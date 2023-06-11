@@ -99,6 +99,7 @@ class ProcessorsProfileLog;
 class FilesystemCacheLog;
 class FilesystemReadPrefetchesLog;
 class AsynchronousInsertLog;
+class BackupLog;
 class IAsynchronousReader;
 struct MergeTreeSettings;
 struct InitialAllRangesAnnouncement;
@@ -979,6 +980,7 @@ public:
     std::shared_ptr<FilesystemCacheLog> getFilesystemCacheLog() const;
     std::shared_ptr<FilesystemReadPrefetchesLog> getFilesystemReadPrefetchesLog() const;
     std::shared_ptr<AsynchronousInsertLog> getAsynchronousInsertLog() const;
+    std::shared_ptr<BackupLog> getBackupLog() const;
 
     /// Returns an object used to log operations with parts if it possible.
     /// Provide table name to make required checks.
