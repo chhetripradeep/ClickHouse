@@ -47,11 +47,30 @@ ColumnsDescription TableFunctionPostgreSQL::getActualTableStructure(ContextPtr c
 void TableFunctionPostgreSQL::parseArguments(const ASTPtr & ast_function, ContextPtr context)
 {
     const auto & func_args = ast_function->as<ASTFunction &>();
+
     if (!func_args.arguments)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function 'PostgreSQL' must have arguments.");
 
-    configuration.emplace(StoragePostgreSQL::getConfiguration(func_args.arguments->children, context));
+    auto & args = func_args.arguments->children;
+
+    PostgreSQLSettings postgresql_settings;
+
     const auto & settings = context->getSettingsRef();
+    postgresql_settings.connect_timeout = settings.external_storage_connect_timeout_sec;
+    postgresql_settings.read_write_timeout = settings.external_storage_rw_timeout_sec;
+
+    for (auto * it = args.begin(); it != args.end(); ++it)
+    {
+        const ASTSetQuery * settings_ast = (*it)->as<ASTSetQuery>();
+        if (settings_ast)
+        {
+            postgresql_settings.loadFromQuery(*settings_ast);
+            args.erase(it);
+            break;
+        }
+    }
+
+    configuration = StoragePostgreSQL::getConfiguration(args, context, postgresql_settings);
     connection_pool = std::make_shared<postgres::PoolWithFailover>(
         *configuration,
         settings.postgresql_connection_pool_size,
