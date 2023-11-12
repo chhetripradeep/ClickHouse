@@ -1,12 +1,20 @@
 #include <TableFunctions/TableFunctionPostgreSQL.h>
 
 #if USE_LIBPQXX
+#include <Processors/Sources/PostgreSQLSource.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Parsers/ASTFunction.h>
+#include <Storages/PostgreSQL/PostgreSQLSettings.h>
 #include <TableFunctions/ITableFunction.h>
 #include <TableFunctions/TableFunctionFactory.h>
+#include <TableFunctions/TableFunctionPostgreSQL.h>
 #include <Common/Exception.h>
+#include <Common/parseAddress.h>
+#include <Common/quoteString.h>
 #include "registerTableFunctions.h"
+
+#include <Databases/PostgreSQL/DatabasePostgreSQL.h>
 #include <Common/parseRemoteDescription.h>
 
 
@@ -22,6 +30,7 @@ namespace ErrorCodes
 StoragePtr TableFunctionPostgreSQL::executeImpl(const ASTPtr & /*ast_function*/,
         ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns, bool /*is_insert_query*/) const
 {
+    PostgreSQLSettings postgresql_settings;
     auto result = std::make_shared<StoragePostgreSQL>(
         StorageID(getDatabaseName(), table_name),
         connection_pool,
@@ -30,6 +39,7 @@ StoragePtr TableFunctionPostgreSQL::executeImpl(const ASTPtr & /*ast_function*/,
         ConstraintsDescription{},
         String{},
         context,
+        postgresql_settings,
         configuration->schema,
         configuration->on_conflict);
 
