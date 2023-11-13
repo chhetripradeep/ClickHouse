@@ -19,12 +19,6 @@ postgres_table_template = """
     id Integer NOT NULL, value Integer, PRIMARY KEY (id))
     """
 
-postgres_table_with_settings_template = """
-    CREATE TABLE {} (
-    id Integer NOT NULL, value Integer, PRIMARY KEY (id))
-    SETTINGS {}
-    """
-
 postgres_drop_table_template = """
     DROP TABLE {}
     """
@@ -37,11 +31,6 @@ def create_postgres_db(cursor, name):
 def create_postgres_table(cursor, table_name):
     # database was specified in connection string
     cursor.execute(postgres_table_template.format(table_name))
-
-
-def create_postgres_table_with_settings(cursor, table_name, settings):
-    # database was specified in connection string
-    cursor.execute(postgres_table_with_settings_template.format(table_name, settings))
 
 
 def drop_postgres_table(cursor, table_name):
@@ -456,14 +445,28 @@ def test_postgres_table_with_settings(started_cluster):
         """
     )
 
-    create_postgres_table_with_settings(cursor, "test_table", "connection_pool_size = 20")
-    assert "test_table" in node1.query("SHOW TABLES FROM postgres_database")
-    assert (
-        "SETTINGS connection_pool_size = \\'20\\'"
-        in node1.query("SHOW CREATE TABLE postgres_database.test_table")
+    table_name = "test_settings_connection_wait_timeout"
+    node1.query(f"DROP TABLE IF EXISTS {table_name}")
+    wait_timeout = 2
+
+    node1.query(
+        """
+        CREATE TABLE {}
+        (
+            id UInt32,
+            name String,
+            age UInt32,
+            money UInt32
+        )
+        ENGINE = PostgreSQL('postgres1:5432', 'postgres_database', 'postgres', 'mysecretpassword', 1)
+        SETTINGS connection_wait_timeout={}, connection_pool_size=1
+        """.format(
+            table_name, wait_timeout
+        )
     )
-    cursor.execute(f"DROP TABLE test_table;")
-    node1.query("DROP DATABASE IF EXISTS postgres_database;")
+
+    cursor.execute(f"DROP TABLE {table_name}")
+    node1.query("DROP DATABASE IF EXISTS postgres_database")
 
 
 if __name__ == "__main__":
