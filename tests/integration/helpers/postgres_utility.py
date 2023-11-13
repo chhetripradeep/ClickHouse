@@ -81,6 +81,7 @@ def create_postgres_table(
     database_name="",
     replica_identity_full=False,
     template=postgres_table_template,
+    settings=None,
 ):
     if database_name == "":
         name = table_name
@@ -88,6 +89,12 @@ def create_postgres_table(
         name = f"{database_name}.{table_name}"
     drop_postgres_table(cursor, name)
     query = template.format(name)
+    if settings is not None and len(settings) > 0:
+        query += " SETTINGS "
+    for i in range(len(settings)):
+        if i != 0:
+            query += ", "
+        query += settings[i]
     cursor.execute(query)
     print(f"Query: {query}")
     if replica_identity_full:
@@ -261,23 +268,23 @@ class PostgresManager:
         create_postgres_schema(self.cursor, name)
 
     def create_postgres_table(
-        self, table_name, database_name="", template=postgres_table_template
+        self, table_name, database_name="", template=postgres_table_template, settings=None
     ):
         create_postgres_table(
-            self.cursor, table_name, database_name=database_name, template=template
+            self.cursor, table_name, database_name=database_name, template=template, settings=settings
         )
 
-    def create_and_fill_postgres_table(self, table_name, database_name=""):
-        create_postgres_table(self.cursor, table_name, database_name)
+    def create_and_fill_postgres_table(self, table_name, database_name="", settings=None):
+        create_postgres_table(self.cursor, table_name, database_name, settings=settings)
         database_name = self.database_or_default(database_name)
         self.instance.query(
             f"INSERT INTO {database_name}.{table_name} SELECT number, number from numbers(50)"
         )
 
-    def create_and_fill_postgres_tables(self, tables_num, numbers=50, database_name=""):
+    def create_and_fill_postgres_tables(self, tables_num, numbers=50, database_name="", settings=None):
         for i in range(tables_num):
             table_name = f"postgresql_replica_{i}"
-            create_postgres_table(self.cursor, table_name, database_name)
+            create_postgres_table(self.cursor, table_name, database_name, settings=settings)
             if numbers > 0:
                 db = self.database_or_default(database_name)
                 self.instance.query(

@@ -19,6 +19,12 @@ postgres_table_template = """
     id Integer NOT NULL, value Integer, PRIMARY KEY (id))
     """
 
+postgres_table_with_settings_template = """
+    CREATE TABLE {} (
+    id Integer NOT NULL, value Integer, PRIMARY KEY (id))
+    SETTINGS {}
+    """
+
 postgres_drop_table_template = """
     DROP TABLE {}
     """
@@ -31,6 +37,11 @@ def create_postgres_db(cursor, name):
 def create_postgres_table(cursor, table_name):
     # database was specified in connection string
     cursor.execute(postgres_table_template.format(table_name))
+
+
+def create_postgres_table_with_settings(cursor, table_name, settings):
+    # database was specified in connection string
+    cursor.execute(postgres_table_template.format(table_name, settings))
 
 
 def drop_postgres_table(cursor, table_name):
@@ -431,6 +442,28 @@ def test_postgresql_password_leak(started_cluster):
 
     cursor.execute("DROP SCHEMA test_schema CASCADE")
     cursor.execute("DROP TABLE table2")
+
+
+def test_postgres_table_with_settings(started_cluster):
+    conn = get_postgres_conn(
+        started_cluster.postgres_ip, started_cluster.postgres_port, database=True
+    )
+    cursor = conn.cursor()
+
+    node1.query(
+        """
+        CREATE DATABASE postgres_database ENGINE = PostgreSQL('postgres1:5432', 'postgres_database', 'postgres', 'mysecretpassword', 1);
+        """
+    )
+
+    create_postgres_table_with_settings(cursor, "test_table", "connection_pool_size = 20")
+    assert "test_table" in node1.query("SHOW TABLES FROM postgres_database")
+    assert (
+        "SETTINGS connection_pool_size = \\'20\\'"
+        in node1.query("SHOW CREATE TABLE postgres_database.test_table")
+    )
+    cursor.execute(f"DROP TABLE test_table;")
+    node1.query("DROP DATABASE IF EXISTS postgres_database;")
 
 
 if __name__ == "__main__":
