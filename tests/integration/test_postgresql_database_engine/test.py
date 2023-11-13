@@ -458,7 +458,7 @@ def test_postgres_table_with_settings(started_cluster):
             age UInt32,
             money UInt32
         )
-        ENGINE = PostgreSQL('postgres1:5432', 'postgres_database', 'postgres', 'mysecretpassword', 1)
+        ENGINE = PostgreSQL("postgres1:5432", "postgres_database", "postgres", "mysecretpassword", 1)
         SETTINGS connection_wait_timeout={}, connection_pool_size=1
         """.format(
             table_name, wait_timeout
