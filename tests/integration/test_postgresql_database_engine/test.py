@@ -41,7 +41,7 @@ def create_postgres_table(cursor, table_name):
 
 def create_postgres_table_with_settings(cursor, table_name, settings):
     # database was specified in connection string
-    cursor.execute(postgres_table_template.format(table_name, settings))
+    cursor.execute(postgres_table_with_settings_template.format(table_name, settings))
 
 
 def drop_postgres_table(cursor, table_name):
