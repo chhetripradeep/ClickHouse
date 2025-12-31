@@ -237,8 +237,7 @@ struct TraversalTask : public std::enable_shared_from_this<TraversalTask<UserCtx
     struct Ctx
     {
         std::deque<TraversalTaskPtr> new_tasks; /// Tasks for newly discovered children, that hasn't been started yet
-        std::deque<std::function<void(Ctx &)>> in_flight_list_requests;  /// In-flight getChildren requests
-        std::deque<std::function<void(Ctx &)>> finish_callbacks;    /// Callbacks to be called
+        std::deque<std::pair<TraversalTaskPtr, std::shared_ptr<std::future<Coordination::ListResponse>>>> in_flight_list_requests;  /// In-flight getChildren requests
         KeeperClient * client;
         UserCtx & user_ctx;
 
@@ -265,10 +264,7 @@ public:
         /// tryGetChildren doesn't throw if the node is not found (was deleted in the meantime)
         std::shared_ptr<std::future<Coordination::ListResponse>> list_request =
             std::make_shared<std::future<Coordination::ListResponse>>(ctx.client->zookeeper->asyncTryGetChildren(path));
-        ctx.in_flight_list_requests.push_back([task = this->shared_from_this(), list_request](Ctx & ctx_) mutable
-        {
-            task->onGetChildren(ctx_, list_request->get());
-        });
+        ctx.in_flight_list_requests.push_back({this->shared_from_this(), list_request});
     }
 
     /// Called when getChildren request returns
@@ -309,14 +305,8 @@ private:
     {
         ctx.user_ctx.onFinishChildrenTraversal(path, nodes_in_subtree);
 
-        if (!parent)
-            return;
-
-        /// Notify the parent that we have finished traversing the subtree
-        ctx.finish_callbacks.push_back([p = this->parent, child_nodes_in_subtree = this->nodes_in_subtree](Ctx & ctx_)
-        {
-            p->onChildTraversalFinished(ctx_, child_nodes_in_subtree);
-        });
+        if (parent)
+            parent->onChildTraversalFinished(ctx, this->nodes_in_subtree);
     }
 };
 
@@ -332,16 +322,8 @@ void parallelized_traverse(const fs::path & path, KeeperClient * client, size_t 
     ctx.new_tasks.push_back(root_task);
 
     /// Until there is something to do
-    while (!ctx.new_tasks.empty() || !ctx.in_flight_list_requests.empty() || !ctx.finish_callbacks.empty())
+    while (!ctx.new_tasks.empty() || !ctx.in_flight_list_requests.empty())
     {
-        /// First process all finish callbacks, they don't wait for anything and allow to free memory
-        while (!ctx.finish_callbacks.empty())
-        {
-            auto callback = std::move(ctx.finish_callbacks.front());
-            ctx.finish_callbacks.pop_front();
-            callback(ctx);
-        }
-
         /// Make new requests if there are less than max in flight
         while (!ctx.new_tasks.empty() && ctx.in_flight_list_requests.size() < max_in_flight_requests)
         {
@@ -353,9 +335,9 @@ void parallelized_traverse(const fs::path & path, KeeperClient * client, size_t 
         /// Wait for first request in the queue to finish
         if (!ctx.in_flight_list_requests.empty())
         {
-            auto request = std::move(ctx.in_flight_list_requests.front());
+            auto [task, list_request] = std::move(ctx.in_flight_list_requests.front());
             ctx.in_flight_list_requests.pop_front();
-            request(ctx);
+            task->onGetChildren(ctx, list_request->get());
         }
     }
 }
@@ -471,21 +453,33 @@ void FindBigFamily::execute(const ASTKeeperQuery * query, KeeperClient * client)
 
     struct
     {
-        std::vector<std::tuple<Int64, String>> result;
+        std::priority_queue<std::tuple<Int64, String>,
+                           std::vector<std::tuple<Int64, String>>,
+                           std::greater<std::tuple<Int64, String>>> result;
+        size_t n;
 
         bool onListChildren(const fs::path &, const Strings &) const { return true; }
 
         void onFinishChildrenTraversal(const fs::path & path, Int64 nodes_in_subtree)
         {
-            result.emplace_back(nodes_in_subtree, path.string());
+            result.emplace(nodes_in_subtree, path.string());
+            if (result.size() > n)
+                result.pop();
         }
-    } ctx;
+    } ctx {{}, n};
 
     parallelized_traverse(path, client, /* max_in_flight_requests */ 50, ctx);
 
-    std::sort(ctx.result.begin(), ctx.result.end(), std::greater());
-    for (UInt64 i = 0; i < std::min(ctx.result.size(), static_cast<size_t>(n)); ++i)
-        std::cout << std::get<1>(ctx.result[i]) << "\t" << std::get<0>(ctx.result[i]) << "\n";
+    std::vector<std::tuple<Int64, String>> sorted_result;
+    while (!ctx.result.empty())
+    {
+        sorted_result.push_back(ctx.result.top());
+        ctx.result.pop();
+    }
+
+    std::reverse(sorted_result.begin(), sorted_result.end());
+    for (const auto & [nodes, node_path] : sorted_result)
+        std::cout << node_path << "\t" << nodes << "\n";
 }
 
 bool RMCommand::parse(IParser::Pos & pos, std::shared_ptr<ASTKeeperQuery> & node, Expected & expected) const
