@@ -22,6 +22,14 @@ option(FAIL_ON_UNSUPPORTED_OPTIONS_COMBINATION
    "Stop/Fail CMake configuration if some ENABLE_XXX option is defined (either ON or OFF)
    but is not possible to satisfy" ON)
 
+option(USE_NSYNC_SHARED_MUTEX "Use google/nsync as the backend for DB::SharedMutex" OFF)
+
+if (USE_NSYNC_SHARED_MUTEX)
+    add_compile_definitions(USE_NSYNC_SHARED_MUTEX=1)
+else ()
+    add_compile_definitions(USE_NSYNC_SHARED_MUTEX=0)
+endif ()
+
 # This allows to compile some code conditionally in the private build while having byte-identical source files.
 set (CLICKHOUSE_CLOUD 0)
 

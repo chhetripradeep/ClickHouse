@@ -1,4 +1,4 @@
-#ifdef OS_LINUX /// Because of futex
+#if defined(OS_LINUX) && (!defined(USE_NSYNC_SHARED_MUTEX) || !USE_NSYNC_SHARED_MUTEX) /// Because of futex
 
 #include <Common/SharedMutex.h>
 #include <Common/futex.h>
