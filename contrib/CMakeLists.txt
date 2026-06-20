@@ -50,7 +50,7 @@ disable_dummy_launchers_if_needed()
 # We need to add OpenSSL first so that all our projects use our own version instead of the system one.
 add_contrib (openssl-cmake openssl)  # Needed for delta-lake
 add_contrib (abseil-cpp-cmake abseil-cpp)
-if (USE_NSYNC_SHARED_MUTEX)
+if (USE_NSYNC)
     add_contrib (nsync-cmake nsync)
 endif ()
 add_contrib (zlib-ng-cmake zlib-ng)
