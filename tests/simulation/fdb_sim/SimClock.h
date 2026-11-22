@@ -132,6 +132,7 @@ struct BuggifyConfig
     uint64_t lsmt_memtable_size = 2048;
     uint64_t lsmt_block_size = 512;
     uint64_t lsmt_min_files_to_merge = 2;
+    uint64_t write_log_entry_version = 0;
 
     void initialize(SimRandom & rng, bool enable_buggify, const std::string & profile)
     {
@@ -179,6 +180,7 @@ struct BuggifyConfig
         roll("torn_writes_on_power_loss", profile == "power-loss" || profile == "chaos" ? 0.90 : 0.60);
         roll("transient_disk_io_errors", profile == "power-loss" || profile == "snapshot-storm" ? 0.85 : 0.50);
         roll("delayed_snapshot_publish", 0.55);
+        write_log_entry_version = roll("batched_log_entries", 0.50) ? 1 : 0;
 
         if (roll("lsmt_tiny_memtables", 0.70))
         {

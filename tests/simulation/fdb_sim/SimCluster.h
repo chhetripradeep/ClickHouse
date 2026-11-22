@@ -379,7 +379,7 @@ public:
             *node.snapshots_queue,
             node.context,
             /*snapshot_manager_s3=*/nullptr,
-            [this, id](uint64_t log_idx, const DB::KeeperRequestForSession & req)
+            [this, id](uint64_t log_idx, const DB::KeeperRequestForSession & req, int32_t /*dispatcher_server_id*/)
             {
                 auto it = nodes.find(id);
                 if (it == nodes.end() || !it->second.online)
@@ -605,8 +605,11 @@ public:
         entry.session_id = session_id;
         entry.time = simTimeMs();
         entry.request = std::move(request);
-        auto buf = DB::KeeperStateMachine::getZooKeeperLogEntry(entry);
-        return node.server->append_entries({buf});
+        DB::KeeperRequestBatch batch;
+        batch.dispatcher_server_id = -1;
+        batch.requests.push_back(std::move(entry));
+        auto bufs = DB::KeeperStateMachine::serializeRequestBatch(batch, engine.buggify.write_log_entry_version);
+        return node.server->append_entries(bufs);
     }
 
     /// Issue a real local read (Get / List / Exists, optionally with watch) on a live node.
@@ -752,22 +755,23 @@ private:
                 if (!entry || entry->get_val_type() != nuraft::app_log)
                     return nuraft::cb_func::ReturnCode::Ok;
 
-                const auto next_zxid = node.machine->getNextZxid();
                 auto entry_buf = entry->get_buf_ptr();
                 DB::KeeperStateMachine::ZooKeeperLogSerializationVersion ser_ver{};
-                size_t req_end_pos = 0;
-                auto req = node.machine->parseRequest(*entry_buf, /*final=*/false, &ser_ver, &req_end_pos);
-                req->zxid = next_zxid;
-                auto digest = node.machine->preprocess(*req, /*lock_mutex=*/true);
+                size_t patched_fields_offset = 0;
+                auto batch = node.machine->parseRequestBatch(*entry_buf, /*final=*/false, &ser_ver, &patched_fields_offset);
+                batch->first_zxid = node.machine->getNextZxid();
+                auto digest = node.machine->preprocessBatch(*batch, /*lock_mutex=*/true);
                 if (!digest)
                     return nuraft::cb_func::ReturnCode::ReturnNull;
 
-                req->digest = *digest;
+                batch->digest = *digest;
+                batch->committed_log_idx = static_cast<int64_t>(node.machine->last_commit_index());
+
                 size_t bytes_missing = 0;
                 if (ser_ver < DB::KeeperStateMachine::ZooKeeperLogSerializationVersion::WITH_TIME)
-                    bytes_missing += sizeof(req->time);
+                    bytes_missing += sizeof(int64_t);
                 if (ser_ver < DB::KeeperStateMachine::ZooKeeperLogSerializationVersion::WITH_ZXID_DIGEST)
-                    bytes_missing += sizeof(req->zxid) + sizeof(req->digest->version) + sizeof(req->digest->value);
+                    bytes_missing += sizeof(int64_t) + sizeof(uint8_t) + sizeof(uint64_t);
 
                 if (bytes_missing != 0)
                 {
@@ -777,28 +781,14 @@ private:
                     entry = nuraft::cs_new<nuraft::log_entry>(entry->get_term(), entry_buf, entry->get_val_type());
                 }
 
-                size_t hdr_size = sizeof(req->zxid) + sizeof(req->digest->version) + sizeof(req->digest->value);
-                if (ser_ver < DB::KeeperStateMachine::ZooKeeperLogSerializationVersion::WITH_TIME)
-                    hdr_size += sizeof(req->time);
-                else
-                    req_end_pos += sizeof(req->time);
-
-                auto * start_ptr = reinterpret_cast<DB::BufferBase::Position>(entry_buf->data_begin() + req_end_pos);
-                DB::WriteBufferFromPointer write_buf(start_ptr, hdr_size);
-                if (ser_ver < DB::KeeperStateMachine::ZooKeeperLogSerializationVersion::WITH_TIME)
-                    DB::writeIntBinary(req->time, write_buf);
-                DB::writeIntBinary(req->zxid, write_buf);
-                DB::writeIntBinary(static_cast<uint8_t>(req->digest->version), write_buf);
-                if (req->digest->version != DB::KeeperDigestVersion::NO_DIGEST)
-                    DB::writeIntBinary(req->digest->value, write_buf);
-                write_buf.finalize();
+                DB::KeeperStateMachine::patchSerializedRequestBatch(*entry_buf, ser_ver, patched_fields_offset, *batch);
                 return nuraft::cb_func::ReturnCode::Ok;
             }
             case nuraft::cb_func::PreAppendLogFollower:
             {
                 const auto & entry = *static_cast<nuraft::ptr<nuraft::log_entry> *>(param->ctx);
                 if (entry && entry->get_val_type() == nuraft::app_log)
-                    node.machine->parseRequest(entry->get_buf(), /*final=*/false);
+                    node.machine->parseRequestBatch(entry->get_buf(), /*final=*/false);
                 return nuraft::cb_func::ReturnCode::Ok;
             }
             case nuraft::cb_func::AppendLogFailed:
@@ -806,8 +796,8 @@ private:
                 auto & entry = *static_cast<nuraft::ptr<nuraft::log_entry> *>(param->ctx);
                 if (entry && entry->get_val_type() == nuraft::app_log)
                 {
-                    auto req = node.machine->parseRequest(entry->get_buf(), /*final=*/true);
-                    node.machine->rollbackRequest(*req, /*allow_missing=*/true);
+                    auto batch = node.machine->parseRequestBatch(entry->get_buf(), /*final=*/true);
+                    node.machine->rollbackRequestBatch(*batch, /*allow_missing=*/true);
                 }
                 return nuraft::cb_func::ReturnCode::Ok;
             }
