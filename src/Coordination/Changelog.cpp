@@ -3603,7 +3603,8 @@ void Changelog::spliceChangelog(ChangelogFileDescriptionPtr source_changelog, Ch
 
 
 Changelog::Changelog(
-    LoggerPtr log_, LogFileSettings log_file_settings, FlushSettings flush_settings_, ReadAheadSettings readahead_settings_, KeeperContextPtr keeper_context_)
+    LoggerPtr log_, LogFileSettings log_file_settings, FlushSettings flush_settings_, ReadAheadSettings readahead_settings_,
+    KeeperContextPtr keeper_context_, ExecutionMode execution_mode_)
     : changelogs_detached_dir("detached")
     , rotate_interval(log_file_settings.rotate_interval)
     , compress_logs(log_file_settings.compress_logs)
@@ -3616,9 +3617,15 @@ Changelog::Changelog(
     , append_completion_queue(std::numeric_limits<size_t>::max())
     , keeper_context(std::move(keeper_context_))
     , flush_settings(flush_settings_)
+    , execution_mode(execution_mode_)
 {
     try
     {
+        if (execution_mode == ExecutionMode::Manual
+            && (startup_read_max_streams != 1 || readahead_settings_.enabled || readahead_settings_.commit_window_bytes != 0
+                || flush_settings.max_flush_batch_size != 1 || flush_settings.min_time_between_fsyncs_ms != 0))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Manual changelog execution requires serial startup, no read-ahead, and unthrottled single-batch flushes");
+
         /// Settings-layer NonZeroUInt64 can be bypassed by direct construction (gtests); re-check here.
         if (log_file_settings.startup_read_buffer_size == 0)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "startup_read_buffer_size must be greater than 0");
@@ -3721,11 +3728,12 @@ Changelog::Changelog(
         if (existing_changelogs.empty())
             LOG_WARNING(log, "No logs exists in {}. It's Ok if it's the first run of clickhouse-keeper.", disk->getPath());
 
-        background_changelog_operations_thread = std::make_unique<ThreadFromGlobalPool>([this] { backgroundChangelogOperationsThread(); });
-
-        write_thread = std::make_unique<ThreadFromGlobalPool>([this] { writeThread(); });
-
-        append_completion_thread = std::make_unique<ThreadFromGlobalPool>([this] { appendCompletionThread(); });
+        if (execution_mode == ExecutionMode::Threaded)
+        {
+            background_changelog_operations_thread = std::make_unique<ThreadFromGlobalPool>([this] { backgroundChangelogOperationsThread(); });
+            write_thread = std::make_unique<ThreadFromGlobalPool>([this] { writeThread(); });
+            append_completion_thread = std::make_unique<ThreadFromGlobalPool>([this] { appendCompletionThread(); });
+        }
 
         current_writer = std::make_unique<ChangelogWriter>(
             existing_changelogs,
@@ -4210,6 +4218,106 @@ void Changelog::appendCompletionThread()
     }
 }
 
+bool Changelog::appendRecord(const AppendLog & append)
+{
+    std::lock_guard writer_lock(writer_mutex);
+    chassert(current_writer);
+    return current_writer->appendRecord(buildRecord(append.index, append.log_entry));
+}
+
+void Changelog::flushLogs(const Flush & flush)
+{
+    {
+        std::lock_guard writer_lock(writer_mutex);
+        current_writer->flush();
+    }
+
+    std::lock_guard lock{durable_idx_mutex};
+    last_durable_idx = flush.index;
+}
+
+void Changelog::notifyAppendCompletion(bool append_ok)
+{
+    durable_idx_cv.notify_all();
+
+    /// Notify outside the writer: NuRaft may hold its global lock while waiting for a flush.
+    if (!append_completion_queue.push(append_ok))
+        LOG_WARNING(log, "Changelog is shut down");
+}
+
+bool Changelog::hasPendingTask(BackgroundTask task) const
+{
+    if (execution_mode != ExecutionMode::Manual)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Manual steps cannot run alongside changelog workers");
+    switch (task)
+    {
+        case BackgroundTask::Write: return !write_operations.empty();
+        case BackgroundTask::Completion: return !append_completion_queue.empty();
+        case BackgroundTask::FileOperation: return !changelog_operation_queue.empty();
+    }
+    UNREACHABLE();
+}
+
+size_t Changelog::discardUnexecutedWritesForTesting()
+{
+    if (execution_mode != ExecutionMode::Manual)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot discard writes alongside changelog workers");
+    write_operations.finish();
+    return write_operations.drainAll().size();
+}
+
+bool Changelog::runTask(BackgroundTask task)
+{
+    if (!hasPendingTask(task))
+        return false;
+    switch (task)
+    {
+        case BackgroundTask::Write:
+        {
+            WriteOperation operation;
+            if (!write_operations.tryPop(operation))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Concurrent manual changelog execution");
+            if (auto * append = std::get_if<AppendLog>(&operation))
+            {
+                if (manual_append_ok)
+                    manual_append_ok = appendRecord(*append);
+            }
+            else
+            {
+                const auto & flush = std::get<Flush>(operation);
+                if (manual_append_ok)
+                    flushLogs(flush);
+                else
+                {
+                    std::lock_guard lock{durable_idx_mutex};
+                    *flush.failed = true;
+                }
+                notifyAppendCompletion(manual_append_ok);
+                manual_append_ok = true;
+            }
+            break;
+        }
+        case BackgroundTask::Completion:
+        {
+            bool append_ok = false;
+            if (!append_completion_queue.tryPop(append_ok))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Concurrent manual changelog execution");
+            if (auto server = raft_server.lock())
+                server->notify_log_append_completion(append_ok);
+            break;
+        }
+        case BackgroundTask::FileOperation:
+        {
+            ChangelogFileOperationPtr operation;
+            if (!changelog_operation_queue.tryPop(operation))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Concurrent manual changelog execution");
+            processFileOperation(operation);
+            break;
+        }
+    }
+    return true;
+}
+
 void Changelog::writeThread()
 {
     /// The only consumer of an exception escaping this thread is the catch-all below, which calls
@@ -4236,29 +4344,8 @@ void Changelog::writeThread()
         earliest_next_flush_time
             = std::chrono::steady_clock::now() + std::chrono::milliseconds(flush_settings.min_time_between_fsyncs_ms);
 
-        {
-            std::lock_guard writer_lock(writer_mutex);
-            current_writer->flush();
-        }
-
-        {
-            std::lock_guard lock{durable_idx_mutex};
-            last_durable_idx = flush.index;
-        }
-
+        flushLogs(flush);
         pending_appends = 0;
-    };
-
-    const auto notify_append_completion = [&]
-    {
-        durable_idx_cv.notify_all();
-
-        // we need to call completion callback in another thread because it takes a global lock for the NuRaft server
-        // NuRaft will in some places wait for flush to be done while having the same global lock leading to deadlock
-        // -> future write operations are blocked by flush that cannot be completed because it cannot take NuRaft lock
-        // -> NuRaft won't leave lock until its flush is done
-        if (!append_completion_queue.push(batch_append_ok))
-            LOG_WARNING(log, "Changelog is shut down");
     };
 
     try
@@ -4304,7 +4391,7 @@ void Changelog::writeThread()
                         *pending_flush->failed = true;
                     }
 
-                    notify_append_completion();
+                    notifyAppendCompletion(batch_append_ok);
                     pending_flush.reset();
                     batch_append_ok = true;
                     continue;
@@ -4322,10 +4409,7 @@ void Changelog::writeThread()
                 if (!batch_append_ok)
                     continue;
 
-                std::lock_guard writer_lock(writer_mutex);
-                chassert(current_writer);
-
-                batch_append_ok = current_writer->appendRecord(buildRecord(append_log->index, append_log->log_entry));
+                batch_append_ok = appendRecord(*append_log);
                 ++pending_appends;
             }
             else
@@ -4361,6 +4445,10 @@ void Changelog::writeAt(uint64_t index, const LogEntryPtr & log_entry)
 
     /// wait for all appends to finish before changing active changelog file
     flush();
+    if (execution_mode == ExecutionMode::Manual)
+        while (runTask(BackgroundTask::FileOperation))
+        {
+        }
 
     {
         /// After flush(), last_durable_idx == old max_log_id. But we are about to
@@ -4422,6 +4510,10 @@ void Changelog::writeAt(uint64_t index, const LogEntryPtr & log_entry)
     }
 
     /// Append the rewrite only after superseded changelog files are gone.
+    if (execution_mode == ExecutionMode::Manual)
+        while (runTask(BackgroundTask::FileOperation))
+        {
+        }
     for (const auto & op : pending_superseded_removes)
     {
         op->done.wait(false);
@@ -4648,6 +4740,12 @@ bool Changelog::flush()
 {
     if (auto failed_ptr = flushAsync())
     {
+        /// Configuration entries require a synchronous barrier inside the selected Raft action.
+        /// Do the real writes/fsync, but leave NuRaft callbacks queued to avoid lock re-entry.
+        if (execution_mode == ExecutionMode::Manual)
+            while (runTask(BackgroundTask::Write))
+            {
+            }
         std::unique_lock lock{durable_idx_mutex};
         durable_idx_cv.wait(lock, [&] { return *failed_ptr || last_durable_idx == max_log_id.load(std::memory_order_relaxed); });
 
@@ -4688,19 +4786,31 @@ void Changelog::shutdown()
     if (!changelog_operation_queue.isFinished())
         changelog_operation_queue.finish();
 
-    if (background_changelog_operations_thread->joinable())
+    if (execution_mode == ExecutionMode::Manual)
+        while (runTask(BackgroundTask::FileOperation))
+        {
+        }
+    if (background_changelog_operations_thread && background_changelog_operations_thread->joinable())
         background_changelog_operations_thread->join();
 
     if (!write_operations.isFinished())
         write_operations.finish();
 
-    if (write_thread->joinable())
+    if (execution_mode == ExecutionMode::Manual)
+        while (runTask(BackgroundTask::Write))
+        {
+        }
+    if (write_thread && write_thread->joinable())
         write_thread->join();
 
     if (!append_completion_queue.isFinished())
         append_completion_queue.finish();
 
-    if (append_completion_thread->joinable())
+    if (execution_mode == ExecutionMode::Manual)
+        while (runTask(BackgroundTask::Completion))
+        {
+        }
+    if (append_completion_thread && append_completion_thread->joinable())
         append_completion_thread->join();
 
     if (current_writer)
@@ -4745,70 +4855,73 @@ void Changelog::backgroundChangelogOperationsThread()
 
     ChangelogFileOperationPtr changelog_operation;
     while (changelog_operation_queue.pop(changelog_operation))
-    {
-        if (std::holds_alternative<RemoveChangelog>(changelog_operation->operation))
-        {
-            chassert(changelog_operation->changelog);
-            auto & changelog = *changelog_operation->changelog; /// mutable: we set removed_from_disk
-            changelog.withWriteLock(
-                [&]
-                {
-                    changelog.removed_from_disk = true; /// set BEFORE removeFile
-                    FailPointInjection::pauseFailPoint(FailPoints::keeper_changelog_removed_from_disk_set);
-                    try
-                    {
-                        changelog.disk->removeFile(changelog.path);
-                        LOG_INFO(log, "Removed changelog {} because of compaction.", changelog.path);
-                    }
-                    catch (Exception & e)
-                    {
-                        LOG_WARNING(log, "Failed to remove changelog {} in compaction, error message: {}", changelog.path, e.message());
-                        changelog_operation->setError(std::current_exception());
-                    }
-                    catch (...)
-                    {
-                        tryLogCurrentException(log);
-                        changelog_operation->setError(std::current_exception());
-                    }
-                });
-        }
-        else if (auto * move_operation = std::get_if<MoveChangelog>(&changelog_operation->operation))
-        {
-            const auto & changelog = changelog_operation->changelog;
+        processFileOperation(changelog_operation);
+}
 
-            if (move_operation->new_disk == changelog->disk)
+void Changelog::processFileOperation(const ChangelogFileOperationPtr & changelog_operation)
+{
+    if (std::holds_alternative<RemoveChangelog>(changelog_operation->operation))
+    {
+        chassert(changelog_operation->changelog);
+        auto & changelog = *changelog_operation->changelog; /// mutable: we set removed_from_disk
+        changelog.withWriteLock(
+            [&]
             {
-                if (move_operation->new_path != changelog->path)
+                changelog.removed_from_disk = true; /// set BEFORE removeFile
+                FailPointInjection::pauseFailPoint(FailPoints::keeper_changelog_removed_from_disk_set);
+                try
                 {
-                    changelog->withWriteLock(
-                        [&]
-                        {
-                            try
-                            {
-                                changelog->disk->moveFile(changelog->path, move_operation->new_path);
-                            }
-                            catch (...)
-                            {
-                                tryLogCurrentException(log, fmt::format("File rename failed on disk {}", changelog->disk->getName()));
-                            }
-                            changelog->path = std::move(move_operation->new_path);
-                        });
+                    changelog.disk->removeFile(changelog.path);
+                    LOG_INFO(log, "Removed changelog {} because of compaction.", changelog.path);
                 }
-            }
-            else
+                catch (Exception & e)
+                {
+                    LOG_WARNING(log, "Failed to remove changelog {} in compaction, error message: {}", changelog.path, e.message());
+                    changelog_operation->setError(std::current_exception());
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(log);
+                    changelog_operation->setError(std::current_exception());
+                }
+            });
+    }
+    else if (auto * move_operation = std::get_if<MoveChangelog>(&changelog_operation->operation))
+    {
+        const auto & changelog = changelog_operation->changelog;
+
+        if (move_operation->new_disk == changelog->disk)
+        {
+            if (move_operation->new_path != changelog->path)
             {
-                moveChangelogBetweenDisks(changelog->disk, changelog, move_operation->new_disk, move_operation->new_path, keeper_context);
+                changelog->withWriteLock(
+                    [&]
+                    {
+                        try
+                        {
+                            changelog->disk->moveFile(changelog->path, move_operation->new_path);
+                        }
+                        catch (...)
+                        {
+                            tryLogCurrentException(log, fmt::format("File rename failed on disk {}", changelog->disk->getName()));
+                        }
+                        changelog->path = std::move(move_operation->new_path);
+                    });
             }
         }
         else
         {
-            LOG_ERROR(log, "Unsupported operation detected for changelog {}", changelog_operation->changelog->path);
-            chassert(false);
+            moveChangelogBetweenDisks(changelog->disk, changelog, move_operation->new_disk, move_operation->new_path, keeper_context);
         }
-        changelog_operation->done = true;
-        /// Wake up `waitAllAsyncOperations`; a bare store does not wake an `std::atomic::wait`.
-        changelog_operation->done.notify_all();
     }
+    else
+    {
+        LOG_ERROR(log, "Unsupported operation detected for changelog {}", changelog_operation->changelog->path);
+        chassert(false);
+    }
+    changelog_operation->done = true;
+    /// Wake up `waitAllAsyncOperations`; a bare store does not wake an `std::atomic::wait`.
+    changelog_operation->done.notify_all();
 }
 
 void Changelog::modifyChangelogAsync(ChangelogFileOperationPtr changelog_operation)

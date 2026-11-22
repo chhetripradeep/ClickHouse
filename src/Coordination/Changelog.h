@@ -564,14 +564,36 @@ private:
 class Changelog
 {
 public:
+    enum class ExecutionMode
+    {
+        Threaded,
+        Manual,
+    };
+    enum class BackgroundTask
+    {
+        Write,
+        Completion,
+        FileOperation,
+    };
+
     Changelog(
         LoggerPtr log_,
         LogFileSettings log_file_settings,
         FlushSettings flush_settings,
         ReadAheadSettings readahead_settings,
-        KeeperContextPtr keeper_context_);
+        KeeperContextPtr keeper_context_,
+        ExecutionMode execution_mode_ = ExecutionMode::Threaded);
 
     Changelog(Changelog &&) = delete;
+
+    /// Manual execution is single-threaded, unthrottled, and without read-ahead workers.
+    /// Each step consumes one queued operation; completion steps must run outside NuRaft locks.
+    bool hasPendingTask(BackgroundTask task) const;
+    bool runTask(BackgroundTask task);
+
+    /// Manual fault injection: discard only work not yet executed, then destroy this store.
+    /// Finalizing the writer can still publish bytes from previously executed writes.
+    size_t discardUnexecutedWritesForTesting();
 
     /// Reads changelog files from disk (see computeStartToReadFrom for the start index), truncates
     /// broken entries, and removes files after them. Dispatches to the serial or parallel reader.
@@ -769,6 +791,11 @@ private:
 
     using WriteOperation = std::variant<AppendLog, Flush>;
 
+    bool appendRecord(const AppendLog & append);
+    void flushLogs(const Flush & flush);
+    void notifyAppendCompletion(bool append_ok);
+    void processFileOperation(const ChangelogFileOperationPtr & operation);
+
     void writeThread();
 
     std::unique_ptr<ThreadFromGlobalPool> write_thread;
@@ -793,6 +820,8 @@ private:
     KeeperContextPtr keeper_context;
 
     const FlushSettings flush_settings;
+    const ExecutionMode execution_mode;
+    bool manual_append_ok = true;
 
     bool initialized = false;
 

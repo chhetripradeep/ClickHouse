@@ -1472,7 +1472,16 @@ TEST_P(CoordinationTest, ApplySnapshotReplacesCommittedState)
 {
     ChangelogDirTest snapshots("./snapshots");
 
-    auto ctx = makeContextForSnapshotApply(GetParam(), "./snapshots");
+    auto now = std::make_shared<std::atomic<int64_t>>(1000);
+    auto settings = std::make_shared<DB::CoordinationSettings>(keeper_context->getCoordinationSettings());
+    (*settings)[DB::CoordinationSetting::compress_snapshots_with_zstd_format] = true;
+    auto ctx = std::make_shared<DB::KeeperContext>(true, settings, [now]
+    {
+        return now->load();
+    });
+    ctx->setLocalLogsPreprocessed();
+    ctx->setDigestEnabled(true);
+    ctx->setSnapshotDisk(std::make_shared<DB::DiskLocal>("SnapshotDisk", "./snapshots"));
     DB::SnapshotsQueue snapshots_queue{1};
     auto state_machine = std::make_shared<DB::KeeperStateMachine>(nullptr, snapshots_queue, ctx, nullptr);
     state_machine->init();
@@ -1480,15 +1489,18 @@ TEST_P(CoordinationTest, ApplySnapshotReplacesCommittedState)
     auto old_entry = makeCreateEntry(*state_machine, "/old", "old");
     state_machine->pre_commit(1, old_entry->get_buf());
     state_machine->commit(1, old_entry->get_buf());
+    state_machine->getStorageUnsafe().addSessionID(77, 500);
 
     auto snapshot_storage = DB::KeeperStorage::create(500, "", ctx);
     addNode(*snapshot_storage,"/committed", "from_snapshot");
+    snapshot_storage->addSessionID(88, 1000);
     TSA_SUPPRESS_WARNING_FOR_WRITE(snapshot_storage->zxid) = 1;
 
     nuraft::snapshot snapshot(1, 0, std::make_shared<nuraft::cluster_config>());
     auto snapshot_buf = makeSnapshotBufferFromStorage(*snapshot_storage, 1, ctx);
     saveSingleObjectSnapshot(*state_machine, snapshot, snapshot_buf);
 
+    now->store(2500);
     EXPECT_TRUE(state_machine->apply_snapshot(snapshot));
 
     auto & storage = state_machine->getStorageUnsafe();
@@ -1496,6 +1508,12 @@ TEST_P(CoordinationTest, ApplySnapshotReplacesCommittedState)
     EXPECT_EQ(committedNodeData(storage, "/committed"), "from_snapshot");
     EXPECT_FALSE(committedNodeExists(storage, "/old"));
     EXPECT_EQ(state_machine->last_commit_index(), 1);
+
+    /// Restoring sessions re-arms their timeout using the same context-owned clock.
+    now->store(3999);
+    EXPECT_TRUE(storage.getDeadSessions().empty());
+    now->store(4000);
+    EXPECT_EQ(storage.getDeadSessions(), std::vector<int64_t>({88}));
 }
 
 TEST_P(CoordinationTest, ApplySnapshotPreservesPreprocessedTailAboveSnapshotIndex)

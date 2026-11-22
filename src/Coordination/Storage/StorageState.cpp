@@ -598,6 +598,9 @@ void StorageState::listUncommittedChildrenNames(
 
 void StorageState::throttleWrite() const
 {
+    if (keeper_context && keeper_context->isManualLSMTBackgroundWork())
+        return;
+
     int64_t delay_us = write_throttling_us.load(std::memory_order_relaxed);
     if (delay_us != 0)
     {

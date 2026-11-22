@@ -356,7 +356,9 @@ KeeperStorage::~KeeperStorage() = default;
 
 KeeperStorage::KeeperStorage(
     int64_t tick_time_ms, const String & superdigest_, const KeeperContextPtr & keeper_context_)
-    : keeper_context(keeper_context_), superdigest(superdigest_), session_expiry_queue(tick_time_ms)
+    : keeper_context(keeper_context_)
+    , superdigest(superdigest_)
+    , session_expiry_queue(tick_time_ms, keeper_context_->getSessionExpiryClock())
 {
 
 }

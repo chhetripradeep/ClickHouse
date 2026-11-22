@@ -52,7 +52,11 @@ namespace ErrorCodes = DB::ErrorCodes;
 
 BackgroundWork::BackgroundWork(StorageState * storage_)
     : storage(storage_)
+    , manual_mode(storage_->keeper_context && storage_->keeper_context->isManualLSMTBackgroundWork())
 {
+    if (manual_mode)
+        return;
+
     const DB::CoordinationSettings & settings = storage->keeper_context->getCoordinationSettings();
 
     const size_t num_flush_threads = settings[DB::CoordinationSetting::flush_threads];
@@ -102,12 +106,65 @@ void BackgroundWork::shutdown()
 
 void BackgroundWork::maybeStartFlush()
 {
-    flush_requests.release();
+    if (!manual_mode)
+        flush_requests.release();
 }
 
 void BackgroundWork::maybeStartMerge()
 {
-    merge_requests.release();
+    if (!manual_mode)
+        merge_requests.release();
+}
+
+bool BackgroundWork::hasPendingFileDeletes() const
+{
+    std::lock_guard lock(file_delete_queue->mutex);
+    return !file_delete_queue->paths.empty();
+}
+
+bool BackgroundWork::runFileDeleteStep()
+{
+    if (!manual_mode || shutting_down.load())
+        return false;
+    if (!hasPendingFileDeletes())
+        return false;
+    return deleteQueuedFiles();
+}
+
+bool BackgroundWork::hasPendingFlush() const
+{
+    std::lock_guard lock(const_cast<std::mutex &>(mutex));
+    std::shared_lock storage_lock(*storage->storage_mutex);
+    for (const MemtablePtr & m : storage->immutable_memtables)
+    {
+        if (!flushes_in_progress.contains(m->file_seqno))
+            return true;
+    }
+    return false;
+}
+
+bool BackgroundWork::runFlushStep()
+{
+    if (!manual_mode || shutting_down.load())
+        return false;
+    return runSingleFlush(/*allow_sleep=*/false);
+}
+
+bool BackgroundWork::hasPendingMerge() const
+{
+    std::lock_guard lock(const_cast<std::mutex &>(mutex));
+    std::shared_lock storage_lock(*storage->storage_mutex);
+    std::vector<SortedRunPtr> input_runs;
+    SortedRunPtr output_run;
+    std::vector<uint32_t> seqnos_to_lock;
+    return pickRunsToMerge(input_runs, output_run, seqnos_to_lock);
+}
+
+bool BackgroundWork::runMergeStep()
+{
+    if (!manual_mode || shutting_down.load())
+        return false;
+    return runSingleMerge(/*allow_sleep=*/false);
 }
 
 bool BackgroundWork::deleteQueuedFiles() const
@@ -152,146 +209,151 @@ void BackgroundWork::flushThread()
             continue;
         }
 
-        /// Pick a memtable to flush.
-        MemtablePtr memtable;
-        {
-            std::lock_guard lock(mutex);
-            std::shared_lock storage_lock(*storage->storage_mutex);
-
-            for (const MemtablePtr & m : storage->immutable_memtables)
-            {
-                if (!flushes_in_progress.contains(m->file_seqno))
-                {
-                    memtable = m;
-                    flushes_in_progress.insert(m->file_seqno);
-                    break;
-                }
-            }
-        }
-
-        if (!memtable)
-        {
+        if (!runSingleFlush(/*allow_sleep=*/true))
             flush_requests.acquire();
-            continue;
-        }
+    }
+}
 
-        LOG_DEBUG(storage->log, "Flushing memtable {} ({} bytes)", memtable->file_seqno, memtable->total_bytes);
+bool BackgroundWork::runSingleFlush(bool allow_sleep)
+{
+    /// Pick a memtable to flush.
+    MemtablePtr memtable;
+    {
+        std::lock_guard lock(mutex);
+        std::shared_lock storage_lock(*storage->storage_mutex);
 
-        Stopwatch stopwatch;
-        double sort_duration = 0;
-
-        SortedRunPtr new_run;
-
-        /// Do the flush.
-        try
+        for (const MemtablePtr & m : storage->immutable_memtables)
         {
-            SortedRunWriter writer(std::make_shared<SortedRun>(memtable->file_seqno, memtable->file_seqno), storage);
-
-            Stopwatch sort_stopwatch;
-            MemtableSortedNodeStream reader(memtable);
-            sort_duration = sort_stopwatch.elapsedSeconds();
-
-            /// Collapse consecutive nodes with equal paths into one or zero nodes.
-            std::optional<NodeAction> combined_action;
-            while (true)
+            if (!flushes_in_progress.contains(m->file_seqno))
             {
-                if (shutting_down)
-                    throw Exception(ErrorCodes::ABORTED, "Cancelling flush because of shutdown");
-
-                reader.next();
-                if (reader.at_end)
-                    break;
-
-                combined_action = combineActions(combined_action, reader.node.action, /*strict=*/ true);
-
-                if (reader.isNextPathEqualToCurrent())
-                    /// This node gets combined with the next one. Only need the action from this node.
-                    continue;
-
-                /// We've combined all actions for current path.
-
-                if (!combined_action.has_value())
-                    /// ... and they cancelled out (e.g. Create + Remove), nothing to write.
-                    continue;
-
-                reader.node.action = *combined_action;
-                combined_action.reset();
-
-                writer.appendNode(reader.node);
-                writer.finishFileIfBigEnough();
+                memtable = m;
+                flushes_in_progress.insert(m->file_seqno);
+                break;
             }
-
-            new_run = writer.finish();
-            chassert(new_run);
-
-            int64_t node_count_delta = 0;
-            for (const SortedFilePtr & file : new_run->files)
-                node_count_delta += file->node_count_delta;
-            chassert(memtable->node_count_delta == node_count_delta);
-            new_run->node_count_delta = node_count_delta;
-        }
-        catch (...)
-        {
-            ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushExceptions);
-            DB::tryLogCurrentException(storage->log, "Memtable flush failed");
-
-            /// Don't retry immediately.
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-
-            std::lock_guard lock(mutex);
-            flushes_in_progress.erase(memtable->file_seqno);
-            continue;
-        }
-
-        ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushes);
-        ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushWrittenCompressedBytes, new_run->total_file_size);
-        ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushWrittenUncompressedBytes, new_run->total_block_size);
-
-        const double duration = stopwatch.elapsedSeconds();
-        LOG_DEBUG(storage->log,
-            "Flushed memtable {} ({} bytes) into a sorted run of {} files ({} bytes) in {:.3} s (sorting took {:.3} s)",
-            memtable->file_seqno, memtable->total_bytes,
-            new_run->files.size(), new_run->total_block_size,
-            duration, sort_duration);
-
-        /// Publish the new sorted run. If some earlier memtable is not flushed yet, leave the result
-        /// in the flushed_files reorder buffer for now (the thread that flushes that earlier memtable
-        /// will publish our run).
-        {
-            std::lock_guard lock(mutex);
-
-            {
-                std::lock_guard storage_lock(*storage->storage_mutex);
-
-                flushed_files[memtable->file_seqno] = new_run;
-
-                while (!flushed_files.empty())
-                {
-                    const auto [seqno, run] = *flushed_files.begin();
-                    chassert(!storage->immutable_memtables.empty());
-                    chassert(seqno >= storage->immutable_memtables[0]->file_seqno);
-                    if (seqno != storage->immutable_memtables[0]->file_seqno)
-                        break; // previous memtable not flushed yet
-
-                    /// The run becomes visible to readers only now; until this point its files stay
-                    /// self-deleting, so a shutdown or snapshot install that destroys BackgroundWork
-                    /// while the run sits in the reorder buffer doesn't leak the files on disk.
-                    for (const SortedFilePtr & file : run->files)
-                        file->delete_when_destroyed = false;
-
-                    storage->sorted_runs.push_back(run);
-                    storage->immutable_memtables.erase(storage->immutable_memtables.begin());
-                    flushed_files.erase(flushed_files.begin());
-                    flushes_in_progress.erase(seqno);
-                    storage->recalculateWriteThrottling();
-
-                    maybeStartMerge();
-                }
-            }
-
-            /// TODO: Write manifest file, if we want files to be usable after restart.
         }
     }
+
+    if (!memtable)
+        return false;
+
+    LOG_DEBUG(storage->log, "Flushing memtable {} ({} bytes)", memtable->file_seqno, memtable->total_bytes);
+
+    Stopwatch stopwatch;
+    double sort_duration = 0;
+
+    SortedRunPtr new_run;
+
+    /// Do the flush.
+    try
+    {
+        SortedRunWriter writer(std::make_shared<SortedRun>(memtable->file_seqno, memtable->file_seqno), storage);
+
+        Stopwatch sort_stopwatch;
+        MemtableSortedNodeStream reader(memtable);
+        sort_duration = sort_stopwatch.elapsedSeconds();
+
+        /// Collapse consecutive nodes with equal paths into one or zero nodes.
+        std::optional<NodeAction> combined_action;
+        while (true)
+        {
+            if (shutting_down)
+                throw Exception(ErrorCodes::ABORTED, "Cancelling flush because of shutdown");
+
+            reader.next();
+            if (reader.at_end)
+                break;
+
+            combined_action = combineActions(combined_action, reader.node.action, /*strict=*/ true);
+
+            if (reader.isNextPathEqualToCurrent())
+                /// This node gets combined with the next one. Only need the action from this node.
+                continue;
+
+            /// We've combined all actions for current path.
+
+            if (!combined_action.has_value())
+                /// ... and they cancelled out (e.g. Create + Remove), nothing to write.
+                continue;
+
+            reader.node.action = *combined_action;
+            combined_action.reset();
+
+            writer.appendNode(reader.node);
+            writer.finishFileIfBigEnough();
+        }
+
+        new_run = writer.finish();
+        chassert(new_run);
+
+        int64_t node_count_delta = 0;
+        for (const SortedFilePtr & file : new_run->files)
+            node_count_delta += file->node_count_delta;
+        chassert(memtable->node_count_delta == node_count_delta);
+        new_run->node_count_delta = node_count_delta;
+    }
+    catch (...)
+    {
+        ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushExceptions);
+        DB::tryLogCurrentException(storage->log, "Memtable flush failed");
+
+        /// Don't retry immediately.
+        if (allow_sleep)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        std::lock_guard lock(mutex);
+        flushes_in_progress.erase(memtable->file_seqno);
+        return true;
+    }
+
+    ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushes);
+    ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushWrittenCompressedBytes, new_run->total_file_size);
+    ProfileEvents::increment(ProfileEvents::KeeperLSMTFlushWrittenUncompressedBytes, new_run->total_block_size);
+
+    const double duration = stopwatch.elapsedSeconds();
+    LOG_DEBUG(storage->log,
+        "Flushed memtable {} ({} bytes) into a sorted run of {} files ({} bytes) in {:.3} s (sorting took {:.3} s)",
+        memtable->file_seqno, memtable->total_bytes,
+        new_run->files.size(), new_run->total_block_size,
+        duration, sort_duration);
+
+    /// Publish the new sorted run. If some earlier memtable is not flushed yet, leave the result
+    /// in the flushed_files reorder buffer for now (the thread that flushes that earlier memtable
+    /// will publish our run).
+    {
+        std::lock_guard lock(mutex);
+
+        {
+            std::lock_guard storage_lock(*storage->storage_mutex);
+
+            flushed_files[memtable->file_seqno] = new_run;
+
+            while (!flushed_files.empty())
+            {
+                const auto [seqno, run] = *flushed_files.begin();
+                chassert(!storage->immutable_memtables.empty());
+                chassert(seqno >= storage->immutable_memtables[0]->file_seqno);
+                if (seqno != storage->immutable_memtables[0]->file_seqno)
+                    break; // previous memtable not flushed yet
+
+                /// The run becomes visible to readers only now; until this point its files stay
+                /// self-deleting, so a shutdown or snapshot install that destroys BackgroundWork
+                /// while the run sits in the reorder buffer doesn't leak the files on disk.
+                for (const SortedFilePtr & file : run->files)
+                    file->delete_when_destroyed = false;
+
+                storage->sorted_runs.push_back(run);
+                storage->immutable_memtables.erase(storage->immutable_memtables.begin());
+                flushed_files.erase(flushed_files.begin());
+                flushes_in_progress.erase(seqno);
+                storage->recalculateWriteThrottling();
+
+                maybeStartMerge();
+            }
+        }
+
+        /// TODO: Write manifest file, if we want files to be usable after restart.
+    }
+    return true;
 }
 
 void BackgroundWork::mergeThread()
@@ -304,271 +366,259 @@ void BackgroundWork::mergeThread()
             continue;
         }
 
-        /// Pick files to merge.
-        std::vector<SortedRunPtr> input_runs;
-        SortedRunPtr output_run;
-        std::vector<uint32_t> seqnos_to_lock;
-        bool picked = false;
-        {
-            std::lock_guard lock(mutex);
-            std::shared_lock storage_lock(*storage->storage_mutex);
-
-            picked = pickRunsToMerge(input_runs, output_run, seqnos_to_lock);
-            if (picked)
-            {
-                std::string inputs_description;
-                bool first = true;
-                for (const SortedRunPtr & r : input_runs)
-                {
-                    if (!std::exchange(first, false))
-                        inputs_description += ", ";
-                    inputs_description += fmt::format("{}-{} ({} bytes)", r->min_file_seqno, r->max_file_seqno, r->total_block_size);
-                }
-                LOG_DEBUG(storage->log, "{} {}/{} sorted runs: [{}]", output_run ? "Resuming merge of" : "Merging", input_runs.size(), storage->sorted_runs.size(), inputs_description);
-
-                for (uint32_t seqno : seqnos_to_lock)
-                    merges_in_progress.insert(seqno);
-
-                merges_running.fetch_add(1);
-            }
-        }
-
-        if (!picked)
-        {
+        if (!runSingleMerge(/*allow_sleep=*/true))
             merge_requests.acquire();
-            continue;
-        }
+    }
+}
 
-        auto unlock_files = [&]()
+bool BackgroundWork::runSingleMerge(bool allow_sleep)
+{
+    /// Pick files to merge.
+    std::vector<SortedRunPtr> input_runs;
+    SortedRunPtr output_run;
+    std::vector<uint32_t> seqnos_to_lock;
+    bool picked = false;
+    {
+        std::lock_guard lock(mutex);
+        std::shared_lock storage_lock(*storage->storage_mutex);
+
+        picked = pickRunsToMerge(input_runs, output_run, seqnos_to_lock);
+        if (picked)
         {
-            std::lock_guard lock(mutex);
+            std::string inputs_description;
+            bool first = true;
+            for (const SortedRunPtr & r : input_runs)
+            {
+                if (!std::exchange(first, false))
+                    inputs_description += ", ";
+                inputs_description += fmt::format("{}-{} ({} bytes)", r->min_file_seqno, r->max_file_seqno, r->total_block_size);
+            }
+            LOG_DEBUG(storage->log, "{} {}/{} sorted runs: [{}]", output_run ? "Resuming merge of" : "Merging", input_runs.size(), storage->sorted_runs.size(), inputs_description);
+
             for (uint32_t seqno : seqnos_to_lock)
-            {
-                size_t erased = merges_in_progress.erase(seqno);
-                chassert(erased);
-            }
-            merges_running.fetch_sub(1);
-        };
+                merges_in_progress.insert(seqno);
 
-        Stopwatch stopwatch;
-
-        /// Do the merge.
-        try
-        {
-            /// Make a private copy of all involved StorageRun-s. We'll be mutating them in place,
-            /// then shallowCopy-ing them into StorageState when publishing partial results.
-            /// All files in these runs are immutable (SortedRunWriter only adds finished files to
-            /// SortedRun).
-            for (auto & r : input_runs)
-                r = r->shallowCopy();
-            if (output_run)
-                output_run = output_run->shallowCopy();
-            else
-                output_run = std::make_shared<SortedRun>(input_runs.front()->min_file_seqno, input_runs.back()->max_file_seqno);
-
-            /// node_count_delta bookkeeping: the output run takes ownership of the merged nodes'
-            /// count, the (eventually trimmed) inputs contribute 0. Using += (not =) keeps this
-            /// correct for a resumed merge, whose output already carries the sum and whose inputs
-            /// were already zeroed by the original merge.
-            for (const SortedRunPtr & r : input_runs)
-            {
-                output_run->node_count_delta += r->node_count_delta;
-                r->node_count_delta = 0;
-            }
-
-            /// A resumed merge's output files were already counted in ProfileEvents by the
-            /// interrupted merge (files get published, and counted, one at a time).
-            size_t counted_output_files = output_run->files.size();
-
-            SortedRunWriter writer(output_run, storage);
-
-            std::vector<SortedRunNodeStream> input_streams;
-            input_streams.reserve(input_runs.size());
-            for (const SortedRunPtr & r : input_runs)
-                input_streams.emplace_back(r, storage->block_cache.get());
-
-            MergingNodeStream merging_stream;
-            for (SortedRunNodeStream & s : input_streams)
-                merging_stream.addSubstream(&s);
-
-            auto publish_results = [&](bool is_final)
-            {
-                LockMemoryExceptionInThread blocker{VariableContext::Global};
-
-                try
-                {
-                    std::vector<SortedRunPtr> to_publish;
-                    std::vector<SortedFilePtr> removed_files;
-
-                    /// Paths <= min_path_cutoff are now visible in the output SortedRun,
-                    /// paths > min_path_cutoff stay visible in the input SortedRun-s. Trim (and free)
-                    /// the input files that became fully redundant.
-                    ///
-                    /// (Be careful about cancelled-out paths; the following scenario would be a
-                    ///  problem, if it were possible:
-                    ///   1. The MergingNodeStream reported node with path A, we wrote it to the output.
-                    ///   2. The MergingNodeStream looked at path B, saw a Create + Remove, and didn't
-                    ///      report any output node. Nothing was appended to output_run.
-                    ///   3. We decided to publish results. We got min_path_cutoff = A from output_run,
-                    ///      but inputs' dropConsumedFiles dropped files with max_path <= B. The Remove
-                    ///      for path B happened to be dropped, but the Create was kept.
-                    ///   4. Readers now see a Create but no Remove for path B. We have accidentally
-                    ///      performed necromancy.
-                    ///  Currently this is not possible because we only call publish_results after
-                    ///  appending non-cancelled-out node and after finishing the merge.)
-                    if (is_final)
-                    {
-                        /// (Assert that all input was consumed.)
-                        for (size_t i = 0; i < input_runs.size(); ++i)
-                        {
-                            input_streams[i].dropConsumedFiles(removed_files);
-                            chassert(input_runs[i]->files.empty());
-                        }
-                    }
-                    else
-                    {
-                        chassert(!output_run->files.empty());
-                        NodePath min_path_cutoff = output_run->files.back()->blocks.back().max_path;
-                        for (size_t i = 0; i < input_runs.size(); ++i)
-                        {
-                            input_runs[i]->setMinPathCutoff(min_path_cutoff);
-                            input_streams[i].dropConsumedFiles(removed_files);
-                            if (!input_runs[i]->files.empty())
-                                to_publish.push_back(input_runs[i]);
-                        }
-                        chassert(!to_publish.empty());
-                    }
-
-                    if (!output_run->files.empty()) // may be empty if all input nodes cancelled out
-                    {
-                        for (const SortedFilePtr & f : output_run->files)
-                            f->delete_when_destroyed = false;
-
-                        to_publish.push_back(output_run);
-                    }
-
-                    if (!is_final)
-                    {
-                        /// We keep mutating output_run and the input runs, so publish snapshots.
-                        for (SortedRunPtr & r : to_publish)
-                            r = r->shallowCopy();
-                    }
-
-                    /// Publish the updated input and output files.
-                    {
-                        std::lock_guard lock(mutex);
-                        {
-                            std::lock_guard storage_lock(*storage->storage_mutex);
-                            auto & runs = storage->sorted_runs;
-
-                            /// Find the range of runs relevant to this merge.
-                            size_t start_idx = 0;
-                            while (start_idx < runs.size() && runs[start_idx]->min_file_seqno < output_run->min_file_seqno)
-                                ++start_idx;
-                            chassert(start_idx < runs.size());
-                            size_t end_idx = start_idx;
-                            while (end_idx < runs.size() && runs[end_idx]->max_file_seqno <= output_run->max_file_seqno)
-                            {
-                                chassert(merges_in_progress.contains(runs[end_idx]->min_file_seqno));
-                                ++end_idx;
-                            }
-                            chassert(end_idx > start_idx);
-
-                            /// Replace the whole range with to_publish.
-                            runs.erase(runs.begin() + start_idx, runs.begin() + end_idx);
-                            runs.insert(runs.begin() + start_idx, to_publish.begin(), to_publish.end());
-
-                            storage->recalculateWriteThrottling();
-                        }
-
-                        /// TODO: Write manifest file, if we want files to be usable after restart.
-                    }
-
-                    /// Evict newly obsolete files from block cache and mark them for deletion from disk.
-                    size_t consumed_bytes = 0;
-                    for (SortedFilePtr & f : removed_files)
-                    {
-                        consumed_bytes += f->total_block_size;
-
-                        f->removeFromBlockCache(storage->block_cache.get());
-
-                        /// The file is no longer visible to new readers; delete it from disk when the
-                        /// last reader lets go of it.
-                        f->delete_when_destroyed = true;
-
-                        f.reset();
-                    }
-
-                    ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeConsumedFiles, removed_files.size());
-                    ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeConsumedUncompressedBytes, consumed_bytes);
-
-                    size_t written_compressed_bytes = 0;
-                    size_t written_uncompressed_bytes = 0;
-                    for (; counted_output_files < output_run->files.size(); ++counted_output_files)
-                    {
-                        const SortedFile & f = *output_run->files[counted_output_files];
-                        written_compressed_bytes += f.file_size;
-                        written_uncompressed_bytes += f.total_block_size;
-                        ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenFiles);
-                    }
-                    ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenCompressedBytes, written_compressed_bytes);
-                    ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenUncompressedBytes, written_uncompressed_bytes);
-                }
-                catch (...)
-                {
-                    DB::tryLogCurrentException(storage->log, "Unexpected exception");
-                    std::abort();
-                }
-            };
-
-            while (true)
-            {
-                if (shutting_down)
-                    throw Exception(ErrorCodes::ABORTED, "Cancelling merge because of shutdown");
-
-                merging_stream.next();
-                if (merging_stream.at_end)
-                    break;
-
-                writer.appendNode(merging_stream.node);
-
-                if (writer.finishFileIfBigEnough())
-                    publish_results(/*is_final=*/ false);
-            }
-
-            output_run = writer.finish();
-
-            {
-                int64_t sum_of_file_deltas = 0;
-                for (const SortedFilePtr & file : output_run->files)
-                    sum_of_file_deltas += file->node_count_delta;
-                chassert(output_run->node_count_delta == sum_of_file_deltas);
-                output_run->node_count_delta = sum_of_file_deltas;
-            }
-
-            const double duration = stopwatch.elapsedSeconds();
-            LOG_DEBUG(storage->log,
-                "Merged {} sorted runs into a sorted run of {} files ({} bytes) in {:.3} s",
-                input_runs.size(), output_run->files.size(), output_run->total_block_size,
-                duration);
-
-            publish_results(/*is_final=*/ true);
-            ProfileEvents::increment(ProfileEvents::KeeperLSMTMerges);
-            unlock_files();
-            maybeStartMerge();
-        }
-        catch (...)
-        {
-            ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeExceptions);
-            DB::tryLogCurrentException(storage->log, "Merge failed");
-
-            /// Don't retry immediately.
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-
-            unlock_files();
-            continue;
+            merges_running.fetch_add(1);
         }
     }
+
+    if (!picked)
+        return false;
+
+    auto unlock_files = [&]()
+    {
+        std::lock_guard lock(mutex);
+        for (uint32_t seqno : seqnos_to_lock)
+        {
+            size_t erased = merges_in_progress.erase(seqno);
+            chassert(erased);
+        }
+        merges_running.fetch_sub(1);
+    };
+
+    Stopwatch stopwatch;
+
+    /// Do the merge.
+    try
+    {
+        /// Make a private copy of all involved StorageRun-s. We'll be mutating them in place,
+        /// then shallowCopy-ing them into StorageState when publishing partial results.
+        /// All files in these runs are immutable (SortedRunWriter only adds finished files to
+        /// SortedRun).
+        for (auto & r : input_runs)
+            r = r->shallowCopy();
+        if (output_run)
+            output_run = output_run->shallowCopy();
+        else
+            output_run = std::make_shared<SortedRun>(input_runs.front()->min_file_seqno, input_runs.back()->max_file_seqno);
+
+        /// node_count_delta bookkeeping: the output run takes ownership of the merged nodes'
+        /// count, the (eventually trimmed) inputs contribute 0. Using += (not =) keeps this
+        /// correct for a resumed merge, whose output already carries the sum and whose inputs
+        /// were already zeroed by the original merge.
+        for (const SortedRunPtr & r : input_runs)
+        {
+            output_run->node_count_delta += r->node_count_delta;
+            r->node_count_delta = 0;
+        }
+
+        /// A resumed merge's output files were already counted in ProfileEvents by the
+        /// interrupted merge (files get published, and counted, one at a time).
+        size_t counted_output_files = output_run->files.size();
+
+        SortedRunWriter writer(output_run, storage);
+
+        std::vector<SortedRunNodeStream> input_streams;
+        input_streams.reserve(input_runs.size());
+        for (const SortedRunPtr & r : input_runs)
+            input_streams.emplace_back(r, storage->block_cache.get());
+
+        MergingNodeStream merging_stream;
+        for (SortedRunNodeStream & s : input_streams)
+            merging_stream.addSubstream(&s);
+
+        auto publish_results = [&](bool is_final)
+        {
+            LockMemoryExceptionInThread blocker{VariableContext::Global};
+
+            try
+            {
+                std::vector<SortedRunPtr> to_publish;
+                std::vector<SortedFilePtr> removed_files;
+
+                if (is_final)
+                {
+                    /// (Assert that all input was consumed.)
+                    for (size_t i = 0; i < input_runs.size(); ++i)
+                    {
+                        input_streams[i].dropConsumedFiles(removed_files);
+                        chassert(input_runs[i]->files.empty());
+                    }
+                }
+                else
+                {
+                    chassert(!output_run->files.empty());
+                    NodePath min_path_cutoff = output_run->files.back()->blocks.back().max_path;
+                    for (size_t i = 0; i < input_runs.size(); ++i)
+                    {
+                        input_runs[i]->setMinPathCutoff(min_path_cutoff);
+                        input_streams[i].dropConsumedFiles(removed_files);
+                        if (!input_runs[i]->files.empty())
+                            to_publish.push_back(input_runs[i]);
+                    }
+                    chassert(!to_publish.empty());
+                }
+
+                if (!output_run->files.empty()) // may be empty if all input nodes cancelled out
+                {
+                    for (const SortedFilePtr & f : output_run->files)
+                        f->delete_when_destroyed = false;
+
+                    to_publish.push_back(output_run);
+                }
+
+                if (!is_final)
+                {
+                    /// We keep mutating output_run and the input runs, so publish snapshots.
+                    for (SortedRunPtr & r : to_publish)
+                        r = r->shallowCopy();
+                }
+
+                /// Publish the updated input and output files.
+                {
+                    std::lock_guard lock(mutex);
+                    {
+                        std::lock_guard storage_lock(*storage->storage_mutex);
+                        auto & runs = storage->sorted_runs;
+
+                        /// Find the range of runs relevant to this merge.
+                        size_t start_idx = 0;
+                        while (start_idx < runs.size() && runs[start_idx]->min_file_seqno < output_run->min_file_seqno)
+                            ++start_idx;
+                        chassert(start_idx < runs.size());
+                        size_t end_idx = start_idx;
+                        while (end_idx < runs.size() && runs[end_idx]->max_file_seqno <= output_run->max_file_seqno)
+                        {
+                            chassert(merges_in_progress.contains(runs[end_idx]->min_file_seqno));
+                            ++end_idx;
+                        }
+                        chassert(end_idx > start_idx);
+
+                        /// Replace the whole range with to_publish.
+                        runs.erase(runs.begin() + start_idx, runs.begin() + end_idx);
+                        runs.insert(runs.begin() + start_idx, to_publish.begin(), to_publish.end());
+
+                        storage->recalculateWriteThrottling();
+                    }
+
+                    /// TODO: Write manifest file, if we want files to be usable after restart.
+                }
+
+                /// Evict newly obsolete files from block cache and mark them for deletion from disk.
+                size_t consumed_bytes = 0;
+                for (SortedFilePtr & f : removed_files)
+                {
+                    consumed_bytes += f->total_block_size;
+
+                    f->removeFromBlockCache(storage->block_cache.get());
+
+                    /// The file is no longer visible to new readers; delete it from disk when the
+                    /// last reader lets go of it.
+                    f->delete_when_destroyed = true;
+
+                    f.reset();
+                }
+
+                ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeConsumedFiles, removed_files.size());
+                ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeConsumedUncompressedBytes, consumed_bytes);
+
+                size_t written_compressed_bytes = 0;
+                size_t written_uncompressed_bytes = 0;
+                for (; counted_output_files < output_run->files.size(); ++counted_output_files)
+                {
+                    const SortedFile & f = *output_run->files[counted_output_files];
+                    written_compressed_bytes += f.file_size;
+                    written_uncompressed_bytes += f.total_block_size;
+                    ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenFiles);
+                }
+                ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenCompressedBytes, written_compressed_bytes);
+                ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeWrittenUncompressedBytes, written_uncompressed_bytes);
+            }
+            catch (...)
+            {
+                DB::tryLogCurrentException(storage->log, "Unexpected exception");
+                std::abort();
+            }
+        };
+
+        while (true)
+        {
+            if (shutting_down)
+                throw Exception(ErrorCodes::ABORTED, "Cancelling merge because of shutdown");
+
+            merging_stream.next();
+            if (merging_stream.at_end)
+                break;
+
+            writer.appendNode(merging_stream.node);
+
+            if (writer.finishFileIfBigEnough())
+                publish_results(/*is_final=*/ false);
+        }
+
+        output_run = writer.finish();
+
+        {
+            int64_t sum_of_file_deltas = 0;
+            for (const SortedFilePtr & file : output_run->files)
+                sum_of_file_deltas += file->node_count_delta;
+            chassert(output_run->node_count_delta == sum_of_file_deltas);
+            output_run->node_count_delta = sum_of_file_deltas;
+        }
+
+        const double duration = stopwatch.elapsedSeconds();
+        LOG_DEBUG(storage->log,
+            "Merged {} sorted runs into a sorted run of {} files ({} bytes) in {:.3} s",
+            input_runs.size(), output_run->files.size(), output_run->total_block_size,
+            duration);
+
+        publish_results(/*is_final=*/ true);
+        ProfileEvents::increment(ProfileEvents::KeeperLSMTMerges);
+        unlock_files();
+        maybeStartMerge();
+    }
+    catch (...)
+    {
+        ProfileEvents::increment(ProfileEvents::KeeperLSMTMergeExceptions);
+        DB::tryLogCurrentException(storage->log, "Merge failed");
+
+        /// Don't retry immediately.
+        if (allow_sleep)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        unlock_files();
+    }
+    return true;
 }
 
 bool BackgroundWork::pickRunsToMerge(std::vector<SortedRunPtr> & out_inputs, SortedRunPtr & out_partial_output, std::vector<uint32_t> & out_seqnos_to_lock) const

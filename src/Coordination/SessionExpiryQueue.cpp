@@ -1,5 +1,4 @@
 #include <Coordination/SessionExpiryQueue.h>
-#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -26,7 +25,7 @@ bool SessionExpiryQueue::remove(int64_t session_id)
 
 void SessionExpiryQueue::addNewSessionOrUpdate(int64_t session_id, int64_t timeout_ms)
 {
-    int64_t now = getNowMilliseconds();
+    int64_t now = clock();
     /// round up to next interval
     int64_t new_expiry_time = roundToNextInterval(now + timeout_ms);
 
@@ -65,7 +64,7 @@ void SessionExpiryQueue::addNewSessionOrUpdate(int64_t session_id, int64_t timeo
 std::vector<int64_t> SessionExpiryQueue::getExpiredSessions() const
 {
     std::lock_guard lock(mutex);
-    int64_t now = getNowMilliseconds();
+    int64_t now = clock();
     std::vector<int64_t> result;
 
     /// Check all buckets

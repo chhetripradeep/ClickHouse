@@ -14,7 +14,14 @@ namespace DB
 class KeeperLogStore : public nuraft::log_store
 {
 public:
-    KeeperLogStore(LogFileSettings log_file_settings, FlushSettings flush_settings, ReadAheadSettings readahead_settings, KeeperContextPtr keeper_context);
+    KeeperLogStore(
+        LogFileSettings log_file_settings, FlushSettings flush_settings, ReadAheadSettings readahead_settings, KeeperContextPtr keeper_context,
+        Changelog::ExecutionMode execution_mode = Changelog::ExecutionMode::Threaded);
+
+    /// Manual execution only; completion steps must not hold the NuRaft global lock.
+    bool hasPendingTask(Changelog::BackgroundTask task) const TSA_NO_THREAD_SAFETY_ANALYSIS;
+    bool runTask(Changelog::BackgroundTask task) TSA_NO_THREAD_SAFETY_ANALYSIS;
+    size_t discardUnexecutedWritesForTesting();
 
     /// Read log storage from filesystem starting from last_commited_log_index
     void init(uint64_t last_commited_log_index, uint64_t logs_to_keep);

@@ -302,10 +302,11 @@ KeeperStateManager::parseServersConfiguration(const Poco::Util::AbstractConfigur
 }
 
 /// Constructor for tests
-KeeperStateManager::KeeperStateManager(int server_id_, const std::string & host, int port, KeeperContextPtr keeper_context_)
+KeeperStateManager::KeeperStateManager(
+    int server_id_, const std::string & host, int port, KeeperContextPtr keeper_context_, nuraft::ptr<KeeperLogStore> log_store_)
     : my_server_id(server_id_)
     , secure(false)
-    , log_store(nuraft::cs_new<KeeperLogStore>(
+    , log_store(log_store_ ? std::move(log_store_) : nuraft::cs_new<KeeperLogStore>(
           LogFileSettings{.force_sync = false, .compress_logs = false, .rotate_interval = 5000},
           FlushSettings{},
           ReadAheadSettings{},

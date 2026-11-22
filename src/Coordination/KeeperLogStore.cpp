@@ -23,13 +23,32 @@ namespace FailPoints
 namespace DB
 {
 
-KeeperLogStore::KeeperLogStore(LogFileSettings log_file_settings, FlushSettings flush_settings, ReadAheadSettings readahead_settings, KeeperContextPtr keeper_context)
-    : log(getLogger("KeeperLogStore")), changelog(log, log_file_settings, flush_settings, readahead_settings, keeper_context)
+KeeperLogStore::KeeperLogStore(
+    LogFileSettings log_file_settings, FlushSettings flush_settings, ReadAheadSettings readahead_settings, KeeperContextPtr keeper_context,
+    Changelog::ExecutionMode execution_mode)
+    : log(getLogger("KeeperLogStore")), changelog(log, log_file_settings, flush_settings, readahead_settings, keeper_context, execution_mode)
 {
     if (log_file_settings.force_sync)
         LOG_INFO(log, "force_sync enabled");
     else
         LOG_INFO(log, "force_sync disabled");
+}
+
+bool KeeperLogStore::hasPendingTask(Changelog::BackgroundTask task) const
+{
+    return changelog.hasPendingTask(task);
+}
+
+bool KeeperLogStore::runTask(Changelog::BackgroundTask task)
+{
+    /// Manual execution is single-threaded. A completion may re-enter the log store.
+    return changelog.runTask(task);
+}
+
+size_t KeeperLogStore::discardUnexecutedWritesForTesting()
+{
+    ProfiledExclusiveLock lock(changelog_lock, ProfileEvents::KeeperChangelogLockWaitMicroseconds);
+    return changelog.discardUnexecutedWritesForTesting();
 }
 
 uint64_t KeeperLogStore::start_index() const

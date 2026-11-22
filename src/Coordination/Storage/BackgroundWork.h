@@ -23,6 +23,7 @@ struct BackgroundWork
     StorageState * storage = nullptr;
 
     std::atomic<bool> shutting_down{false};
+    bool manual_mode = false;
 
     std::vector<ThreadFromGlobalPool> flush_threads;
     std::vector<ThreadFromGlobalPool> merge_threads;
@@ -59,9 +60,21 @@ struct BackgroundWork
     void maybeStartFlush();
     void maybeStartMerge();
 
+    /// Manual execution mode (for deterministic simulation): runs the exact same production
+    /// flush, merge, and file-deletion paths one step at a time without spawning OS threads.
+    bool isManualMode() const { return manual_mode; }
+    bool hasPendingFileDeletes() const;
+    bool runFileDeleteStep();
+    bool hasPendingFlush() const;
+    bool runFlushStep();
+    bool hasPendingMerge() const;
+    bool runMergeStep();
+
 private:
     void flushThread();
     void mergeThread();
+    bool runSingleFlush(bool allow_sleep);
+    bool runSingleMerge(bool allow_sleep);
 
     /// Perform pending file deletions. Called from flush and merge threads; there are no dedicated
     /// deletion threads.

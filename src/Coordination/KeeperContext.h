@@ -1,6 +1,7 @@
 #pragma once
 #include <Common/ZooKeeper/KeeperFeatureFlags.h>
 #include <Common/ZooKeeper/ZooKeeperConstants.h>
+#include <Coordination/SessionExpiryQueue.h>
 #include <Common/CacheLine.h>
 #include <Common/SharedMutex.h>
 #include <IO/WriteBufferFromString.h>
@@ -30,7 +31,14 @@ using DiskPtr = std::shared_ptr<IDisk>;
 class KeeperContext
 {
 public:
-    KeeperContext(bool standalone_keeper_, CoordinationSettingsPtr coordination_settings_);
+    KeeperContext(
+        bool standalone_keeper_, CoordinationSettingsPtr coordination_settings_,
+        SessionExpiryQueue::Clock session_expiry_clock_ = SessionExpiryQueue::getNowMilliseconds);
+
+    const SessionExpiryQueue::Clock & getSessionExpiryClock() const
+    {
+        return session_expiry_clock;
+    }
 
     enum class Phase : uint8_t
     {
@@ -132,6 +140,9 @@ public:
 
     bool shouldLogRequests() const;
     void setLogRequests(bool log_requests_);
+
+    bool isManualLSMTBackgroundWork() const { return manual_lsmt_background_work; }
+    void setManualLSMTBackgroundWork(bool manual_lsmt_background_work_) { manual_lsmt_background_work = manual_lsmt_background_work_; }
 private:
     /// local disk defined using path or disk name
     using Storage = std::variant<DiskPtr, std::string>;
@@ -183,6 +194,8 @@ private:
 
     bool standalone_keeper;
 
+    const SessionExpiryQueue::Clock session_expiry_clock;
+
     std::unordered_map<std::string, std::string> system_nodes_with_data;
 
     KeeperFeatureFlags feature_flags;
@@ -206,6 +219,7 @@ private:
     CoordinationSettingsPtr dynamic_settings; // hot-reloaded on config file change
 
     bool block_acl = false;
+    bool manual_lsmt_background_work = false;
 
     std::atomic<bool> log_requests = false;
 };

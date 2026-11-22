@@ -60,9 +60,11 @@ thread_local CoordinationSettingsPtr cached_coordination_settings_holder;
 /// Assign unique versions across all instances of KeeperContext.
 static std::atomic<uint64_t> next_coordination_settings_version {1};
 
-KeeperContext::KeeperContext(bool standalone_keeper_, CoordinationSettingsPtr coordination_settings)
+KeeperContext::KeeperContext(
+    bool standalone_keeper_, CoordinationSettingsPtr coordination_settings, SessionExpiryQueue::Clock session_expiry_clock_)
     : disk_selector(std::make_shared<DiskSelector>())
     , standalone_keeper(standalone_keeper_)
+    , session_expiry_clock(std::move(session_expiry_clock_))
 {
     coordination_settings->version = next_coordination_settings_version++;
     fixed_settings = coordination_settings;

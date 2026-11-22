@@ -1160,6 +1160,32 @@ if (ENABLE_TESTS)
     if (TARGET ch_contrib::silk_fibers)
         target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::silk_fibers)
     endif()
+
+    option(ENABLE_KEEPER_SIMULATION "Build the bounded real Keeper state-machine probe" OFF)
+    if (ENABLE_KEEPER_SIMULATION AND TARGET ch_contrib::nuraft)
+        # The unmodified NuRaft example does not follow ClickHouse's warning policy.
+        set_source_files_properties(../contrib/NuRaft/examples/in_memory_log_store.cxx
+            PROPERTIES COMPILE_OPTIONS "-Wno-error")
+        clickhouse_add_executable(keeper_manual_probe EXCLUDE_FROM_ALL
+            ../tests/simulation/nuraft/probe.cpp
+            ../contrib/NuRaft/examples/in_memory_log_store.cxx
+            Common/tests/gtest_global_context.cpp)
+        target_compile_definitions(keeper_manual_probe PRIVATE SIMULATION_KEEPER=1)
+        target_include_directories(keeper_manual_probe SYSTEM PRIVATE
+            ../contrib/NuRaft/examples ../contrib/NuRaft/include/libnuraft)
+        get_target_property(keeper_simulation_libraries unit_tests_dbms LINK_LIBRARIES)
+        target_link_libraries(keeper_manual_probe PRIVATE ${keeper_simulation_libraries})
+        target_link_options(keeper_manual_probe PRIVATE "-Wl,--wrap=pthread_create" "-Wl,--wrap=clock_gettime")
+
+        clickhouse_add_executable(keeper_fdb_sim EXCLUDE_FROM_ALL
+            ../tests/simulation/fdb_sim/main.cpp
+            Common/tests/gtest_global_context.cpp)
+        target_include_directories(keeper_fdb_sim SYSTEM PRIVATE
+            ../contrib/NuRaft/include ../contrib/NuRaft/include/libnuraft)
+        target_include_directories(keeper_fdb_sim PRIVATE ../tests/simulation/fdb_sim)
+        target_link_libraries(keeper_fdb_sim PRIVATE ${keeper_simulation_libraries})
+        target_link_options(keeper_fdb_sim PRIVATE "-Wl,--wrap=pthread_create" "-Wl,--wrap=clock_gettime")
+    endif()
 endif ()
 
 if (TARGET ch_contrib::jwt-cpp)

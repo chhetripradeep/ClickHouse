@@ -5,6 +5,9 @@
 #include <vector>
 #include <mutex>
 #include <chrono>
+#include <cstdint>
+#include <functional>
+#include <utility>
 
 namespace DB
 {
@@ -20,6 +23,15 @@ namespace DB
 /// When new session appear it's added to the existing bucket or create new bucket.
 class SessionExpiryQueue
 {
+public:
+    using Clock = std::function<int64_t()>;
+
+    static int64_t getNowMilliseconds()
+    {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
+
 private:
     /// Session -> timeout ms
     std::unordered_map<int64_t, int64_t> session_to_expiration_time;
@@ -29,13 +41,9 @@ private:
 
     int64_t expiration_interval;
 
-    mutable std::mutex mutex;
+    const Clock clock;
 
-    static int64_t getNowMilliseconds()
-    {
-        using namespace std::chrono;
-        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    }
+    mutable std::mutex mutex;
 
     /// Round time to the next expiration interval. The result used as a key for
     /// expiry_to_sessions map.
@@ -48,8 +56,10 @@ public:
     /// expiration_interval -- how often we will check new sessions and how small
     /// buckets we will have. In ZooKeeper normal session timeout is around 30 seconds
     /// and expiration_interval is about 500ms.
-    explicit SessionExpiryQueue(int64_t expiration_interval_)
+    /// A supplied clock must be safe to call from the queue's callers and return milliseconds.
+    explicit SessionExpiryQueue(int64_t expiration_interval_, Clock clock_ = getNowMilliseconds)
         : expiration_interval(expiration_interval_)
+        , clock(std::move(clock_))
     {
     }
 

@@ -320,6 +320,70 @@ TEST_P(CoordinationTestWithCompression, ChangelogTestSimple)
     EXPECT_EQ(changelog.log_entries(1, 2)->size(), 1);
 }
 
+TEST_P(CoordinationTestWithCompression, ManualChangelogPersistence)
+{
+    ChangelogDirTest test("./logs");
+    this->setLogDirectory("./logs");
+    const DB::LogFileSettings log_settings{
+        .force_sync = true, .compress_logs = this->enable_compression, .rotate_interval = 2, .startup_read_max_streams = 1};
+    const DB::FlushSettings flush_settings{.max_flush_batch_size = 1, .min_time_between_fsyncs_ms = 0};
+    using Task = DB::Changelog::BackgroundTask;
+    using Mode = DB::Changelog::ExecutionMode;
+
+    EXPECT_THROW(DB::KeeperLogStore(log_settings, DB::FlushSettings{}, DB::ReadAheadSettings{}, this->keeper_context, Mode::Manual), DB::Exception);
+    auto replacement = getLogEntry("replacement--613", 29);
+    auto expected = replacement->serialize();
+    {
+        DB::KeeperLogStore store(log_settings, flush_settings, {}, this->keeper_context, Mode::Manual);
+        store.init(0, 0);
+        for (uint64_t index = 1; index <= 6; ++index)
+        {
+            auto entry = getLogEntry("payload-" + std::to_string(index * 731), 17);
+            ASSERT_EQ(store.append(entry), index);
+            store.end_of_append_batch(index, 1);
+            EXPECT_EQ(store.last_durable_index(), index - 1);
+            ASSERT_TRUE(store.runTask(Task::Write));
+            EXPECT_EQ(store.last_durable_index(), index - 1);
+            ASSERT_TRUE(store.runTask(Task::Write));
+            EXPECT_EQ(store.last_durable_index(), index);
+            while (store.runTask(Task::Completion))
+            {
+            }
+        }
+
+        store.write_at(3, replacement);
+        EXPECT_EQ(store.next_slot(), 4);
+        EXPECT_EQ(store.last_durable_index(), 2);
+        store.end_of_append_batch(3, 1);
+        while (store.runTask(Task::Write))
+        {
+        }
+        EXPECT_EQ(store.last_durable_index(), 3);
+        store.compact(2);
+        EXPECT_TRUE(store.hasPendingTask(Task::FileOperation));
+        const std::string old_path = "./logs/changelog_1_2.bin" + this->extension;
+        EXPECT_TRUE(fs::exists(old_path));
+        while (store.runTask(Task::FileOperation))
+        {
+        }
+        EXPECT_FALSE(fs::exists(old_path));
+        auto unwritten = getLogEntry("unwritten--1201", 31);
+        EXPECT_EQ(store.append(unwritten), 4);
+        store.end_of_append_batch(4, 1);
+        EXPECT_EQ(store.last_durable_index(), 3);
+        EXPECT_GE(store.discardUnexecutedWritesForTesting(), 2);
+    }
+    {
+        DB::KeeperLogStore recovered(log_settings, flush_settings, {}, this->keeper_context, Mode::Manual);
+        recovered.init(2, 0);
+        EXPECT_EQ(recovered.start_index(), 3);
+        EXPECT_EQ(recovered.next_slot(), 4);
+        auto actual = recovered.entry_at(3)->serialize();
+        ASSERT_EQ(actual->size(), expected->size());
+        EXPECT_EQ(std::memcmp(actual->data_begin(), expected->data_begin(), expected->size()), 0);
+    }
+}
+
 TEST_P(CoordinationTestWithCompression, ChangelogTestFlushThrottling)
 {
     ChangelogDirTest test("./logs");

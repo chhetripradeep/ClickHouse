@@ -1695,19 +1695,62 @@ TEST_P(CoordinationTest, TestSetACLWithAuthSchemeForAclWhenAuthIsPrecommitted)
 
 TEST_P(CoordinationTest, TestSessionExpiryQueue)
 {
-    using namespace Coordination;
-    SessionExpiryQueue queue(500);
-
-    queue.addNewSessionOrUpdate(1, 1000);
-
-    for (size_t i = 0; i < 2; ++i)
+    int64_t now = 1000;
+    DB::SessionExpiryQueue queue(500, [&now]
     {
-        EXPECT_EQ(queue.getExpiredSessions(), std::vector<int64_t>({}));
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        return now;
+    });
+    queue.addNewSessionOrUpdate(1, 1000);
+    now = 2499;
+    EXPECT_TRUE(queue.getExpiredSessions().empty());
+    now = 2500;
     EXPECT_EQ(queue.getExpiredSessions(), std::vector<int64_t>({1}));
+    queue.addNewSessionOrUpdate(1, 500);
+    now = 3499;
+    EXPECT_TRUE(queue.getExpiredSessions().empty());
+    now = 3500;
+    EXPECT_EQ(queue.getExpiredSessions(), std::vector<int64_t>({1}));
+}
+
+TEST_P(CoordinationTest, TestSessionExpiryClockFromContext)
+{
+    int64_t now = 1000;
+    auto context = std::make_shared<DB::KeeperContext>(true,
+        std::make_shared<DB::CoordinationSettings>(keeper_context->getCoordinationSettings()), [&now]
+    {
+        return now;
+    });
+    auto storage = DB::KeeperStorage::create(500, "", context);
+    const auto session = storage->getSessionID(1000);
+
+    int64_t other_now = 1000;
+    auto other_context = std::make_shared<DB::KeeperContext>(true,
+        std::make_shared<DB::CoordinationSettings>(keeper_context->getCoordinationSettings()), [&other_now]
+    {
+        return other_now;
+    });
+    auto other_storage = DB::KeeperStorage::create(500, "", other_context);
+    other_storage->addSessionID(session, 1500);
+
+    now = 2499;
+    EXPECT_TRUE(storage->getDeadSessions().empty());
+    now = 2500;
+    EXPECT_EQ(storage->getDeadSessions(), std::vector<int64_t>({session}));
+    EXPECT_TRUE(other_storage->getDeadSessions().empty());
+
+    /// Storage recreation and restored sessions must keep the context's clock.
+    storage.reset();
+    storage = DB::KeeperStorage::create(500, "", context);
+    storage->addSessionID(session, 1000);
+    now = 3999;
+    EXPECT_TRUE(storage->getDeadSessions().empty());
+    now = 4000;
+    EXPECT_EQ(storage->getDeadSessions(), std::vector<int64_t>({session}));
+    other_now = 2999;
+    EXPECT_TRUE(other_storage->getDeadSessions().empty());
+    other_now = 3000;
+    EXPECT_EQ(other_storage->getDeadSessions(), std::vector<int64_t>({session}));
+    EXPECT_EQ(storage->getDeadSessions(), std::vector<int64_t>({session}));
 }
 
 TEST_P(CoordinationTest, TestDurableState)

@@ -30,7 +30,8 @@ public:
         int server_id_,
         const std::string & host,
         int port,
-        KeeperContextPtr keeper_context_);
+        KeeperContextPtr keeper_context_,
+        nuraft::ptr<KeeperLogStore> log_store_ = nullptr);
 
     void loadLogStore(uint64_t last_commited_index, uint64_t logs_to_keep);
 
