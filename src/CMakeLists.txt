@@ -1161,17 +1161,17 @@ if (ENABLE_TESTS)
         target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::silk_fibers)
     endif()
 
-    option(ENABLE_KEEPER_SIMULATION "Build the FoundationDB-inspired deterministic Keeper simulator" OFF)
+    option(ENABLE_KEEPER_SIMULATION "Build the deterministic ClickHouse Keeper simulator (keeper_sim)" OFF)
     if (ENABLE_KEEPER_SIMULATION AND TARGET ch_contrib::nuraft)
         get_target_property(keeper_simulation_libraries unit_tests_dbms LINK_LIBRARIES)
-        clickhouse_add_executable(keeper_fdb_sim EXCLUDE_FROM_ALL
-            ../tests/simulation/fdb_sim/main.cpp
+        clickhouse_add_executable(keeper_sim EXCLUDE_FROM_ALL
+            ../tests/simulation/keeper_sim/main.cpp
             Common/tests/gtest_global_context.cpp)
-        target_include_directories(keeper_fdb_sim SYSTEM PRIVATE
+        target_include_directories(keeper_sim SYSTEM PRIVATE
             ../contrib/NuRaft/include ../contrib/NuRaft/include/libnuraft)
-        target_include_directories(keeper_fdb_sim PRIVATE ../tests/simulation/fdb_sim)
-        target_link_libraries(keeper_fdb_sim PRIVATE ${keeper_simulation_libraries})
-        target_link_options(keeper_fdb_sim PRIVATE "-Wl,--wrap=pthread_create" "-Wl,--wrap=clock_gettime")
+        target_include_directories(keeper_sim PRIVATE ../tests/simulation/keeper_sim)
+        target_link_libraries(keeper_sim PRIVATE ${keeper_simulation_libraries})
+        target_link_options(keeper_sim PRIVATE "-Wl,--wrap=pthread_create" "-Wl,--wrap=clock_gettime")
     endif()
 endif ()
 

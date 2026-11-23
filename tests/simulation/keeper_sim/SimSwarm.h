@@ -17,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 /// Pure C++ FoundationDB Joshua-style multi-process swarm runner.
@@ -34,12 +34,31 @@ public:
         uint64_t seed = 1;
         int nodes = 3;
         std::string profile = "balanced";
-        std::string storage = "mem"; // "mem", "lsmt-mem", "lsmt-disk"
+        std::string storage = "mem"; // "mem", "lsmt-mem", "lsmt-disk", "mixed"
         int64_t duration_ms = 15000;
         bool host_delay = false;
         bool strict_raft_commit = false;
         bool unsafe_quorum_control = false;
         bool expect_failure = false;
+        bool no_streaming = false;
+        bool compress_logs = false;
+        bool no_bounded_cache = false;
+        bool dynamic_membership = false;
+        bool late_session_race = false;
+        bool snapshot_torture = false;
+        bool mixed_versions = false;
+        bool async_replication = false;
+        bool leadership_expiry = false;
+        bool force_new_joiner = false;
+        bool no_disk_faults = false;
+        bool backpressure = false;
+        bool large_snap_dist = false;
+        bool acl_torture = false;
+        bool torn_snapshots = false;
+        bool auto_forward = false;
+        bool full_consensus = false;
+        bool rollback_torture = false;
+        bool watch_oracle = false;
     };
 
     struct JobResult
@@ -64,10 +83,47 @@ public:
     {
         std::vector<JobSpec> jobs;
         auto add_group = [&](const std::string & name, const std::string & profile, int nodes,
-                             const std::string & storage, const std::vector<uint64_t> & seeds, int64_t duration_ms)
+                             const std::string & storage, const std::vector<uint64_t> & seeds, int64_t duration_ms,
+                             bool no_streaming = false, bool compress_logs = false, bool no_bounded_cache = false,
+                             bool dynamic_membership = false, bool late_session_race = false,
+                             bool snapshot_torture = false, bool mixed_versions = false,
+                             bool async_replication = false, bool leadership_expiry = false,
+                             bool force_new_joiner = false, bool no_disk_faults = false,
+                             bool backpressure = false, bool large_snap_dist = false,
+                             bool acl_torture = false, bool torn_snapshots = false,
+                             bool auto_forward = false, bool full_consensus = false,
+                             bool rollback_torture = false, bool watch_oracle = false)
         {
             for (uint64_t s : seeds)
-                jobs.push_back(JobSpec{name + "_s" + std::to_string(s), s, nodes, profile, storage, duration_ms, false, false, false, false});
+            {
+                JobSpec spec;
+                spec.name = name + "_s" + std::to_string(s);
+                spec.seed = s;
+                spec.nodes = nodes;
+                spec.profile = profile;
+                spec.storage = storage;
+                spec.duration_ms = duration_ms;
+                spec.no_streaming = no_streaming;
+                spec.compress_logs = compress_logs;
+                spec.no_bounded_cache = no_bounded_cache;
+                spec.dynamic_membership = dynamic_membership;
+                spec.late_session_race = late_session_race;
+                spec.snapshot_torture = snapshot_torture;
+                spec.mixed_versions = mixed_versions;
+                spec.async_replication = async_replication;
+                spec.leadership_expiry = leadership_expiry;
+                spec.force_new_joiner = force_new_joiner;
+                spec.no_disk_faults = no_disk_faults;
+                spec.backpressure = backpressure;
+                spec.large_snap_dist = large_snap_dist;
+                spec.acl_torture = acl_torture;
+                spec.torn_snapshots = torn_snapshots;
+                spec.auto_forward = auto_forward;
+                spec.full_consensus = full_consensus;
+                spec.rollback_torture = rollback_torture;
+                spec.watch_oracle = watch_oracle;
+                jobs.push_back(std::move(spec));
+            }
         };
 
         if (suite == "quick")
@@ -88,9 +144,175 @@ public:
             add_group("lsmt-mem-chaos-3n", "chaos", 3, "lsmt-mem", {51, 52, 53}, 15000);
             add_group("lsmt-disk-chaos-3n", "chaos", 3, "lsmt-disk", {61, 62, 63}, 15000);
         }
+        else if (suite == "hunt")
+        {
+            /// High-intensity bug-hunting campaign with --no-streaming to look past #133552:
+            /// heterogeneous Mem+LSMT-Mem+LSMT-Disk differential clusters, compressed Zstd logs
+            /// under power loss, multi-request batches, extended Keeper ops, TTL/Container GC,
+            /// leadership yield, and 5-node partition storms.
+            add_group("mixed-chaos-3n", "chaos", 3, "mixed", {1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008}, 16000, true, false);
+            add_group("mixed-power-loss-3n", "power-loss", 3, "mixed", {2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008}, 16000, true, true);
+            add_group("mixed-snap-3n", "snapshot-storm", 3, "mixed", {3001, 3002, 3003, 3004, 3005, 3006}, 16000, true, false);
+            add_group("mixed-chaos-5n", "chaos", 5, "mixed", {4001, 4002, 4003, 4004, 4005, 4006}, 16000, true, false);
+            add_group("lsmt-disk-pl-3n", "power-loss", 3, "lsmt-disk", {5001, 5002, 5003, 5004, 5005, 5006}, 16000, true, true);
+            add_group("mem-zstd-pl-3n", "power-loss", 3, "mem", {6001, 6002, 6003, 6004, 6005, 6006}, 16000, true, true);
+        }
+        else if (suite == "hunt2")
+        {
+            /// Wave 2: 60 seeds exercising v9 snapshots with Container & TTL nodes, chunked snapshot
+            /// transfers, Auth + SetACL + ACLMap refcounts, dynamic priority reconfiguration, async
+            /// unsynced torn writes, and mixed Mem/LSMT-Mem/LSMT-Disk (--no-streaming --no-bounded-cache
+            /// to look past Bugs #2, #4, #5, #6).
+            add_group("w2-mixed-chaos-3n", "chaos", 3, "mixed", {10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010}, 16000, true, false, true);
+            add_group("w2-mixed-pl-3n", "power-loss", 3, "mixed", {10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020}, 16000, true, false, true);
+            add_group("w2-mixed-snap-3n", "snapshot-storm", 3, "mixed", {10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028}, 16000, true, false, true);
+            add_group("w2-mixed-chaos-5n", "chaos", 5, "mixed", {10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036}, 16000, true, false, true);
+            add_group("w2-lsmt-disk-3n", "chaos", 3, "lsmt-disk", {10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044}, 16000, true, false, true);
+            add_group("w2-lsmt-pl-3n", "power-loss", 3, "lsmt-disk", {10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052}, 16000, true, true, true);
+            add_group("w2-mem-5n-part", "partition-storm", 5, "mem", {10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060}, 16000, true, false, true);
+        }
+        else if (suite == "hunt3")
+        {
+            /// Wave 3: 80 aggressive seeds stressing multi-file LSMT incremental merges + data_disk I/O
+            /// faults, ghost-session oracle checks, v9 snapshots + chunked transfer, ACLs/Auth, dynamic
+            /// priority reconfiguration, and 3n/5n mixed/LSMT/Mem chaos & power-loss.
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(20001 + i);
+                s2.push_back(20101 + i);
+                s3.push_back(20201 + i);
+                s4.push_back(20301 + i);
+            }
+            add_group("w3-lsmt-multifile-3n", "chaos", 3, "lsmt-disk", s1, 18000, true, false, true);
+            add_group("w3-mixed-chaos-3n", "chaos", 3, "mixed", s2, 18000, true, false, true);
+            add_group("w3-mixed-snap-3n", "snapshot-storm", 3, "mixed", s3, 18000, true, false, true);
+            add_group("w3-mixed-pl-5n", "power-loss", 5, "mixed", s4, 18000, true, false, true);
+        }
+        else if (suite == "hunt4")
+        {
+            /// Wave 4: 80 seeds targeting dynamic membership (`add_srv` voter/learner, `remove_srv`,
+            /// `pack`/`apply_pack` `sync_log_request`, `commit_config`), late-closed-session ghost
+            /// resurrection race, `ListWithOptions`/`CheckStat`/`SetWatches`/`SetWatches2`, and
+            /// preserved-`state_disk` `WipeAndRejoin` snapshot recovery under chaos & power-loss.
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(30001 + i);
+                s2.push_back(30101 + i);
+                s3.push_back(30201 + i);
+                s4.push_back(30301 + i);
+            }
+            add_group("w4-dyn-mixed-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, true, false);
+            add_group("w4-dyn-snap-3n", "snapshot-storm", 3, "lsmt-disk", s2, 18000, true, false, true, true, false);
+            add_group("w4-late-sess-3n", "chaos", 3, "mixed", s3, 18000, true, false, true, false, true);
+            add_group("w4-ops-pl-5n", "power-loss", 5, "mixed", s4, 18000, true, false, true, false, false);
+        }
+        else if (suite == "hunt5")
+        {
+            /// Wave 5: 80 seeds hammering chunked snapshot torture (multi-chunk 64-256B + 30% reply drop
+            /// after exec), mixed-version rolling upgrades (v0/v8 + v1/v9), async_replication + non-zero
+            /// leadership_expiry + Sync requests, and deep large-value LSMT-Disk + dynamic membership!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(40001 + i);
+                s2.push_back(40101 + i);
+                s3.push_back(40201 + i);
+                s4.push_back(40301 + i);
+            }
+            add_group("w5-snap-torture-3n", "snapshot-storm", 3, "mixed", s1, 18000, true, false, true, false, false, true, false, false, false);
+            add_group("w5-mixed-ver-3n", "chaos", 3, "mixed", s2, 18000, true, false, true, false, false, false, true, false, false);
+            add_group("w5-async-repl-3n", "partition-storm", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, true, true);
+            add_group("w5-lsmt-deep-5n", "chaos", 5, "lsmt-disk", s4, 18000, true, false, true, true, false, true, false, false, false);
+        }
+        else if (suite == "hunt6")
+        {
+            /// Wave 6: 80 seeds with strict fatal `system_exit` checking:
+            /// 1. Chunked snapshot torture + fast follower reboots + 5-min `snapshot_sync_ctx_timeout_`
+            ///    + ZERO disk faults (targets `save_logical_snp_obj` missing-throw on `is_last_obj`!).
+            /// 2. Dynamic membership with `use_new_joiner_type_ = true` (looks past Bug #9!).
+            /// 3. Compressed Zstd logs + unbounded cache under power-loss & snapshot-storm.
+            /// 4. 5-node mixed Mem/LSMT-Mem/LSMT-Disk heavy chaos with large values & all ZK ops.
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(50001 + i);
+                s2.push_back(50101 + i);
+                s3.push_back(50201 + i);
+                s4.push_back(50301 + i);
+            }
+            add_group("w6-snap-reboot-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, true, false, false, false, false, true);
+            add_group("w6-dyn-newjoiner-3n", "chaos", 3, "mixed", s2, 18000, true, false, true, true, false, true, false, false, false, true, true);
+            add_group("w6-zstd-unbounded-3n", "power-loss", 3, "mixed", s3, 18000, true, true, true, false, false, false, false, false, false, false, true);
+            add_group("w6-mixed-5n-heavy", "chaos", 5, "mixed", s4, 18000, true, false, true, true, false, true, false, false, false, true, false);
+        }
+        else if (suite == "hunt7")
+        {
+            /// Wave 7: 80 seeds targeting brand-new NuRaft backpressure (`bpon`/`bpoff`,
+            /// `max_uncommitted_log_entries_`, `slow_member_backpressure_*`, `max_append_size_bytes_`,
+            /// `append_entries_backward_probe_throttle_threshold_`, `track_peers_sm_commit_idx_`),
+            /// AND real `parallel_log_appending_ = true` streaming mode under power-loss & partitions
+            /// (with large snapshot_distance to avoid Bug #2 #133552)!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(60001 + i);
+                s2.push_back(60101 + i);
+                s3.push_back(60201 + i);
+                s4.push_back(60301 + i);
+            }
+            add_group("w7-bp-stream-3n", "chaos", 3, "mixed", s1, 18000, false, false, true, false, false, false, false, false, false, false, true, true, true);
+            add_group("w7-bp-dyn-5n", "chaos", 5, "mixed", s2, 18000, true, false, true, true, false, true, false, false, false, true, true, true, false);
+            add_group("w7-stream-pl-3n", "power-loss", 3, "mixed", s3, 18000, false, false, true, false, false, false, false, false, false, false, true, true, true);
+            add_group("w7-stream-part-5n", "partition-storm", 5, "mixed", s4, 18000, false, false, true, false, false, false, false, false, false, false, true, true, true);
+        }
+        else if (suite == "hunt8")
+        {
+            /// Wave 8: 80 seeds targeting:
+            /// 1. Differential local-read oracle (`Get`/`Exists`/`List`/`FilteredList`/`ListWithOptions`/`GetACL`/`MultiRead`)
+            ///    + 30-user high-churn `ACLMap` torture + Watch-map bijection & `total_watches_count` / `ttl_paths` /
+            ///    `container_paths` / `committed_ephemerals` invariants!
+            /// 2. Multi-snapshot retention (`snapshots_to_keep = 3`) + torn/corrupted latest snapshot fallback on power loss!
+            /// 3. 5-node LSMT-Disk differential reads + `ACLMap` + `backpressure` + `Create2`/`CheckNotExists(version)`!
+            /// 4. Heavy watch/session/container-GC/snapshot-storm torture!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(70001 + i);
+                s2.push_back(70101 + i);
+                s3.push_back(70201 + i);
+                s4.push_back(70301 + i);
+            }
+            add_group("w8-acl-read-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, true, false);
+            add_group("w8-torn-snap-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, true);
+            add_group("w8-lsmt-read-5n", "chaos", 5, "lsmt-disk", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, true, false, true, false);
+            add_group("w8-watch-snap-3n", "snapshot-storm", 3, "mixed", s4, 18000, true, false, true, false, false, false, false, false, false, false, true, true, false, true, false);
+        }
+        else if (suite == "hunt9")
+        {
+            /// Wave 9: 80 seeds hammering 4 brand-new surfaces:
+            /// 1. NuRaft `auto_forwarding_ = true` (submitting writes + `set_priority` directly to FOLLOWERS!)
+            /// 2. NuRaft `use_full_consensus_among_healthy_members_ = true` + `grace_period_of_lagging_state_machine_`!
+            /// 3. Hot-key 2-path overlapping uncommitted mutation + partial Raft rollback torture (Mem vs LSMT-Mem vs LSMT-Disk)!
+            /// 4. Watch semantic oracle (`CheckWatch` per-session leak, `SetWatches` `Event::CHANGED` vs `Event::CHILD`)!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(80001 + i);
+                s2.push_back(80101 + i);
+                s3.push_back(80201 + i);
+            }
+            for (uint64_t i = 0; i < 10; ++i)
+                s4.push_back(80301 + i);
+            add_group("w9-autofwd-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, true, false, false, false);
+            add_group("w9-fullcons-5n", "partition-storm", 5, "mixed", s2, 18000, true, false, true, true, false, false, false, false, false, true, true, false, true, false, false, false, true, false, false);
+            add_group("w9-rollback-hot-3n", "partition-storm", 3, "mixed", s3, 18000, false, false, true, false, false, false, false, false, false, false, true, false, true, true, false, false, false, true, false);
+            add_group("w9-watch-oracle-3n", "clean", 3, "mixed", s4, 10000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, true);
+        }
         else
         {
-            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick or full)");
+            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt, hunt2, hunt3, hunt4, hunt5, hunt6, hunt7, hunt8, or hunt9)");
         }
         return jobs;
     }
@@ -111,7 +333,7 @@ public:
         /// 1. Run instrumentation control in an isolated child process.
         {
             auto ctrl = runOneSubprocess(self_exe, {"--instrumentation-control"}, JobSpec{"instrumentation-control"}, work_dir);
-            if (ctrl.exit_code != 0 || ctrl.stdout_text.find("PASS fdb-sim-instrumentation-control") == std::string::npos)
+            if (ctrl.exit_code != 0 || ctrl.stdout_text.find("PASS keeper-sim-instrumentation-control") == std::string::npos)
             {
                 std::cerr << "[FAIL] instrumentation-control: " << ctrl.stderr_text << '\n';
                 return 1;
@@ -196,7 +418,7 @@ public:
         const double total_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
         const bool all_ok = (passed_count == results.size()) && (det_passed == det_results.size());
 
-        std::cout << "\n=== C++ FDB-Style Simulation Swarm Report ===\n";
+        std::cout << "\n=== Keeper Deterministic Simulation Swarm Report ===\n";
         std::cout << "Verdict: " << (all_ok ? "PASS" : "FAIL")
                   << " (" << passed_count << "/" << results.size() << " seeds passed, "
                   << det_passed << "/" << det_results.size() << " determinism checks passed, "
@@ -303,6 +525,46 @@ private:
             args.push_back("--lsmt");
         else if (spec.storage == "lsmt-disk")
             args.push_back("--lsmt-disk");
+        else if (spec.storage == "mixed")
+            args.push_back("--mixed-storage");
+        if (spec.no_streaming)
+            args.push_back("--no-streaming");
+        if (spec.compress_logs)
+            args.push_back("--compress-logs");
+        if (spec.no_bounded_cache)
+            args.push_back("--no-bounded-cache");
+        if (spec.dynamic_membership)
+            args.push_back("--dynamic-membership");
+        if (spec.late_session_race)
+            args.push_back("--late-session-race");
+        if (spec.snapshot_torture)
+            args.push_back("--snapshot-torture");
+        if (spec.mixed_versions)
+            args.push_back("--mixed-versions");
+        if (spec.async_replication)
+            args.push_back("--async-replication");
+        if (spec.leadership_expiry)
+            args.push_back("--leadership-expiry");
+        if (spec.force_new_joiner)
+            args.push_back("--force-new-joiner");
+        if (spec.no_disk_faults)
+            args.push_back("--no-disk-faults");
+        if (spec.backpressure)
+            args.push_back("--backpressure");
+        if (spec.large_snap_dist)
+            args.push_back("--large-snap-dist");
+        if (spec.acl_torture)
+            args.push_back("--acl-torture");
+        if (spec.torn_snapshots)
+            args.push_back("--torn-snapshots");
+        if (spec.auto_forward)
+            args.push_back("--auto-forward");
+        if (spec.full_consensus)
+            args.push_back("--full-consensus");
+        if (spec.rollback_torture)
+            args.push_back("--rollback-torture");
+        if (spec.watch_oracle)
+            args.push_back("--watch-oracle");
         if (spec.host_delay)
             args.push_back("--host-delay");
         if (spec.strict_raft_commit)
@@ -560,4 +822,4 @@ private:
     }
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

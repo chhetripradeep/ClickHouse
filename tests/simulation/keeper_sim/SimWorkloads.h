@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 /// FoundationDB-inspired Concurrent Multi-Session ZooKeeper Workload Actor.
@@ -34,6 +34,7 @@ public:
         int64_t timeout_ms = 8000;
         bool alive = false;
         bool letting_expire = false;
+        bool auth_submitted = false;
     };
 
     ZooKeeperWorkload(SimEngine & engine_, SimCluster & cluster_, int64_t workload_end_ms_)
@@ -71,10 +72,12 @@ public:
             return false;
 
         cluster.getKeeperOracle().recordClientInvoke(sid, req->xid, g_sim_time_ns);
+        final_barrier_in_flight = true;
         const int64_t xid = req->xid;
         res->when_ready(
             [this, sid, xid](nuraft::cmd_result<nuraft::ptr<nuraft::buffer>> & r, nuraft::ptr<std::exception> & err)
             {
+                final_barrier_in_flight = false;
                 const bool ok = !err && r.get_result_code() == nuraft::cmd_result_code::OK;
                 cluster.getKeeperOracle().recordClientOutcome(sid, xid, ok, g_sim_time_ns);
                 if (ok)
@@ -84,6 +87,7 @@ public:
     }
 
     bool isFinalBarrierAcked() const { return final_barrier_acked; }
+    bool isFinalBarrierInFlight() const { return final_barrier_in_flight; }
 
     uint64_t ops_submitted = 0;
     uint64_t ops_rejected_no_leader = 0;
@@ -96,8 +100,9 @@ public:
     {
         if (last_acked_lin_val == 0)
             return;
-        for (const auto & [id, node] : cluster.getNodes())
+        for (int id : cluster.currentClusterMemberIds())
         {
+            const auto & node = cluster.getNodes().at(id);
             if (!node.online || !node.machine)
                 continue;
             std::string data;
@@ -182,6 +187,32 @@ private:
         /// Periodically send heartbeats for active sessions that are NOT deliberately expiring.
         for (auto & [sid, sess] : sessions)
         {
+            if (sess.alive && !sess.letting_expire && !sess.auth_submitted && (sid == 1 || engine.rng.chance(0.55)))
+            {
+                sess.auth_submitted = true;
+                auto auth = std::make_shared<Coordination::ZooKeeperAuthRequest>();
+                auth->xid = sess.next_xid++;
+                auth->scheme = "digest";
+                if (engine.buggify.acl_torture)
+                {
+                    const int64_t uid = (sid == 1) ? 0 : engine.rng.rangeInt(0, 29);
+                    auth->data = "u" + std::to_string(uid) + ":p" + std::to_string(uid);
+                }
+                else
+                {
+                    auth->data = (sid % 2 == 1) ? "simuser:simpass" : "simuser2:pass2";
+                }
+                cluster.submitRequest(leader, auth, sid);
+            }
+            if (engine.buggify.acl_torture && sess.alive && !sess.letting_expire && engine.rng.chance(0.08))
+            {
+                auto auth = std::make_shared<Coordination::ZooKeeperAuthRequest>();
+                auth->xid = sess.next_xid++;
+                auth->scheme = "digest";
+                const int64_t uid = engine.rng.rangeInt(0, 29);
+                auth->data = "u" + std::to_string(uid) + ":p" + std::to_string(uid);
+                cluster.submitRequest(leader, auth, sid);
+            }
             if (sess.alive && !sess.letting_expire && engine.rng.chance(0.18))
             {
                 auto hb = std::make_shared<Coordination::ZooKeeperHeartbeatRequest>();
@@ -215,6 +246,35 @@ private:
             return;
         }
 
+        /// Late in-flight request race after session Close (models follower-forwarded write or local read
+        /// arriving after leader's sessionCleanerTask commits Close(sid)).
+        if (engine.buggify.enable_late_session_race
+            && !cluster.getRecentlyClosedSessions().empty()
+            && engine.rng.chance(0.35))
+        {
+            const int64_t closed_sid = engine.rng.pick(cluster.getRecentlyClosedSessions());
+            if (engine.rng.chance(0.50))
+            {
+                auto online = cluster.onlineNodes();
+                if (!online.empty())
+                {
+                    auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+                    g->path = "/sim";
+                    g->xid = 550000 + static_cast<int64_t>(++reads_executed);
+                    cluster.executeLocalRead(engine.rng.pick(online), g, closed_sid);
+                    engine.coverage.hit("late_closed_session_read");
+                }
+            }
+            else
+            {
+                auto hb = std::make_shared<Coordination::ZooKeeperHeartbeatRequest>();
+                hb->xid = 560000 + static_cast<int64_t>(++ops_submitted);
+                cluster.submitRequest(leader, hb, closed_sid);
+                engine.coverage.hit("late_closed_session_write");
+            }
+            return;
+        }
+
         /// Mix of linearizability register updates, general writes (Single + Multi), and local Reads + Watches!
         if (engine.rng.chance(0.12))
         {
@@ -238,11 +298,66 @@ private:
         if (candidates.empty())
             return;
 
+        /// Choose target server for writes: leader normally, or 65% follower when `--auto-forward` is active!
+        int write_target = leader;
+        if (engine.buggify.auto_forward && engine.rng.chance(0.65))
+        {
+            std::vector<int> followers;
+            for (int oid : cluster.onlineNodes())
+                if (oid != leader)
+                    followers.push_back(oid);
+            if (!followers.empty())
+                write_target = engine.rng.pick(followers);
+        }
+
+        /// With `multi_request_batches` active, pack 2..5 mixed requests into a single Raft log entry (`write_log_entry_version = 1`)!
+        if (engine.buggify.multi_request_batches && engine.rng.chance(0.45))
+        {
+            const size_t batch_size = engine.rng.rangeSize(2, 5);
+            std::vector<DB::KeeperRequestForSession> batch_entries;
+            std::vector<std::pair<int64_t, int64_t>> batch_ids;
+            batch_entries.reserve(batch_size);
+            for (size_t b = 0; b < batch_size; ++b)
+            {
+                const int64_t b_sid = engine.rng.pick(candidates);
+                auto & b_sess = sessions.at(b_sid);
+                Coordination::ZooKeeperRequestPtr req = engine.rng.chance(0.30)
+                    ? buildMultiRequest(b_sess)
+                    : buildSingleWriteRequest(b_sess);
+                req->xid = b_sess.next_xid++;
+                batch_ids.emplace_back(b_sid, req->xid);
+                DB::KeeperRequestForSession entry;
+                entry.session_id = b_sid;
+                entry.time = simTimeMs();
+                entry.request = std::move(req);
+                batch_entries.push_back(std::move(entry));
+            }
+            auto res = cluster.submitRequestBatch(write_target, std::move(batch_entries), /*log_entry_version=*/1);
+            if (!res || !res->get_accepted())
+            {
+                ++ops_rejected_no_leader;
+                return;
+            }
+            ops_submitted += batch_ids.size();
+            for (const auto & [b_sid, b_xid] : batch_ids)
+                cluster.getKeeperOracle().recordClientInvoke(b_sid, b_xid, g_sim_time_ns);
+            res->when_ready(
+                [this, batch_ids](nuraft::cmd_result<nuraft::ptr<nuraft::buffer>> & r, nuraft::ptr<std::exception> & err)
+                {
+                    const bool ok = !err && r.get_result_code() == nuraft::cmd_result_code::OK;
+                    for (const auto & [b_sid, b_xid] : batch_ids)
+                        cluster.getKeeperOracle().recordClientOutcome(b_sid, b_xid, ok, g_sim_time_ns);
+                });
+            return;
+        }
+
         const int64_t sid = engine.rng.pick(candidates);
         auto & sess = sessions.at(sid);
 
-        /// With 35% probability, submit a pipelined burst of 2-3 writes!
-        const size_t burst = engine.rng.chance(0.35) ? engine.rng.rangeSize(2, 3) : 1;
+        /// With 35% probability (or 80% under rollback_torture), submit a pipelined burst of writes!
+        const size_t burst = engine.buggify.rollback_torture
+            ? engine.rng.rangeSize(4, 6)
+            : (engine.rng.chance(0.35) ? engine.rng.rangeSize(2, 3) : 1);
         for (size_t b = 0; b < burst; ++b)
         {
             Coordination::ZooKeeperRequestPtr req;
@@ -253,7 +368,7 @@ private:
 
             req->xid = sess.next_xid++;
             const int64_t xid = req->xid;
-            auto res = cluster.submitRequest(leader, req, sid);
+            auto res = cluster.submitRequest(write_target, req, sid);
             if (!res || !res->get_accepted())
             {
                 ++ops_rejected_no_leader;
@@ -332,34 +447,96 @@ private:
 
     std::string pickPath()
     {
+        if (engine.buggify.rollback_torture)
+            return engine.rng.chance(0.50) ? "/sim/h0" : "/sim/h0/c0";
         const int64_t bucket = engine.rng.rangeInt(0, 7);
         std::string p = "/sim/k" + std::to_string(bucket);
         if (engine.rng.chance(0.35))
+        {
             p += "/c" + std::to_string(engine.rng.rangeInt(0, 2));
+            if (engine.buggify.large_values && engine.rng.chance(0.35))
+                p += "/d" + std::to_string(engine.rng.rangeInt(0, 1));
+        }
         return p;
     }
 
-    Coordination::ZooKeeperRequestPtr buildSingleWriteRequest(ClientSession & /*sess*/)
+    std::string makePayload(const std::string & prefix)
     {
-        const int64_t kind = engine.rng.rangeInt(0, 9);
-        if (kind <= 3)
+        std::string s = prefix + std::to_string(engine.rng.nextU32());
+        if (engine.buggify.large_values)
         {
-            /// Create (persistent, ephemeral, or sequential)
+            const size_t pad = engine.rng.rangeSize(200, 640);
+            s.append(pad, static_cast<char>('a' + (engine.rng.nextU32() % 26)));
+        }
+        return s;
+    }
+
+    Coordination::ZooKeeperRequestPtr buildSingleWriteRequest(ClientSession & /*sess*/, bool for_multi = false)
+    {
+        static const std::string simuser_digest = DB::KeeperStorage::generateDigest("simuser:simpass");
+        auto random_acls = [&]() -> Coordination::ACLs
+        {
+            if (engine.buggify.acl_torture && engine.rng.chance(0.65))
+            {
+                Coordination::ACLs out;
+                const size_t cnt = engine.rng.rangeSize(1, 3);
+                for (size_t i = 0; i < cnt; ++i)
+                {
+                    const int64_t uid = engine.rng.rangeInt(0, 29);
+                    const std::string cred = "u" + std::to_string(uid) + ":p" + std::to_string(uid);
+                    const int32_t perms = engine.rng.chance(0.75)
+                        ? Coordination::ACL::All
+                        : (Coordination::ACL::Read | Coordination::ACL::Write | Coordination::ACL::Create);
+                    out.push_back({perms, "digest", DB::KeeperStorage::generateDigest(cred)});
+                }
+                if (engine.rng.chance(0.45))
+                    out.push_back({Coordination::ACL::All, "world", "anyone"});
+                return out;
+            }
+            if (engine.rng.chance(0.20))
+                return {{Coordination::ACL::All, "digest", simuser_digest}};
+            return {{Coordination::ACL::All, "world", "anyone"}};
+        };
+        const int64_t kind = engine.rng.rangeInt(0, 16);
+        if (kind <= 4)
+        {
+            /// Create (persistent, ephemeral, sequential, Create2, CreateIfNotExists, CreateContainer, or CreateTTL)
             auto req = std::make_shared<Coordination::ZooKeeperCreateRequest>();
             const bool seq = (kind == 3);
             req->path = seq ? ("/sim/seq-" + std::to_string(engine.rng.rangeInt(0, 1)) + "-") : pickPath();
-            req->data = "v-" + std::to_string(engine.rng.nextU32());
-            req->is_ephemeral = (!seq && engine.rng.chance(0.35));
-            req->is_sequential = seq;
-            req->acls = {{31, "world", "anyone"}};
+            req->data = makePayload("v-");
+            req->acls = random_acls();
+            if (seq)
+            {
+                req->is_sequential = true;
+                req->include_stats = engine.rng.chance(0.30);
+            }
+            else if (kind == 4)
+            {
+                const int64_t sub = engine.buggify.mixed_versions ? 0 : engine.rng.rangeInt(0, 2);
+                if (sub == 0)
+                    req->not_exists = true; // CreateIfNotExists
+                else if (sub == 1)
+                    req->is_container = true; // CreateContainer
+                else
+                {
+                    req->include_ttl = true; // CreateTTL (short virtual TTL for GC!)
+                    req->ttl = engine.rng.rangeInt(1200, 3500);
+                }
+            }
+            else
+            {
+                req->is_ephemeral = engine.rng.chance(0.35);
+                req->include_stats = engine.rng.chance(0.30);
+            }
             return req;
         }
-        if (kind <= 6)
+        if (kind <= 8)
         {
             /// Set (unconditional or versioned CAS)
             auto req = std::make_shared<Coordination::ZooKeeperSetRequest>();
             req->path = pickPath();
-            req->data = "upd-" + std::to_string(engine.rng.nextU32());
+            req->data = makePayload("upd-");
             if (engine.rng.chance(0.5))
             {
                 const auto & tree = cluster.getKeeperOracle().latestTree().nodes;
@@ -375,16 +552,82 @@ private:
             }
             return req;
         }
-        if (kind <= 8)
+        if (kind <= 10)
         {
-            /// Remove (versioned or unconditional)
+            /// Remove or TryRemove
             auto req = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
             req->path = pickPath();
             req->version = engine.rng.chance(0.5) ? -1 : static_cast<int32_t>(engine.rng.rangeInt(0, 2));
+            req->try_remove = (kind == 10);
             return req;
         }
+        if (kind == 11)
+        {
+            /// RemoveRecursive (with small or generous limit to test both ZNOTEMPTY and deep subtree delete!)
+            auto req = std::make_shared<Coordination::ZooKeeperRemoveRecursiveRequest>();
+            req->path = "/sim/k" + std::to_string(engine.rng.rangeInt(0, 7));
+            req->remove_nodes_limit = static_cast<uint32_t>(engine.rng.rangeInt(1, 8));
+            return req;
+        }
+        if ((kind == 12 || kind == 13) && !for_multi)
+        {
+            /// SetACL (exercises ACLMap refcounting, aversion CAS, world/digest/auth ACLs, and rollback!)
+            auto req = std::make_shared<Coordination::ZooKeeperSetACLRequest>();
+            req->path = pickPath();
+            req->version = engine.rng.chance(0.55) ? -1 : static_cast<int32_t>(engine.rng.rangeInt(0, 2));
+            const int64_t acl_mode = engine.rng.rangeInt(0, 2);
+            if (engine.buggify.acl_torture && engine.rng.chance(0.70))
+                req->acls = random_acls();
+            else if (acl_mode == 0)
+                req->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            else if (acl_mode == 1)
+                req->acls = {{Coordination::ACL::All, "digest", simuser_digest}};
+            else
+                req->acls = {{Coordination::ACL::All, "auth", ""}};
+            return req;
+        }
+        if (kind == 16 && !for_multi)
+        {
+            auto req = std::make_shared<Coordination::ZooKeeperSyncRequest>();
+            req->path = pickPath();
+            engine.coverage.hit("sync_request_submitted");
+            return req;
+        }
+        /// Check, CheckNotExists, or CheckStat
         auto req = std::make_shared<Coordination::ZooKeeperCheckRequest>();
         req->path = pickPath();
+        if (kind == 14)
+        {
+            Coordination::Stat st{};
+            st.czxid = -1;
+            st.mzxid = -1;
+            st.ctime = -1;
+            st.mtime = -1;
+            st.version = -1;
+            st.cversion = -1;
+            st.aversion = -1;
+            st.ephemeralOwner = -1;
+            st.dataLength = -1;
+            st.numChildren = -1;
+            st.pzxid = -1;
+            const auto & tree = cluster.getKeeperOracle().latestTree().nodes;
+            auto it = tree.find(req->path);
+            if (it != tree.end() && engine.rng.chance(0.7))
+            {
+                st.version = it->second.version;
+                st.aversion = it->second.aversion;
+                st.dataLength = static_cast<int32_t>(it->second.data.size());
+            }
+            else
+            {
+                st.version = static_cast<int32_t>(engine.rng.rangeInt(0, 2));
+                st.numChildren = static_cast<int32_t>(engine.rng.rangeInt(0, 2));
+            }
+            req->stat_to_check = st;
+            req->version = -1;
+            return req;
+        }
+        req->not_exists = (kind >= 15);
         req->version = engine.rng.chance(0.5) ? -1 : static_cast<int32_t>(engine.rng.rangeInt(0, 2));
         return req;
     }
@@ -444,7 +687,7 @@ private:
             /// Random 2-3 op mix.
             const size_t n = engine.rng.rangeSize(2, 3);
             for (size_t i = 0; i < n; ++i)
-                multi->requests.push_back(buildSingleWriteRequest(sess));
+                multi->requests.push_back(buildSingleWriteRequest(sess, /*for_multi=*/true));
         }
         return multi;
     }
@@ -458,9 +701,14 @@ private:
         if (sid == 0)
             return;
         const int target_node = engine.rng.pick(online);
+        /// Avoid triggering known Bug #133645 (processLocalRequests inserting `{sid, 0}` on a
+        /// lagging follower that hasn't committed `SessionID(sid)` yet) unless explicitly testing it.
+        const auto & tnode = cluster.getNodes().at(target_node);
+        if (!tnode.machine || !cluster.getKeeperOracle().sessionKnownAt(tnode.machine->last_commit_index(), sid))
+            return;
         const std::string path = engine.rng.chance(0.3) ? "/sim" : pickPath();
 
-        const int64_t kind = engine.rng.rangeInt(0, 2);
+        const int64_t kind = engine.rng.rangeInt(0, 12);
         Coordination::ZooKeeperRequestPtr req;
         if (kind == 0)
         {
@@ -476,11 +724,110 @@ private:
             r->has_watch = true;
             req = r;
         }
-        else
+        else if (kind == 2)
         {
             auto r = std::make_shared<Coordination::ZooKeeperExistsRequest>();
             r->path = path;
             r->has_watch = true;
+            req = r;
+        }
+        else if (kind == 3)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperAddWatchRequest>();
+            r->path = path;
+            r->mode = engine.rng.chance(0.5)
+                ? Coordination::AddWatchRequest::AddWatchMode::PERSISTENT
+                : Coordination::AddWatchRequest::AddWatchMode::PERSISTENT_RECURSIVE;
+            req = r;
+        }
+        else if (kind == 4)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperListRecursiveRequest>();
+            r->path = "/sim";
+            r->children_nodes_limit = static_cast<uint32_t>(engine.rng.rangeInt(2, 32));
+            req = r;
+        }
+        else if (kind == 5)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperGetACLRequest>();
+            r->path = path;
+            req = r;
+        }
+        else if (kind == 6)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperListRequest>();
+            r->path = "/sim";
+            const int64_t lt = engine.rng.rangeInt(0, 2);
+            r->list_request_type = (lt == 0) ? Coordination::ListRequestType::ALL
+                : (lt == 1 ? Coordination::ListRequestType::PERSISTENT_ONLY : Coordination::ListRequestType::EPHEMERAL_ONLY);
+            r->with_stat = engine.rng.chance(0.5);
+            r->with_data = engine.rng.chance(0.5);
+            r->has_watch = engine.rng.chance(0.5);
+            req = r;
+        }
+        else if (kind == 7)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+            r->operation_type = Coordination::ZooKeeperMultiRequest::OperationType::Read;
+            auto g1 = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g1->path = path;
+            auto e1 = std::make_shared<Coordination::ZooKeeperExistsRequest>();
+            e1->path = "/sim";
+            auto a1 = std::make_shared<Coordination::ZooKeeperGetACLRequest>();
+            a1->path = path;
+            r->requests = {g1, e1, a1};
+            req = r;
+        }
+        else if (kind == 8)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperCheckWatchRequest>();
+            r->path = path;
+            r->type = Coordination::CheckWatchRequest::CheckWatchType::ANY;
+            req = r;
+        }
+        else if (kind == 9)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperRemoveWatchRequest>();
+            r->path = path;
+            r->type = Coordination::RemoveWatchRequest::WatchType::ANY;
+            req = r;
+        }
+        else if (kind == 10)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperListWithOptionsRequest>();
+            r->path = "/sim";
+            const int64_t lt = engine.rng.rangeInt(0, 2);
+            r->options.filter = (lt == 0) ? Coordination::ListRequestType::ALL
+                : (lt == 1 ? Coordination::ListRequestType::PERSISTENT_ONLY : Coordination::ListRequestType::EPHEMERAL_ONLY);
+            r->options.with_stat = engine.rng.chance(0.5);
+            r->options.with_data = engine.rng.chance(0.5);
+            r->options.recursive = engine.rng.chance(0.5);
+            r->options.max_results = r->options.recursive ? static_cast<uint32_t>(engine.rng.rangeInt(2, 16)) : 0;
+            r->options.shuffle = !r->options.recursive && engine.rng.chance(0.4);
+            r->has_watch = !r->options.recursive && engine.rng.chance(0.4);
+            engine.coverage.hit("list_with_options_executed");
+            req = r;
+        }
+        else if (kind == 11)
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperSetWatchesRequest>();
+            r->zxid = engine.rng.rangeInt(0, 5);
+            r->data_watches = {path};
+            r->exist_watches = {pickPath()};
+            r->child_watches = {"/sim"};
+            engine.coverage.hit("set_watches_executed");
+            req = r;
+        }
+        else
+        {
+            auto r = std::make_shared<Coordination::ZooKeeperSetWatches2Request>();
+            r->zxid = engine.rng.rangeInt(0, 5);
+            r->data_watches = {path};
+            r->exist_watches = {pickPath()};
+            r->child_watches = {"/sim"};
+            r->persistent_watches = {path};
+            r->persistent_recursive_watches = {"/sim"};
+            engine.coverage.hit("set_watches2_executed");
             req = r;
         }
         req->xid = 500000 + static_cast<int64_t>(++reads_executed);
@@ -551,6 +898,7 @@ private:
     int64_t session_alloc_seq = 0;
     int64_t barrier_counter = 0;
     bool final_barrier_acked = false;
+    bool final_barrier_in_flight = false;
     bool lin_reg_created = false;
     bool lin_write_in_flight = false;
     uint64_t lin_seq_counter = 0;
@@ -583,6 +931,17 @@ public:
     {
         stopped = true;
         cluster.getNetwork().healAll();
+        if (engine.buggify.enable_backpressure)
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+                cluster.toggleSlowMemberBackpressure(leader, false);
+        }
+        for (int id : cluster.currentClusterMemberIds())
+        {
+            if (!cluster.isOnline(id))
+                cluster.startNode(id);
+        }
         for (int id = 1; id <= cluster.getConfig().num_nodes; ++id)
         {
             if (!cluster.isOnline(id))
@@ -648,17 +1007,69 @@ private:
             return;
         }
 
+        /// Toggle NuRaft slow-member backpressure (`bpon`/`bpoff`) from leader OR follower when enabled!
+        if (engine.buggify.enable_backpressure && engine.rng.chance(0.22))
+        {
+            auto online = cluster.onlineNodes();
+            if (!online.empty())
+            {
+                bp_enabled = !bp_enabled;
+                cluster.toggleSlowMemberBackpressure(engine.rng.pick(online), bp_enabled);
+                return;
+            }
+        }
+
+        /// Dynamic cluster membership churn (`add_srv` voter/learner + `remove_srv`) when enabled!
+        if (engine.buggify.enable_dynamic_membership && engine.rng.chance(0.22))
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+            {
+                const int dyn_id = n + 1;
+                auto cur_members = cluster.currentClusterMemberIds();
+                const bool dyn_in_cfg = std::find(cur_members.begin(), cur_members.end(), dyn_id) != cur_members.end();
+                if (!dyn_in_cfg)
+                    cluster.addDynamicNode(leader, /*as_learner=*/engine.rng.chance(0.50));
+                else
+                    cluster.removeDynamicNode(leader);
+                return;
+            }
+        }
+
         /// Balanced / Chaos / LSMT mixed FDB fault menu:
-        if (roll < 30)
+        if (roll < 26)
             injectNetworkFault(n);
-        else if (roll < 55)
+        else if (roll < 50)
             injectNodeCrash(n, quorum, engine.rng.chance(0.75) ? KillMode::PowerLoss : KillMode::Graceful);
-        else if (roll < 72)
+        else if (roll < 64)
             injectDiskIoFault(n);
-        else if (roll < 88)
+        else if (roll < 78)
             injectSnapshotAndWipeFault(n, quorum);
-        else
+        else if (roll < 86)
             injectSwizzleClog(n);
+        else if (roll < 93)
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+                cluster.yieldLeadership(leader);
+        }
+        else
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+            {
+                const int target = static_cast<int>(engine.rng.rangeInt(1, n));
+                const int new_prio = static_cast<int>(engine.rng.rangeInt(1, 5));
+                int caller = leader;
+                if (engine.buggify.auto_forward && engine.rng.chance(0.50))
+                {
+                    auto online = cluster.onlineNodes();
+                    if (!online.empty())
+                        caller = engine.rng.pick(online);
+                }
+                cluster.setNodePriority(caller, target, new_prio);
+            }
+        }
     }
 
     void injectNetworkFault(int n)
@@ -767,7 +1178,9 @@ private:
         }
 
         cluster.crashNode(victim, mode);
-        const int64_t downtime_ms = engine.rng.rangeInt(350, 1800);
+        const int64_t downtime_ms = engine.buggify.snapshot_torture
+            ? engine.rng.rangeInt(25, 350)
+            : engine.rng.rangeInt(350, 1800);
         engine.scheduleAfterMs(
             downtime_ms,
             "node-reboot",
@@ -787,6 +1200,21 @@ private:
             return;
         const int target = engine.rng.pick(online);
         auto & node = cluster.getNodes().at(target);
+
+        /// On LSMT-Disk nodes, 50% of the time inject a transient disk fault on `data_disk` to exercise
+        /// mid-merge failure, partial-merge resumption (`pickRunsToMerge`), and file-deletion retry!
+        if (node.data_disk && engine.rng.chance(0.50))
+        {
+            static const std::vector<SimCrashDisk::TransientFaultKind> lsmt_faults = {
+                SimCrashDisk::TransientFaultKind::Open,
+                SimCrashDisk::TransientFaultKind::PartialWrite,
+                SimCrashDisk::TransientFaultKind::RemoveError,
+            };
+            node.data_disk->armTransientFault("", engine.rng.pick(lsmt_faults));
+            engine.coverage.hit("lsmt_data_disk_fault_armed");
+            (void)n;
+            return;
+        }
 
         /// Arm transient snapshot fault (open / partial / sync / marker remove) and trigger a snapshot!
         static const std::vector<std::pair<std::string, SimCrashDisk::TransientFaultKind>> faults = {
@@ -852,6 +1280,7 @@ private:
     std::string profile;
     int64_t chaos_end_ms;
     bool stopped = false;
+    bool bp_enabled = false;
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

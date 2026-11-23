@@ -14,7 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 using EventId = uint64_t;
@@ -275,4 +275,4 @@ private:
     std::ofstream trace_stream;
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

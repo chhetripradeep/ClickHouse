@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 /// Thin subclass of NuRaft's `raft_server` exposing its protected background execution hooks
@@ -340,7 +340,13 @@ public:
                 }
 
                 auto response = process_req(dst_it->second.get(), *request);
-                require(response && !response->has_cb(), "SimNetwork: unexpected blocking RPC callback");
+                if (!response)
+                {
+                    /// NuRaft legitimately returns nullptr when rejecting a late RPC (e.g. full-consensus arrival limit).
+                    scheduleRpcError(src, src_inc, dst, request, callback, "simulated null response from peer", 2);
+                    return;
+                }
+                require(!response->has_cb(), "SimNetwork: unexpected blocking RPC callback");
 
                 auto deliver_reply = [this, callback, request, response, src, dst, src_inc, mtype, req_term, prev_idx, end_idx]() mutable
                 {
@@ -351,10 +357,15 @@ public:
                         scheduleRpcError(src, src_inc, dst, request, callback, "simulated reverse partition on reply", 1);
                         return;
                     }
-                    if (rev_cfg.response_drop_prob > 0.0 && engine.rng.chance(rev_cfg.response_drop_prob))
+                    const double eff_resp_drop = (mtype == nuraft::msg_type::install_snapshot_request && engine.buggify.snapshot_torture)
+                        ? std::max(rev_cfg.response_drop_prob, 0.30)
+                        : rev_cfg.response_drop_prob;
+                    if (eff_resp_drop > 0.0 && engine.rng.chance(eff_resp_drop))
                     {
                         ++stats.responses_dropped_loss;
                         engine.coverage.hit("dropped_response_after_exec");
+                        if (mtype == nuraft::msg_type::install_snapshot_request)
+                            engine.coverage.hit("dropped_snapshot_response_after_exec");
                         scheduleRpcError(src, src_inc, dst, request, callback, "simulated response drop after execution",
                             std::max<int64_t>(2, rev_cfg.base_latency_ms));
                         return;
@@ -544,4 +555,4 @@ private:
     uint64_t next_id = 0;
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

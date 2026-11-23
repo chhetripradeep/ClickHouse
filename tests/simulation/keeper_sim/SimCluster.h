@@ -28,6 +28,7 @@ namespace DB::CoordinationSetting
 {
     extern const CoordinationSettingsBool use_lsmt_storage;
     extern const CoordinationSettingsBool storage_memory_only;
+    extern const CoordinationSettingsBool compress_snapshots_with_zstd_format;
     extern const CoordinationSettingsMilliseconds dead_session_check_period_ms;
     extern const CoordinationSettingsUInt64 parallel_read_threads;
     extern const CoordinationSettingsUInt64 committed_memtable_size;
@@ -35,9 +36,16 @@ namespace DB::CoordinationSetting
     extern const CoordinationSettingsUInt64 uncommitted_memtable_size;
     extern const CoordinationSettingsUInt64 min_files_to_merge;
     extern const CoordinationSettingsUInt64 max_files_to_merge;
+    extern const CoordinationSettingsUInt64 block_cache_size;
+    extern const CoordinationSettingsUInt64 file_block_size;
+    extern const CoordinationSettingsUInt64 file_block_group_compressed_size;
+    extern const CoordinationSettingsUInt64 sorted_file_uncompressed_size;
+    extern const CoordinationSettingsUInt64 write_snapshot_version;
+    extern const CoordinationSettingsUInt64 snapshot_transfer_chunk_size;
+    extern const CoordinationSettingsUInt64 snapshots_to_keep;
 }
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 enum class KillMode
@@ -52,10 +60,25 @@ struct ClusterConfig
     int num_nodes = 3;
     bool use_lsmt = false;
     bool lsmt_on_disk = false;
+    bool mixed_storage = false; // Heterogeneous cluster: Mem + LSMT-Mem + LSMT-Disk (differential fuzzer!)
     bool unsafe_quorum_control = false;
     bool strict_raft_commit = false;
     int nuraft_log_level = 0; // 0 = silent, 1=Fatal..6=Trace
     std::filesystem::path root_dir;
+
+    bool nodeUsesLsmt(int id) const
+    {
+        if (mixed_storage)
+            return (id == 2 || id == 3 || id == 5);
+        return use_lsmt;
+    }
+
+    bool nodeUsesLsmtDisk(int id) const
+    {
+        if (mixed_storage)
+            return (id == 3 || id == 5);
+        return use_lsmt && lsmt_on_disk;
+    }
 };
 
 class SimNuRaftLogger : public nuraft::logger
@@ -143,6 +166,17 @@ public:
     {
     }
 
+    nuraft::ptr<nuraft::buffer> commit(const uint64_t log_idx, nuraft::buffer & data) override
+    {
+        auto res = DB::KeeperStateMachine::commit(log_idx, data);
+        if (log_idx > 0)
+        {
+            const uint64_t digest = getStorageUnsafe().getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
+            keeper_oracle.verifyDigest(node_id, log_idx, digest);
+        }
+        return res;
+    }
+
     void rollback(uint64_t log_idx, nuraft::buffer & data) override
     {
         uint64_t entry_term = 0;
@@ -190,6 +224,7 @@ public:
         int id = 0;
         uint64_t incarnation = 0;
         bool online = false;
+        bool is_dynamic_joiner = false;
         int64_t clock_skew_ms = 0;
 
         /// Persistent simulated disks survive across crashes (unless WipeAndRejoin).
@@ -209,6 +244,9 @@ public:
 
         /// Pending response capture for the commit currently executing on this node.
         std::optional<DB::KeeperResponseForSession> last_commit_response;
+        std::vector<std::tuple<int64_t, std::string, int32_t>> recent_watches;
+        uint64_t last_commit_log_idx = 0;
+        uint32_t next_commit_sub_idx = 0;
 
         /// Track queued background task deduplication per node.
         std::set<DB::Changelog::BackgroundTask> queued_log_tasks;
@@ -231,6 +269,11 @@ public:
 
         for (int id = 1; id <= cfg.num_nodes; ++id)
             initial_raft_config.get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(id, std::to_string(id)));
+        if (engine.buggify.async_replication)
+        {
+            initial_raft_config.set_async_replication(true);
+            engine.coverage.hit("async_replication_enabled");
+        }
 
         buildRaftParams();
 
@@ -251,11 +294,22 @@ public:
             checkRaftSafetyAllNodes();
         };
 
-        /// Simulate single-process fail-fast + supervisor restart when NuRaft calls `system_exit`.
+        /// Surface fatal NuRaft `system_exit` calls immediately (except expected `N22_unrecoverable_isolation`
+        /// when `leadership_expiry_ms > 0` is explicitly enabled, or `N12`/`N13` when transient disk faults are active).
         engine.on_node_system_exit = [this](int node_id, int exit_code)
         {
-            engine.coverage.hit("node_system_exit_recovered");
+            engine.coverage.hit("node_system_exit_" + std::to_string(exit_code));
             engine.trace("NODE_SYSTEM_EXIT n=" + std::to_string(node_id) + " code=" + std::to_string(exit_code));
+            const bool expected_isolation = (exit_code == nuraft::raft_err::N22_unrecoverable_isolation && engine.buggify.leadership_expiry_ms > 0);
+            const bool expected_disk_snap_err = ((exit_code == nuraft::raft_err::N12_apply_snapshot_failed || exit_code == nuraft::raft_err::N13_snapshot_install_failed)
+                && engine.buggify.isActive("transient_disk_io_errors"));
+            if (!expected_isolation && !expected_disk_snap_err)
+            {
+                require(false,
+                    "FATAL_NURAFT_SYSTEM_EXIT on node " + std::to_string(node_id)
+                    + " exit_code=" + std::to_string(exit_code));
+            }
+            engine.coverage.hit("node_system_exit_recovered");
             if (isOnline(node_id))
                 crashNode(node_id, KillMode::PowerLoss);
             const int64_t restart_delay = engine.rng.rangeInt(300, 900);
@@ -283,7 +337,7 @@ public:
                 node_dir / "live/snapshots", node_dir / "durable/snapshots", &engine.coverage);
             node.state_disk = std::make_shared<SimCrashDisk>("StateDisk_" + std::to_string(id),
                 node_dir / "live/state", node_dir / "durable/state", &engine.coverage);
-            if (cfg.use_lsmt && cfg.lsmt_on_disk)
+            if (cfg.nodeUsesLsmtDisk(id))
             {
                 node.data_disk = std::make_shared<SimCrashDisk>("DataDisk_" + std::to_string(id),
                     node_dir / "live/data", node_dir / "durable/data", &engine.coverage);
@@ -322,18 +376,35 @@ public:
         if (node.data_disk)
             node.data_disk->simulateDiskWipe();
 
+        const bool node_lsmt = cfg.nodeUsesLsmt(id);
+        const bool node_lsmt_disk = cfg.nodeUsesLsmtDisk(id);
+
         auto settings = std::make_shared<DB::CoordinationSettings>();
-        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = cfg.use_lsmt;
-        (*settings)[DB::CoordinationSetting::storage_memory_only] = !(cfg.use_lsmt && cfg.lsmt_on_disk);
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = node_lsmt;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = !node_lsmt_disk;
+        (*settings)[DB::CoordinationSetting::compress_snapshots_with_zstd_format] = engine.buggify.compress_snapshots_zstd;
+        const uint64_t node_snap_ver = engine.buggify.mixed_versions ? ((id % 2 == 1) ? 8ULL : 9ULL) : engine.buggify.write_snapshot_version;
+        (*settings)[DB::CoordinationSetting::write_snapshot_version] = node_snap_ver;
+        (*settings)[DB::CoordinationSetting::snapshot_transfer_chunk_size] = engine.buggify.snapshot_transfer_chunk_size;
+        (*settings)[DB::CoordinationSetting::snapshots_to_keep] = engine.buggify.snapshots_to_keep;
         (*settings)[DB::CoordinationSetting::dead_session_check_period_ms] = 500;
         (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
-        if (cfg.use_lsmt)
+        if (engine.buggify.latest_logs_cache_entry_count_threshold > 0)
+            engine.coverage.hit("bounded_log_cache_active");
+        if (engine.buggify.snapshot_transfer_chunk_size > 0)
+            engine.coverage.hit("chunked_snapshot_transfer_active");
+        if (node_lsmt)
         {
             (*settings)[DB::CoordinationSetting::committed_memtable_size] = engine.buggify.lsmt_memtable_size;
             (*settings)[DB::CoordinationSetting::memtable_block_size] = engine.buggify.lsmt_block_size;
             (*settings)[DB::CoordinationSetting::uncommitted_memtable_size] = engine.buggify.lsmt_memtable_size;
             (*settings)[DB::CoordinationSetting::min_files_to_merge] = engine.buggify.lsmt_min_files_to_merge;
             (*settings)[DB::CoordinationSetting::max_files_to_merge] = 4;
+            (*settings)[DB::CoordinationSetting::file_block_size] = engine.buggify.lsmt_file_block_size;
+            (*settings)[DB::CoordinationSetting::file_block_group_compressed_size] = engine.buggify.lsmt_block_group_compressed_size;
+            (*settings)[DB::CoordinationSetting::sorted_file_uncompressed_size] = engine.buggify.lsmt_sorted_file_uncompressed_size;
+            if (node_lsmt_disk)
+                (*settings)[DB::CoordinationSetting::block_cache_size] = engine.buggify.lsmt_block_cache_size;
         }
 
         const int64_t skew = node.clock_skew_ms;
@@ -354,6 +425,8 @@ public:
 
         node.snapshots_queue = nuraft::cs_new<DB::SnapshotsQueue>(8);
         node.last_commit_response.reset();
+        node.last_commit_log_idx = 0;
+        node.next_commit_sub_idx = 0;
 
         node.machine = nuraft::cs_new<SimKeeperStateMachine>(
             id,
@@ -367,8 +440,15 @@ public:
                 if (resp.response->xid == Coordination::WATCH_XID)
                 {
                     std::string watch_path;
+                    int32_t watch_type = 0;
                     if (auto wr = std::dynamic_pointer_cast<Coordination::ZooKeeperWatchResponse>(resp.response))
+                    {
                         watch_path = wr->path;
+                        watch_type = wr->type;
+                    }
+                    auto it_w = nodes.find(id);
+                    if (it_w != nodes.end() && it_w->second.online)
+                        it_w->second.recent_watches.emplace_back(resp.session_id, watch_path, watch_type);
                     keeper_oracle.recordWatchDelivered(id, resp.session_id, watch_path);
                     return;
                 }
@@ -392,8 +472,15 @@ public:
                     n.last_commit_response.reset();
                 }
 
+                if (n.last_commit_log_idx != log_idx)
+                {
+                    n.last_commit_log_idx = log_idx;
+                    n.next_commit_sub_idx = 0;
+                }
+                const uint32_t sub_idx = n.next_commit_sub_idx++;
+
                 /// Verify Raft State Machine Safety (entry bytes at log_idx).
-                if (n.log_store && log_idx >= n.log_store->start_index() && log_idx < n.log_store->next_slot())
+                if (sub_idx == 0 && n.log_store && log_idx >= n.log_store->start_index() && log_idx < n.log_store->next_slot())
                 {
                     if (auto entry = n.log_store->entry_at(log_idx))
                     {
@@ -404,7 +491,7 @@ public:
                 }
 
                 const uint64_t digest = n.machine->getStorageUnsafe().getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
-                keeper_oracle.onKeeperCommit(id, log_idx, req, resp_ptr, digest);
+                keeper_oracle.onKeeperCommit(id, log_idx, sub_idx, /*is_last_in_batch=*/false, req, resp_ptr, digest);
             });
 
         node.machine->init();
@@ -415,9 +502,10 @@ public:
 
         node.log_store = nuraft::cs_new<DB::KeeperLogStore>(
             DB::LogFileSettings{
-                .force_sync = true,
-                .compress_logs = false,
+                .force_sync = engine.buggify.force_sync_logs,
+                .compress_logs = engine.buggify.compress_logs,
                 .rotate_interval = engine.buggify.log_rotate_interval,
+                .latest_logs_cache_entry_count_threshold = engine.buggify.latest_logs_cache_entry_count_threshold,
                 .startup_read_max_streams = 1,
             },
             DB::FlushSettings{.max_flush_batch_size = 1, .min_time_between_fsyncs_ms = 0},
@@ -442,6 +530,12 @@ public:
             node.state_manager->save_config(*snap_cfg);
         else if (log_cfg)
             node.state_manager->save_config(*log_cfg);
+        else if (node.is_dynamic_joiner)
+        {
+            nuraft::cluster_config joiner_cfg;
+            joiner_cfg.get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(id, 0, std::to_string(id), "", /*learner=*/true, /*priority=*/0));
+            node.state_manager->save_config(joiner_cfg);
+        }
         else
             node.state_manager->save_config(initial_raft_config);
 
@@ -521,6 +615,8 @@ public:
         node.lsmt_merge_queued = false;
         node.lsmt_delete_queued = false;
         node.last_commit_response.reset();
+        node.last_commit_log_idx = 0;
+        node.next_commit_sub_idx = 0;
 
         node.server.reset();
         node.machine.reset();
@@ -557,10 +653,12 @@ public:
         }
         else if (mode == KillMode::WipeAndRejoin)
         {
+            /// Wipe logs + snapshots while preserving `state_disk` (persisted term & voted_for)
+            /// so snapshot-install recovery is tested without violating Raft's persisted-vote safety invariant.
             node.log_disk->simulateDiskWipe();
             node.snapshot_disk->simulateDiskWipe();
-            node.state_disk->simulateDiskWipe();
-            raft_oracle.onNodeDiskWiped(id);
+            node.state_disk->simulateGracefulStop();
+            raft_oracle.onNodeDiskWiped(id, /*state_wiped=*/false);
             engine.coverage.hit("snapshot_wipe_recovery");
         }
     }
@@ -597,31 +695,93 @@ public:
         Coordination::ZooKeeperRequestPtr request,
         int64_t session_id)
     {
-        auto & node = nodes.at(leader_id);
-        if (!node.online || !node.server || !node.server->is_leader())
-            return nullptr;
-
         DB::KeeperRequestForSession entry;
         entry.session_id = session_id;
         entry.time = simTimeMs();
         entry.request = std::move(request);
+        const uint64_t log_ver = engine.buggify.mixed_versions ? ((leader_id % 2 == 1) ? 0ULL : 1ULL) : engine.buggify.write_log_entry_version;
+        return submitRequestBatch(leader_id, {std::move(entry)}, log_ver);
+    }
+
+    nuraft::ptr<nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>> submitRequestBatch(
+        int leader_id,
+        std::vector<DB::KeeperRequestForSession> entries,
+        uint64_t log_entry_version = 1)
+    {
+        auto & node = nodes.at(leader_id);
+        if (!node.online || !node.server || (!engine.buggify.auto_forward && !node.server->is_leader()) || entries.empty())
+            return nullptr;
+
+        if (!node.server->is_leader())
+            engine.coverage.hit("follower_auto_forwarded_write");
+
         DB::KeeperRequestBatch batch;
         batch.dispatcher_server_id = -1;
-        batch.requests.push_back(std::move(entry));
-        auto bufs = DB::KeeperStateMachine::serializeRequestBatch(batch, engine.buggify.write_log_entry_version);
+        batch.requests = std::move(entries);
+        const size_t nreq = batch.requests.size();
+        auto bufs = DB::KeeperStateMachine::serializeRequestBatch(batch, log_entry_version);
+        if (nreq > 1 && log_entry_version >= 1)
+            engine.coverage.hit("multi_request_batch_submitted");
         return node.server->append_entries(bufs);
     }
 
-    /// Issue a real local read (Get / List / Exists, optionally with watch) on a live node.
+    void yieldLeadership(int leader_id)
+    {
+        auto it = nodes.find(leader_id);
+        if (it == nodes.end() || !it->second.online || !it->second.server || !it->second.server->is_leader())
+            return;
+        it->second.server->yield_leadership(/*immediate_yield=*/true);
+        engine.coverage.hit("leadership_yielded");
+        engine.trace("LEADER_YIELD n=" + std::to_string(leader_id));
+    }
+
+    /// Toggle NuRaft slow-member backpressure (`bpon`/`bpoff`) via any online server (leader or follower!).
+    void toggleSlowMemberBackpressure(int node_id, bool enable)
+    {
+        auto it = nodes.find(node_id);
+        if (it == nodes.end() || !it->second.online || !it->second.server)
+            return;
+        if (it->second.server->request_slow_member_backpressure(enable))
+        {
+            engine.coverage.hit(enable ? "slow_member_backpressure_on" : "slow_member_backpressure_off");
+            engine.trace("BACKPRESSURE_TOGGLE n=" + std::to_string(node_id) + " enable=" + std::to_string(enable ? 1 : 0));
+        }
+    }
+
+    /// Submit a live Raft configuration update changing a peer's election priority!
+    void setNodePriority(int leader_id, int target_id, int priority)
+    {
+        auto it = nodes.find(leader_id);
+        if (it == nodes.end() || !it->second.online || !it->second.server)
+            return;
+        auto status = it->second.server->set_priority(target_id, priority);
+        if (status == nuraft::raft_server::PrioritySetResult::SET)
+        {
+            engine.coverage.hit("reconfig_priority_submitted");
+            engine.trace("RECONFIG_PRIORITY leader=" + std::to_string(leader_id)
+                + " target=" + std::to_string(target_id) + " prio=" + std::to_string(priority));
+        }
+    }
+
+    /// Issue a real local read (Get / List / Exists, optionally with watch) on a live node
+    /// and verify its response against the independent Keeper semantic oracle at `last_commit_index()`.
     Coordination::ZooKeeperResponsePtr executeLocalRead(
         int node_id,
         Coordination::ZooKeeperRequestPtr request,
-        int64_t session_id)
+        int64_t session_id,
+        bool verify_response = true)
     {
         auto & node = nodes.at(node_id);
         if (!node.online || !node.machine)
             return nullptr;
         node.last_commit_response.reset();
+        node.last_commit_log_idx = 0;
+        node.next_commit_sub_idx = 0;
+        /// Track watch deliveries during this commit to check for duplicate DELETED events on AddWatch(PERSISTENT).
+        if (engine.buggify.watch_oracle)
+            node.recent_watches.clear();
+        const uint64_t commit_idx = node.machine->last_commit_index();
+        auto req_copy = request;
         DB::KeeperRequestForSession req;
         req.session_id = session_id;
         req.time = simTimeMs();
@@ -631,6 +791,46 @@ public:
             return nullptr;
         auto resp = node.last_commit_response->response;
         node.last_commit_response.reset();
+        node.last_commit_log_idx = 0;
+        node.next_commit_sub_idx = 0;
+        if (engine.buggify.watch_oracle && req_copy && req_copy->getOpNum() == Coordination::OpNum::SetWatch)
+        {
+            const auto & sw = dynamic_cast<const Coordination::ZooKeeperSetWatchesRequest &>(*req_copy);
+            for (const auto & [wsid, wpath, wtype] : node.recent_watches)
+            {
+                const bool in_list = std::find(sw.child_watches.begin(), sw.child_watches.end(), wpath) != sw.child_watches.end();
+                const bool in_data = std::find(sw.data_watches.begin(), sw.data_watches.end(), wpath) != sw.data_watches.end();
+                if (in_list && !in_data && wtype == static_cast<int32_t>(Coordination::Event::CHANGED))
+                {
+                    require(false,
+                        "KEEPER_WATCH_ORACLE SetWatches child_watch fired Event::CHANGED(3) instead of Event::CHILD(4) on node "
+                        + std::to_string(node_id) + " path=" + wpath);
+                }
+            }
+        }
+        if (engine.buggify.watch_oracle && req_copy && resp && req_copy->getOpNum() == Coordination::OpNum::CheckWatch)
+        {
+            const auto & cw = dynamic_cast<const Coordination::ZooKeeperCheckWatchRequest &>(*req_copy);
+            auto & st = node.machine->getStorageUnsafe();
+            std::shared_lock lock(st.storage_mutex);
+            bool own_watch = false;
+            if (auto sit = st.sessions_and_watchers.find(session_id); sit != st.sessions_and_watchers.end())
+            {
+                for (const auto & wi : sit->second)
+                {
+                    if (wi.path == cw.path)
+                        own_watch = true;
+                }
+            }
+            if (resp->error == Coordination::Error::ZOK && !own_watch)
+            {
+                require(false,
+                    "KEEPER_WATCH_ORACLE CheckWatch returned ZOK for session " + std::to_string(session_id)
+                    + " which owns NO watch on path=" + cw.path + " (leaked another session's watch!)");
+            }
+        }
+        if (verify_response && req_copy && resp)
+            keeper_oracle.verifyLocalReadResponse(node_id, commit_idx, session_id, *req_copy, *resp);
         return resp;
     }
 
@@ -654,6 +854,106 @@ public:
         return true;
     }
 
+    /// Dynamically add node `cfg.num_nodes + 1` to the live cluster via NuRaft `add_srv` (as voter or learner).
+    /// Exercises `handle_join_leave.cxx`, `KeeperLogStore::pack`/`apply_pack` (`sync_log_request`),
+    /// snapshot catch-up for fresh joiners, and `KeeperStateMachine::commit_config`.
+    bool addDynamicNode(int leader_id, bool as_learner)
+    {
+        auto lit = nodes.find(leader_id);
+        if (lit == nodes.end() || !lit->second.online || !lit->second.server || !lit->second.server->is_leader())
+            return false;
+
+        const int dyn_id = cfg.num_nodes + 1;
+        auto cur_cfg = lit->second.server->get_config();
+        if (cur_cfg && cur_cfg->get_server(dyn_id) != nullptr)
+            return false;
+
+        auto & node = nodes[dyn_id];
+        if (node.online)
+            crashNode(dyn_id, KillMode::Graceful);
+
+        node.id = dyn_id;
+        node.is_dynamic_joiner = true;
+        if (engine.buggify.isActive("clock_skew"))
+            node.clock_skew_ms = engine.rng.rangeInt(-45, 45);
+
+        const auto node_dir = cfg.root_dir / ("node_" + std::to_string(dyn_id) + "_gen_" + std::to_string(node.incarnation + 1));
+        node.log_disk = std::make_shared<SimCrashDisk>("LogDisk_" + std::to_string(dyn_id),
+            node_dir / "live/logs", node_dir / "durable/logs", &engine.coverage);
+        node.snapshot_disk = std::make_shared<SimCrashDisk>("SnapshotDisk_" + std::to_string(dyn_id),
+            node_dir / "live/snapshots", node_dir / "durable/snapshots", &engine.coverage);
+        node.state_disk = std::make_shared<SimCrashDisk>("StateDisk_" + std::to_string(dyn_id),
+            node_dir / "live/state", node_dir / "durable/state", &engine.coverage);
+        if (cfg.nodeUsesLsmtDisk(dyn_id))
+        {
+            node.data_disk = std::make_shared<SimCrashDisk>("DataDisk_" + std::to_string(dyn_id),
+                node_dir / "live/data", node_dir / "durable/data", &engine.coverage);
+        }
+        raft_oracle.onNodeDiskWiped(dyn_id, /*state_wiped=*/true);
+        startNode(dyn_id);
+
+        nuraft::srv_config new_srv(dyn_id, 0, std::to_string(dyn_id), "", as_learner, as_learner ? 0 : 1);
+        auto res = lit->second.server->add_srv(new_srv);
+        if (!res || !res->get_accepted())
+            return false;
+
+        engine.coverage.hit(as_learner ? "dynamic_add_srv_learner" : "dynamic_add_srv_voter");
+        engine.trace("DYNAMIC_ADD_SRV leader=" + std::to_string(leader_id)
+            + " dyn=" + std::to_string(dyn_id) + " learner=" + std::to_string(as_learner ? 1 : 0));
+        return true;
+    }
+
+    /// Dynamically remove node `cfg.num_nodes + 1` via NuRaft `remove_srv`.
+    bool removeDynamicNode(int leader_id)
+    {
+        auto lit = nodes.find(leader_id);
+        if (lit == nodes.end() || !lit->second.online || !lit->second.server || !lit->second.server->is_leader())
+            return false;
+
+        const int dyn_id = cfg.num_nodes + 1;
+        auto cur_cfg = lit->second.server->get_config();
+        if (!cur_cfg || cur_cfg->get_server(dyn_id) == nullptr)
+            return false;
+
+        auto res = lit->second.server->remove_srv(dyn_id);
+        if (!res || !res->get_accepted())
+            return false;
+
+        engine.coverage.hit("dynamic_remove_srv");
+        engine.trace("DYNAMIC_REMOVE_SRV leader=" + std::to_string(leader_id) + " dyn=" + std::to_string(dyn_id));
+        return true;
+    }
+
+    /// Return all server IDs currently in the leader's cluster config (or initial 1..num_nodes if no leader).
+    std::vector<int> currentClusterMemberIds() const
+    {
+        const int leader = findLeader();
+        if (leader != 0)
+        {
+            auto it = nodes.find(leader);
+            if (it != nodes.end() && it->second.online && it->second.server)
+            {
+                if (auto cur_cfg = it->second.server->get_config())
+                {
+                    std::vector<int> ids;
+                    for (const auto & srv : cur_cfg->get_servers())
+                    {
+                        if (srv && nodes.contains(srv->get_id()))
+                            ids.push_back(srv->get_id());
+                    }
+                    if (!ids.empty())
+                        return ids;
+                }
+            }
+        }
+        std::vector<int> ids;
+        for (int id = 1; id <= cfg.num_nodes; ++id)
+            ids.push_back(id);
+        return ids;
+    }
+
+    const std::vector<int64_t> & getRecentlyClosedSessions() const { return recently_closed_sessions; }
+
     /// Verify every online node's tree and digest against the independent Keeper semantic oracle.
     void verifyAllOnlineNodes()
     {
@@ -672,8 +972,9 @@ public:
 
         uint64_t expected_commit = 0;
         uint64_t expected_digest = 0;
-        for (auto & [id, node] : nodes)
+        for (int id : currentClusterMemberIds())
         {
+            auto & node = nodes.at(id);
             require(node.online && node.server && node.machine, "CONVERGENCE_FAILURE: node offline: " + std::to_string(id));
             const uint64_t cidx = node.machine->last_commit_index();
             const uint64_t digest = node.machine->getStorageUnsafe().getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
@@ -693,7 +994,8 @@ public:
             }
             keeper_oracle.verifyNodeTree(id, *node.machine);
         }
-        keeper_oracle.verifyAllAckedCommitted();
+        if (!engine.buggify.async_replication)
+            keeper_oracle.verifyAllAckedCommitted();
     }
 
     void shutdownAll()
@@ -725,7 +1027,9 @@ private:
         raft_params_cfg.election_timeout_upper_bound_ = engine.buggify.election_timeout_upper_ms;
         raft_params_cfg.heart_beat_interval_ = engine.buggify.heartbeat_interval_ms;
         raft_params_cfg.rpc_failure_backoff_ = 0;
-        raft_params_cfg.leadership_expiry_ = 0;
+        raft_params_cfg.leadership_expiry_ = engine.buggify.leadership_expiry_ms;
+        if (engine.buggify.leadership_expiry_ms > 0)
+            engine.coverage.hit("leadership_expiry_enabled");
         raft_params_cfg.return_method_ = nuraft::raft_params::async_handler;
         raft_params_cfg.use_bg_thread_for_urgent_commit_ = true;
         raft_params_cfg.use_bg_thread_for_snapshot_io_ = false;
@@ -734,6 +1038,33 @@ private:
         raft_params_cfg.max_append_size_ = engine.buggify.max_append_size;
         raft_params_cfg.parallel_log_appending_ = engine.buggify.parallel_log_appending;
         raft_params_cfg.max_log_gap_in_stream_ = engine.buggify.max_log_gap_in_stream;
+        raft_params_cfg.log_sync_stop_gap_ = engine.buggify.log_sync_stop_gap;
+        raft_params_cfg.use_new_joiner_type_ = engine.buggify.use_new_joiner_type;
+        if (engine.buggify.snapshot_torture)
+            raft_params_cfg.snapshot_sync_ctx_timeout_ = 300000; // Production ClickHouse Keeper default (5 minutes)
+        if (engine.buggify.auto_forward)
+        {
+            raft_params_cfg.auto_forwarding_ = true;
+            raft_params_cfg.auto_forwarding_req_timeout_ = 800;
+            engine.coverage.hit("auto_forwarding_enabled");
+        }
+        if (engine.buggify.full_consensus)
+        {
+            raft_params_cfg.use_full_consensus_among_healthy_members_ = true;
+            raft_params_cfg.track_peers_sm_commit_idx_ = true;
+            raft_params_cfg.grace_period_of_lagging_state_machine_ = engine.buggify.grace_period_lagging_sm_ms;
+            engine.coverage.hit("full_consensus_enabled");
+        }
+        if (engine.buggify.enable_backpressure)
+        {
+            raft_params_cfg.max_uncommitted_log_entries_ = engine.buggify.max_uncommitted_log_entries;
+            raft_params_cfg.slow_member_backpressure_max_uncommitted_ = engine.buggify.slow_member_backpressure_max_uncommitted;
+            raft_params_cfg.slow_member_backpressure_no_progress_timeout_ = engine.buggify.slow_member_backpressure_no_progress_timeout_ms;
+            raft_params_cfg.max_append_size_bytes_ = engine.buggify.max_append_size_bytes;
+            raft_params_cfg.append_entries_backward_probe_throttle_threshold_ = engine.buggify.backward_probe_throttle_threshold;
+            raft_params_cfg.track_peers_sm_commit_idx_ = engine.buggify.track_peers_sm_commit_idx;
+            engine.coverage.hit("backpressure_params_active");
+        }
         if (cfg.unsafe_quorum_control)
             raft_params_cfg.custom_commit_quorum_size_ = 1;
     }
@@ -908,8 +1239,8 @@ private:
                 }
             }
 
-            /// 3. Real LSMT BackgroundWork manual tasks (Flush, Merge, FileDelete) when LSMT is enabled.
-            if (cfg.use_lsmt && node.machine)
+            /// 3. Real LSMT BackgroundWork manual tasks (Flush, Merge, FileDelete) when node uses LSMT.
+            if (cfg.nodeUsesLsmt(id) && node.machine)
             {
                 auto * lsmt = dynamic_cast<DB::KeeperLSMTNodesStorage *>(node.machine->getStorageUnsafe().nodes_storage);
                 if (lsmt && lsmt->state.background && lsmt->state.background->isManualMode())
@@ -1012,15 +1343,40 @@ private:
                             {
                                 engine.trace("SESSION_EXPIRE_SUBMIT sid=" + std::to_string(sid));
                                 res->when_ready(
-                                    [this, sid](nuraft::cmd_result<nuraft::ptr<nuraft::buffer>> &, nuraft::ptr<std::exception> &)
+                                    [this, sid](nuraft::cmd_result<nuraft::ptr<nuraft::buffer>> & r, nuraft::ptr<std::exception> & err)
                                     {
                                         in_flight_close_sessions.erase(sid);
+                                        if (!err && r.get_result_code() == nuraft::cmd_result_code::OK)
+                                            recently_closed_sessions.push_back(sid);
                                     });
                             }
                             else
                             {
                                 in_flight_close_sessions.erase(sid);
                             }
+                        }
+
+                        /// Also run real TTL & Container GC sweeps on virtual time!
+                        const auto expired_ttls = leader.machine->getExpiredTTLPathsForGarbageCollector(8);
+                        for (const auto & [path, ver] : expired_ttls)
+                        {
+                            auto rm = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                            rm->xid = 700000 + (++gc_xid_counter);
+                            rm->path = path;
+                            rm->version = ver;
+                            if (auto res = submitRequest(leader_id, rm, -1); res && res->get_accepted())
+                                engine.coverage.hit("ttl_gc_submitted");
+                        }
+                        const auto containers = leader.machine->getContainerCandidatesForGarbageCollector(
+                            8, engine.buggify.container_gc_max_never_used_ms);
+                        for (const auto & [path, ver] : containers)
+                        {
+                            auto rm = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                            rm->xid = 700000 + (++gc_xid_counter);
+                            rm->path = path;
+                            rm->version = ver;
+                            if (auto res = submitRequest(leader_id, rm, -1); res && res->get_accepted())
+                                engine.coverage.hit("container_gc_submitted");
                         }
                     }
                 }
@@ -1084,7 +1440,9 @@ private:
     std::map<int, uint64_t> last_seen_term;
     std::map<int, int> cached_vote;
     std::set<int64_t> in_flight_close_sessions;
+    std::vector<int64_t> recently_closed_sessions;
+    int64_t gc_xid_counter = 0;
     bool shut_down = false;
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace fdb_sim
+namespace keeper_sim
 {
 
 /// FoundationDB AsyncFileNonDurable-inspired crash-consistent simulated disk.
@@ -334,6 +334,40 @@ public:
         clearDirectoryContents(durable_dir);
     }
 
+    /// Corrupt or truncate the newest `snapshot_*.bin` on disk ONLY when at least 2 valid snapshots
+    /// exist, testing `KeeperSnapshotManager`'s multi-snapshot fallback & recovery on startup!
+    bool corruptLatestSnapshotIfMultiple(SimRandom & rng)
+    {
+        std::vector<std::filesystem::path> snaps;
+        if (!std::filesystem::exists(durable_dir))
+            return false;
+        for (const auto & entry : std::filesystem::directory_iterator(durable_dir))
+        {
+            if (!entry.is_regular_file())
+                continue;
+            const auto name = entry.path().filename().string();
+            if (name.starts_with("snapshot_") && name.ends_with(".bin"))
+                snaps.push_back(entry.path());
+        }
+        if (snaps.size() < 2)
+            return false;
+        std::sort(snaps.begin(), snaps.end());
+        const auto & newest = snaps.back();
+        const auto rel = std::filesystem::relative(newest, durable_dir);
+        std::string bytes = readAllBytes(newest);
+        if (bytes.size() < 16)
+            return false;
+        if (rng.chance(0.50))
+            bytes.resize(rng.rangeSize(1, bytes.size() / 2));
+        else
+            bytes[rng.rangeSize(0, bytes.size() - 1)] ^= static_cast<char>(0xFF);
+        writeAllBytes(newest, bytes);
+        writeAllBytes(live_dir / rel, bytes);
+        if (coverage)
+            coverage->hit("latest_snapshot_corrupted_for_fallback");
+        return true;
+    }
+
     const Stats & getStats() const { return stats; }
     size_t dirtyFileCount() const { return dirty_files.size(); }
 
@@ -485,4 +519,4 @@ private:
     Stats stats;
 };
 
-} // namespace fdb_sim
+} // namespace keeper_sim

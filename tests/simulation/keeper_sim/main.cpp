@@ -47,7 +47,7 @@ std::string jsonEscape(const std::string & s)
 
 void runInstrumentationControl()
 {
-    using namespace fdb_sim;
+    using namespace keeper_sim;
     g_virtual_time_enabled = true;
     g_sim_time_ns = 5'000'000'000LL;
     const auto steady_before = std::chrono::steady_clock::now();
@@ -69,7 +69,7 @@ void runInstrumentationControl()
     std::thread t([]() {});
     t.join();
     require(g_thread_attempts.load() == threads_before + 1, "Missed pthread_create interception");
-    std::cout << "PASS fdb-sim-instrumentation-control\n";
+    std::cout << "PASS keeper-sim-instrumentation-control\n";
 }
 
 } // namespace
@@ -95,7 +95,27 @@ int main(int argc, char ** argv)
         std::string profile = "balanced";
         bool use_lsmt = false;
         bool lsmt_on_disk = false;
+        bool mixed_storage = false;
         bool enable_buggify = true;
+        bool no_streaming = false;
+        bool force_compress_logs = false;
+        bool no_bounded_cache = false;
+        bool dynamic_membership = false;
+        bool late_session_race = false;
+        bool snapshot_torture = false;
+        bool mixed_versions = false;
+        bool async_replication = false;
+        bool leadership_expiry = false;
+        bool force_new_joiner = false;
+        bool no_disk_faults = false;
+        bool backpressure = false;
+        bool large_snap_dist = false;
+        bool acl_torture = false;
+        bool torn_snapshots = false;
+        bool auto_forward = false;
+        bool full_consensus = false;
+        bool rollback_torture = false;
+        bool watch_oracle = false;
         bool strict_raft_commit = false;
         bool unsafe_quorum_control = false;
         bool instrumentation_control = false;
@@ -139,6 +159,46 @@ int main(int argc, char ** argv)
                 use_lsmt = true;
                 lsmt_on_disk = true;
             }
+            else if (opt == "--mixed-storage")
+                mixed_storage = true;
+            else if (opt == "--no-streaming")
+                no_streaming = true;
+            else if (opt == "--compress-logs")
+                force_compress_logs = true;
+            else if (opt == "--no-bounded-cache")
+                no_bounded_cache = true;
+            else if (opt == "--dynamic-membership")
+                dynamic_membership = true;
+            else if (opt == "--late-session-race")
+                late_session_race = true;
+            else if (opt == "--snapshot-torture")
+                snapshot_torture = true;
+            else if (opt == "--mixed-versions")
+                mixed_versions = true;
+            else if (opt == "--async-replication")
+                async_replication = true;
+            else if (opt == "--leadership-expiry")
+                leadership_expiry = true;
+            else if (opt == "--force-new-joiner")
+                force_new_joiner = true;
+            else if (opt == "--no-disk-faults")
+                no_disk_faults = true;
+            else if (opt == "--backpressure")
+                backpressure = true;
+            else if (opt == "--large-snap-dist")
+                large_snap_dist = true;
+            else if (opt == "--acl-torture")
+                acl_torture = true;
+            else if (opt == "--torn-snapshots")
+                torn_snapshots = true;
+            else if (opt == "--auto-forward")
+                auto_forward = true;
+            else if (opt == "--full-consensus")
+                full_consensus = true;
+            else if (opt == "--rollback-torture")
+                rollback_torture = true;
+            else if (opt == "--watch-oracle")
+                watch_oracle = true;
             else if (opt == "--buggify")
                 enable_buggify = true;
             else if (opt == "--no-buggify")
@@ -176,8 +236,8 @@ int main(int argc, char ** argv)
 
         if (swarm_mode)
         {
-            fdb_sim::require(!swarm_output.empty(), "--swarm requires --output <dir>");
-            return fdb_sim::SimSwarmRunner::run(argv[0], swarm_suite, swarm_output, swarm_workers, strict_raft_commit);
+            keeper_sim::require(!swarm_output.empty(), "--swarm requires --output <dir>");
+            return keeper_sim::SimSwarmRunner::run(argv[0], swarm_suite, swarm_output, swarm_workers, strict_raft_commit);
         }
 
         if (instrumentation_control)
@@ -186,7 +246,7 @@ int main(int argc, char ** argv)
             return 0;
         }
 
-        using namespace fdb_sim;
+        using namespace keeper_sim;
         require(!state_dir.empty(), "--state-dir is required");
         if (std::filesystem::exists(state_dir))
             std::filesystem::remove_all(state_dir);
@@ -202,12 +262,35 @@ int main(int argc, char ** argv)
             "Simulation did not start single-threaded");
 
         SimEngine engine(seed, host_delay_ms, trace_file);
-        engine.buggify.initialize(engine.rng, enable_buggify, profile);
+        engine.buggify.initialize(
+            engine.rng,
+            enable_buggify,
+            profile,
+            no_streaming,
+            force_compress_logs,
+            no_bounded_cache,
+            dynamic_membership,
+            late_session_race,
+            snapshot_torture,
+            mixed_versions,
+            async_replication,
+            leadership_expiry,
+            force_new_joiner,
+            no_disk_faults,
+            backpressure,
+            large_snap_dist,
+            acl_torture,
+            torn_snapshots,
+            auto_forward,
+            full_consensus,
+            rollback_torture,
+            watch_oracle);
 
         ClusterConfig cluster_cfg;
         cluster_cfg.num_nodes = num_nodes;
         cluster_cfg.use_lsmt = use_lsmt;
         cluster_cfg.lsmt_on_disk = lsmt_on_disk;
+        cluster_cfg.mixed_storage = mixed_storage;
         cluster_cfg.unsafe_quorum_control = unsafe_quorum_control;
         cluster_cfg.strict_raft_commit = strict_raft_commit;
         cluster_cfg.nuraft_log_level = nuraft_log_level;
@@ -238,8 +321,8 @@ int main(int argc, char ** argv)
                 [&cluster]() { return cluster.findLeader() != 0; });
             require(elected, "LIVENESS_FAILURE: cluster failed to elect a leader after healing");
 
-            /// Submit a final barrier write and wait until it commits and replicates to ALL nodes.
-            bool barrier_submitted = false;
+            /// Submit a final barrier write (retrying if cancelled by stepdown) and wait until it replicates to ALL nodes.
+            bool barrier_attempted = false;
             const bool converged = engine.runUntilCondition(
                 quiet_ms,
                 [&]()
@@ -247,17 +330,21 @@ int main(int argc, char ** argv)
                     const int leader = cluster.findLeader();
                     if (leader == 0)
                         return false;
-                    if (!barrier_submitted)
-                        barrier_submitted = workload.submitFinalBarrier(leader);
+                    if (!workload.isFinalBarrierAcked() && !workload.isFinalBarrierInFlight())
+                    {
+                        if (workload.submitFinalBarrier(leader))
+                            barrier_attempted = true;
+                    }
 
                     /// Wait until every node is online and matches the leader's commit index (and barrier acked if sessions existed).
                     const uint64_t leader_commit = cluster.getNodes().at(leader).machine->last_commit_index();
                     if (leader_commit == 0)
                         return false;
-                    if (barrier_submitted && !workload.isFinalBarrierAcked())
+                    if (barrier_attempted && !workload.isFinalBarrierAcked())
                         return false;
-                    for (const auto & [id, node] : cluster.getNodes())
+                    for (int id : cluster.currentClusterMemberIds())
                     {
+                        const auto & node = cluster.getNodes().at(id);
                         if (!node.online || !node.machine || node.machine->last_commit_index() != leader_commit)
                             return false;
                     }
@@ -377,7 +464,7 @@ int main(int argc, char ** argv)
             }
             else
             {
-                std::cout << "PASS fdb_sim seed=" << seed
+                std::cout << "PASS keeper_sim seed=" << seed
                           << " nodes=" << num_nodes
                           << " profile=" << profile
                           << " storage=" << (use_lsmt ? (lsmt_on_disk ? "LSMT_DISK" : "LSMT_MEM") : "MEM")
