@@ -298,6 +298,32 @@ private:
         if (candidates.empty())
             return;
 
+        /// When `--client-stream` is active, pipeline writes via NuRaft's `open_client_req_stream`
+        /// on BOTH followers and the leader!
+        if (engine.buggify.client_stream && engine.rng.chance(0.60))
+        {
+            auto online = cluster.onlineNodes();
+            if (!online.empty())
+            {
+                const int stream_node = engine.rng.pick(online);
+                const int64_t sid = engine.rng.pick(candidates);
+                auto & sess = sessions.at(sid);
+                const size_t n = engine.rng.rangeSize(1, 3);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    Coordination::ZooKeeperRequestPtr req = engine.rng.chance(0.30)
+                        ? buildMultiRequest(sess)
+                        : buildSingleWriteRequest(sess);
+                    req->xid = sess.next_xid++;
+                    if (cluster.submitViaClientStream(stream_node, std::move(req), sid))
+                        ++ops_submitted;
+                    else
+                        break;
+                }
+                return;
+            }
+        }
+
         /// Choose target server for writes: leader normally, or 65% follower when `--auto-forward` is active!
         int write_target = leader;
         if (engine.buggify.auto_forward && engine.rng.chance(0.65))
@@ -319,12 +345,24 @@ private:
             batch_entries.reserve(batch_size);
             for (size_t b = 0; b < batch_size; ++b)
             {
-                const int64_t b_sid = engine.rng.pick(candidates);
+                int64_t b_sid = engine.rng.pick(candidates);
+                int64_t forced_xid = 0;
+                if (b == 0 && engine.buggify.batch_cache_retry && !unknown_retry_xids.empty() && engine.rng.chance(0.40))
+                {
+                    auto [rsid, rxid] = unknown_retry_xids.back();
+                    unknown_retry_xids.pop_back();
+                    if (sessions.contains(rsid) && sessions.at(rsid).alive)
+                    {
+                        b_sid = rsid;
+                        forced_xid = rxid;
+                        engine.coverage.hit("batch_cache_retry_reused_xid");
+                    }
+                }
                 auto & b_sess = sessions.at(b_sid);
                 Coordination::ZooKeeperRequestPtr req = engine.rng.chance(0.30)
                     ? buildMultiRequest(b_sess)
                     : buildSingleWriteRequest(b_sess);
-                req->xid = b_sess.next_xid++;
+                req->xid = forced_xid != 0 ? forced_xid : b_sess.next_xid++;
                 batch_ids.emplace_back(b_sid, req->xid);
                 DB::KeeperRequestForSession entry;
                 entry.session_id = b_sid;
@@ -346,7 +384,11 @@ private:
                 {
                     const bool ok = !err && r.get_result_code() == nuraft::cmd_result_code::OK;
                     for (const auto & [b_sid, b_xid] : batch_ids)
+                    {
                         cluster.getKeeperOracle().recordClientOutcome(b_sid, b_xid, ok, g_sim_time_ns);
+                        if (!ok && engine.buggify.batch_cache_retry && unknown_retry_xids.size() < 32)
+                            unknown_retry_xids.emplace_back(b_sid, b_xid);
+                    }
                 });
             return;
         }
@@ -366,7 +408,26 @@ private:
             else
                 req = buildSingleWriteRequest(sess);
 
-            req->xid = sess.next_xid++;
+            if (engine.buggify.batch_cache_retry && !unknown_retry_xids.empty() && engine.rng.chance(0.25))
+            {
+                auto [rsid, rxid] = unknown_retry_xids.back();
+                unknown_retry_xids.pop_back();
+                if (rsid == sid)
+                {
+                    req->xid = rxid;
+                    engine.coverage.hit("batch_cache_retry_reused_xid");
+                }
+                else
+                {
+                    req->xid = sess.next_xid++;
+                }
+            }
+            else
+            {
+                req->xid = sess.next_xid++;
+                if (engine.buggify.quorum_reads && engine.rng.chance(0.50))
+                    req->xid |= (static_cast<int64_t>(engine.rng.rangeInt(1, 7)) << 33);
+            }
             const int64_t xid = req->xid;
             auto res = cluster.submitRequest(write_target, req, sid);
             if (!res || !res->get_accepted())
@@ -381,6 +442,8 @@ private:
                 {
                     const bool ok = !err && r.get_result_code() == nuraft::cmd_result_code::OK;
                     cluster.getKeeperOracle().recordClientOutcome(sid, xid, ok, g_sim_time_ns);
+                    if (!ok && engine.buggify.batch_cache_retry && unknown_retry_xids.size() < 32)
+                        unknown_retry_xids.emplace_back(sid, xid);
                 });
         }
     }
@@ -449,6 +512,22 @@ private:
     {
         if (engine.buggify.rollback_torture)
             return engine.rng.chance(0.50) ? "/sim/h0" : "/sim/h0/c0";
+        if (engine.buggify.deep_lsmt_stress)
+        {
+            const int64_t b = engine.rng.rangeInt(0, 15);
+            std::string p = "/sim/k" + std::to_string(b);
+            if (engine.rng.chance(0.75))
+            {
+                p += "/c" + std::to_string(engine.rng.rangeInt(0, 3));
+                if (engine.rng.chance(0.65))
+                {
+                    p += "/d" + std::to_string(engine.rng.rangeInt(0, 2));
+                    if (engine.rng.chance(0.50))
+                        p += "/e" + std::to_string(engine.rng.rangeInt(0, 1));
+                }
+            }
+            return p;
+        }
         const int64_t bucket = engine.rng.rangeInt(0, 7);
         std::string p = "/sim/k" + std::to_string(bucket);
         if (engine.rng.chance(0.35))
@@ -773,9 +852,9 @@ private:
             g1->path = path;
             auto e1 = std::make_shared<Coordination::ZooKeeperExistsRequest>();
             e1->path = "/sim";
-            auto a1 = std::make_shared<Coordination::ZooKeeperGetACLRequest>();
-            a1->path = path;
-            r->requests = {g1, e1, a1};
+            auto l1 = std::make_shared<Coordination::ZooKeeperListRequest>();
+            l1->path = "/sim";
+            r->requests = {g1, e1, l1};
             req = r;
         }
         else if (kind == 8)
@@ -803,7 +882,7 @@ private:
             r->options.with_data = engine.rng.chance(0.5);
             r->options.recursive = engine.rng.chance(0.5);
             r->options.max_results = r->options.recursive ? static_cast<uint32_t>(engine.rng.rangeInt(2, 16)) : 0;
-            r->options.shuffle = !r->options.recursive && engine.rng.chance(0.4);
+            r->options.shuffle = engine.rng.chance(0.5);
             r->has_watch = !r->options.recursive && engine.rng.chance(0.4);
             engine.coverage.hit("list_with_options_executed");
             req = r;
@@ -831,6 +910,19 @@ private:
             req = r;
         }
         req->xid = 500000 + static_cast<int64_t>(++reads_executed);
+        if (engine.buggify.quorum_reads && engine.rng.chance(0.75))
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+            {
+                if (auto res = cluster.submitRequest(leader, req, sid); res && res->get_accepted())
+                {
+                    ++ops_submitted;
+                    engine.coverage.hit("quorum_read_submitted");
+                    return;
+                }
+            }
+        }
         cluster.executeLocalRead(target_node, req, sid);
     }
 
@@ -904,6 +996,7 @@ private:
     uint64_t lin_seq_counter = 0;
     uint64_t last_acked_lin_val = 0;
     std::map<int64_t, ClientSession> sessions;
+    std::vector<std::pair<int64_t, int64_t>> unknown_retry_xids;
 };
 
 /// FoundationDB-inspired Continuous Chaos / Fault-Injection Actor.
@@ -942,10 +1035,13 @@ public:
             if (!cluster.isOnline(id))
                 cluster.startNode(id);
         }
-        for (int id = 1; id <= cluster.getConfig().num_nodes; ++id)
+        if (!engine.buggify.member_rotation)
         {
-            if (!cluster.isOnline(id))
-                cluster.startNode(id);
+            for (int id = 1; id <= cluster.getConfig().num_nodes; ++id)
+            {
+                if (!cluster.isOnline(id))
+                    cluster.startNode(id);
+            }
         }
         engine.trace("CHAOS_STOP_AND_HEAL");
     }
@@ -1007,6 +1103,18 @@ private:
             return;
         }
 
+        /// Hot reconfig (`request_leadership`, `set_user_ctx`, `update_params`) when enabled!
+        if (engine.buggify.priority_torture && engine.rng.chance(0.32))
+        {
+            cluster.runPriorityTortureAction();
+            return;
+        }
+        if (engine.buggify.hot_reconfig && engine.rng.chance(0.22))
+        {
+            cluster.runHotReconfigAction();
+            return;
+        }
+
         /// Toggle NuRaft slow-member backpressure (`bpon`/`bpoff`) from leader OR follower when enabled!
         if (engine.buggify.enable_backpressure && engine.rng.chance(0.22))
         {
@@ -1015,6 +1123,17 @@ private:
             {
                 bp_enabled = !bp_enabled;
                 cluster.toggleSlowMemberBackpressure(engine.rng.pick(online), bp_enabled);
+                return;
+            }
+        }
+
+        /// Core-voter membership rotation (`add_srv` voter + `remove_srv` any core voter / old leader)!
+        if (engine.buggify.member_rotation && engine.rng.chance(0.26))
+        {
+            const int leader = cluster.findLeader();
+            if (leader != 0)
+            {
+                cluster.rotateClusterMember(leader);
                 return;
             }
         }
@@ -1040,7 +1159,10 @@ private:
         if (roll < 26)
             injectNetworkFault(n);
         else if (roll < 50)
-            injectNodeCrash(n, quorum, engine.rng.chance(0.75) ? KillMode::PowerLoss : KillMode::Graceful);
+        {
+            const double pl_prob = engine.buggify.snapshot_on_exit ? 0.35 : 0.75;
+            injectNodeCrash(n, quorum, engine.rng.chance(pl_prob) ? KillMode::PowerLoss : KillMode::Graceful);
+        }
         else if (roll < 64)
             injectDiskIoFault(n);
         else if (roll < 78)
@@ -1216,15 +1338,22 @@ private:
             return;
         }
 
-        /// Arm transient snapshot fault (open / partial / sync / marker remove) and trigger a snapshot!
+        /// Arm transient snapshot fault (open / partial / sync / marker remove / read / mid-stream read) and trigger a snapshot!
         static const std::vector<std::pair<std::string, SimCrashDisk::TransientFaultKind>> faults = {
             {"snapshot_", SimCrashDisk::TransientFaultKind::Open},
             {"snapshot_", SimCrashDisk::TransientFaultKind::PartialWrite},
             {"snapshot_", SimCrashDisk::TransientFaultKind::SyncError},
             {"tmp_snapshot_", SimCrashDisk::TransientFaultKind::RemoveError},
+            {"snapshot_", SimCrashDisk::TransientFaultKind::ReadError},
+            {"snapshot_", SimCrashDisk::TransientFaultKind::MidReadError},
         };
         const auto & [prefix, kind] = engine.rng.pick(faults);
-        node.snapshot_disk->armTransientFault(prefix, kind);
+        if (engine.buggify.remote_snap_faults && node.latest_snapshot_disk && engine.rng.chance(0.40))
+            node.latest_snapshot_disk->armTransientFault(prefix, kind);
+        else
+            node.snapshot_disk->armTransientFault(prefix, kind);
+        if (kind == SimCrashDisk::TransientFaultKind::ReadError || kind == SimCrashDisk::TransientFaultKind::MidReadError)
+            engine.coverage.hit("remote_snapshot_read_fault_armed");
         cluster.triggerSnapshot(target);
         (void)n;
     }

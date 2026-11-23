@@ -3,6 +3,9 @@
 #include <SimClock.h>
 
 #include <Disks/DiskLocal.h>
+#include <Disks/IO/createReadBufferFromFileBase.h>
+#include <IO/ReadBufferFromFileDecorator.h>
+#include <IO/ReadPipeline.h>
 #include <IO/SwapHelper.h>
 #include <IO/WriteBufferFromFileDecorator.h>
 
@@ -42,6 +45,8 @@ public:
         PartialWrite,
         SyncError,
         RemoveError,
+        ReadError,
+        MidReadError,
     };
 
     struct Stats
@@ -84,6 +89,37 @@ public:
     bool hasArmedFault() const
     {
         return armed_fault_kind != TransientFaultKind::None;
+    }
+
+    void prepareRead(
+        const String & path,
+        const DB::ReadSettings & settings,
+        std::optional<size_t> read_hint,
+        DB::ReadPipeline & pipeline) const override
+    {
+        auto * self = const_cast<SimCrashDisk *>(this);
+        const std::string norm = normalizeRelPath(path);
+        if (self->matchesArmedFault(norm, TransientFaultKind::ReadError))
+        {
+            self->consumeArmedFault();
+            throw std::runtime_error("sim_disk: injected read open failure on " + norm);
+        }
+        if (self->matchesArmedFault(norm, TransientFaultKind::MidReadError))
+        {
+            self->consumeArmedFault();
+            const auto full_path = (live_dir / norm).string();
+            DB::StoredObject obj(full_path, full_path, DB::StoredObject::UnknownSize);
+            pipeline.setSource(
+                [full_path, norm](const DB::StoredObject &, const DB::ReadSettings & rs, bool, bool) -> std::unique_ptr<DB::ReadBufferFromFileBase>
+                {
+                    auto inner = DB::createReadBufferFromFileBase(full_path, rs);
+                    return std::make_unique<SimFailReadBuffer>(std::move(inner), norm);
+                },
+                DB::StoredObjects{obj},
+                settings);
+            return;
+        }
+        DB::DiskLocal::prepareRead(path, settings, read_hint, pipeline);
     }
 
     std::unique_ptr<DB::WriteBufferFromFileBase> writeFile(
@@ -372,6 +408,28 @@ public:
     size_t dirtyFileCount() const { return dirty_files.size(); }
 
 private:
+    class SimFailReadBuffer : public DB::ReadBufferFromFileDecorator
+    {
+    public:
+        SimFailReadBuffer(std::unique_ptr<DB::ReadBufferFromFileBase> impl_, std::string rel_path_)
+            : DB::ReadBufferFromFileDecorator(std::move(impl_))
+            , rel_path(std::move(rel_path_))
+        {
+        }
+
+        bool nextImpl() override
+        {
+            /// Allow the first read (e.g. 64-byte `FileEncryption::Header`), then fail mid-stream!
+            if (++reads_done >= 2)
+                throw std::runtime_error("sim_disk: injected mid-stream read failure on " + rel_path);
+            return DB::ReadBufferFromFileDecorator::nextImpl();
+        }
+
+    private:
+        std::string rel_path;
+        size_t reads_done = 0;
+    };
+
     class SimWriteBuffer : public DB::WriteBufferFromFileDecorator
     {
     public:

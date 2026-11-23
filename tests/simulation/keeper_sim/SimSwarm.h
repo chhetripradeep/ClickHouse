@@ -59,6 +59,23 @@ public:
         bool full_consensus = false;
         bool rollback_torture = false;
         bool watch_oracle = false;
+        bool remote_snapshots = false;
+        bool encrypted_logs = false;
+        bool client_stream = false;
+        bool hot_reconfig = false;
+        bool snapshot_on_exit = false;
+        bool member_rotation = false;
+        bool remote_snap_faults = false;
+        bool deep_lsmt_stress = false;
+        bool quorum_reads = false;
+        bool log_size_cache = false;
+        bool priority_torture = false;
+        bool batch_cache_retry = false;
+        bool local_disk_cache = false;
+        bool reconfig_race = false;
+        bool batch_cache_snapshot = false;
+        bool reconfig_overlap = false;
+        bool broken_tail_writeat = false;
     };
 
     struct JobResult
@@ -92,7 +109,16 @@ public:
                              bool backpressure = false, bool large_snap_dist = false,
                              bool acl_torture = false, bool torn_snapshots = false,
                              bool auto_forward = false, bool full_consensus = false,
-                             bool rollback_torture = false, bool watch_oracle = false)
+                             bool rollback_torture = false, bool watch_oracle = false,
+                             bool remote_snapshots = false, bool encrypted_logs = false,
+                             bool client_stream = false, bool hot_reconfig = false,
+                             bool snapshot_on_exit = false, bool member_rotation = false,
+                             bool remote_snap_faults = false, bool deep_lsmt_stress = false,
+                             bool quorum_reads = false, bool log_size_cache = false,
+                             bool priority_torture = false, bool batch_cache_retry = false,
+                             bool local_disk_cache = false, bool reconfig_race = false,
+                             bool batch_cache_snapshot = false, bool reconfig_overlap = false,
+                             bool broken_tail_writeat = false)
         {
             for (uint64_t s : seeds)
             {
@@ -122,6 +148,23 @@ public:
                 spec.full_consensus = full_consensus;
                 spec.rollback_torture = rollback_torture;
                 spec.watch_oracle = watch_oracle;
+                spec.remote_snapshots = remote_snapshots;
+                spec.encrypted_logs = encrypted_logs;
+                spec.client_stream = client_stream;
+                spec.hot_reconfig = hot_reconfig;
+                spec.snapshot_on_exit = snapshot_on_exit;
+                spec.member_rotation = member_rotation;
+                spec.remote_snap_faults = remote_snap_faults;
+                spec.deep_lsmt_stress = deep_lsmt_stress;
+                spec.quorum_reads = quorum_reads;
+                spec.log_size_cache = log_size_cache;
+                spec.priority_torture = priority_torture;
+                spec.batch_cache_retry = batch_cache_retry;
+                spec.local_disk_cache = local_disk_cache;
+                spec.reconfig_race = reconfig_race;
+                spec.batch_cache_snapshot = batch_cache_snapshot;
+                spec.reconfig_overlap = reconfig_overlap;
+                spec.broken_tail_writeat = broken_tail_writeat;
                 jobs.push_back(std::move(spec));
             }
         };
@@ -310,9 +353,121 @@ public:
             add_group("w9-rollback-hot-3n", "partition-storm", 3, "mixed", s3, 18000, false, false, true, false, false, false, false, false, false, false, true, false, true, true, false, false, false, true, false);
             add_group("w9-watch-oracle-3n", "clean", 3, "mixed", s4, 10000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, true);
         }
+        else if (suite == "hunt10")
+        {
+            /// Wave 10: 80 seeds hammering 4 completely untouched surfaces:
+            /// 1. Remote/Encrypted snapshot disks (`DiskEncrypted`) + dual-disk migration (`latest_snapshot_disk` -> `snapshot_disk`)
+            ///    + `RemoteSnapshotLoader` + `StreamingSnapshotLoader` (`snapshot_transfer_remote_disk_streaming`)!
+            /// 2. Encrypted `log_disk` (`DiskEncrypted` + `Changelog` `!isLocalDisk()`) + encrypted snapshots under power-loss!
+            /// 3. NuRaft `client_req_stream` (`open_client_req_stream`) pipelined follower/leader forwarding + backpressure!
+            /// 4. Hot `update_params` + directed `request_leadership(successor)` + `set_user_ctx` + 5-node dynamic membership!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(90001 + i);
+                s2.push_back(90101 + i);
+                s3.push_back(90201 + i);
+                s4.push_back(90301 + i);
+            }
+            add_group("w10-remote-snap-3n", "snapshot-storm", 3, "mixed", s1, 18000, true, false, true, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+            add_group("w10-enc-logs-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, true, true, false, false);
+            add_group("w10-cli-stream-3n", "chaos", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, true, true, false, false, false, false, false, false, false, false, true, false);
+            add_group("w10-hot-reconfig-5n", "chaos", 5, "mixed", s4, 18000, true, false, true, true, false, false, false, false, false, true, true, true, false, false, false, false, false, false, false, false, false, true, true);
+        }
+        else if (suite == "hunt11")
+        {
+            /// Wave 11: 80 seeds hammering 4 brand-new production surfaces:
+            /// 1. `create_snapshot_on_exit` (`KeeperServer.cpp:880-885`: `create_snapshot(serialize_commit_=true)`
+            ///    in `Phase::SHUTDOWN` after `raft_instance->shutdown()`) + frequent graceful restarts!
+            /// 2. Core-voter membership rotation (`{1,2,3} <-> {1,2,3,4}` removing original core voters &
+            ///    old leaders + stale-disk rejoin after removal, with `use_new_joiner_type=true`)!
+            /// 3. Remote/Encrypted snapshot transient READ + MID-STREAM READ + WRITE + REMOVE faults
+            ///    (`RemoteSnapshotLoader` / `StreamingSnapshotLoader` / dual-disk `moveSnapshotCandidate`)!
+            /// 4. Deep 5-level tree + shuffled recursive `ListWithOptions` + `ListRecursive` + `RemoveRecursive`
+            ///    + `CreateTTL` + `CreateContainer` + 5-node LSMT-Disk stress + `DataDisk` faults + `snapshot_on_exit`!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(100001 + i);
+                s2.push_back(100101 + i);
+                s3.push_back(100201 + i);
+                s4.push_back(100301 + i);
+            }
+            add_group("w11-snap-on-exit-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+            add_group("w11-member-rotate-3n", "chaos", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+            add_group("w11-remote-snap-faults-3n", "snapshot-storm", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, true, false);
+            add_group("w11-deep-lsmt-5n", "chaos", 5, "lsmt-disk", s4, 18000, true, false, true, false, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, true, false, false, true);
+        }
+        else if (suite == "hunt12")
+        {
+            /// Wave 12: 80 seeds hammering 4 completely untouched surfaces:
+            /// 1. `quorum_reads` (ALL 13 read & watch ops through Raft consensus!) + `use_xid_64` (>32-bit XIDs)
+            ///    + `OpenTelemetry::TracingContext` serialization + `min_request_size_for_cache = 32`!
+            /// 2. `Changelog` `max_size` + `overallocate_size` + byte-bounded `latest_logs_cache_size_threshold`
+            ///    + `max_flush_batch_size > 1` under power-loss & torn writes!
+            /// 3. NuRaft `set_priority_v2` (leader & forwarded) + `set_priority(0, broadcast)` + `flip_learner_flag`
+            ///    + `update_srv_config` + `auto_forward` + `hot_reconfig` on 5-node partition storms!
+            /// 4. `parsed_batch_cache` (`min_request_size_for_cache = 32`) with client retries / reused `(sid, xid)`
+            ///    across leader failovers and variable-size v1 batches!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(110001 + i);
+                s2.push_back(110101 + i);
+                s3.push_back(110201 + i);
+                s4.push_back(110301 + i);
+            }
+            add_group("w12-quorum-reads-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+            add_group("w12-log-size-cache-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+            add_group("w12-prio-v2-5n", "partition-storm", 5, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+            add_group("w12-batch-cache-3n", "partition-storm", 3, "mixed", s4, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+        }
+        else if (suite == "hunt13")
+        {
+            /// Wave 13: 80 seeds hammering 4 brand-new production surfaces:
+            /// 1. Real `DB::DiskLocal` logs + snapshots (`isLocalDisk() == true`): FIRST-TIME coverage of
+            ///    `KeeperSnapshotManager::writeSnapshotFile` (streaming snapshot writer), `fallocate`, `ftruncate`,
+            ///    `getSizeFromFileDescriptor`, AND byte+count bounded `latest_logs_cache` + `ValidRuns` + `executeReadPlan`!
+            /// 2. NuRaft concurrent reconfiguration race (`reconfig-race`, 5n chaos, NO `auto_forward`):
+            ///    `add_srv` / `remove_srv` / `flip_learner_flag` / `set_priority_v2` / `update_srv_config` / `set_user_ctx`!
+            /// 3. `parsed_batch_cache` (`min_request_size_for_cache = 32`) + mixed v0/v1 rolling upgrades + `quorum_reads`
+            ///    + `snapshot-storm` WITHOUT `xid` reuse!
+            /// 4. 5-node LSMT-Disk + real `DiskLocal` streaming snapshots (`SnapshotIterator`) + deep 5-level trees + `quorum_reads`!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(120001 + i);
+                s2.push_back(120101 + i);
+                s3.push_back(120201 + i);
+                s4.push_back(120301 + i);
+            }
+            add_group("w13-local-disk-cache-3n", "chaos", 3, "mixed", s1, 18000, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+            add_group("w13-reconfig-race-5n", "chaos", 5, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, true, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+            add_group("w13-batch-cache-snap-3n", "snapshot-storm", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+            add_group("w13-deep-lsmt-local-5n", "chaos", 5, "lsmt-disk", s4, 18000, true, false, false, false, false, false, false, false, false, false, true, true, false, true, false, false, false, false, false, false, false, false, false, true, false, false, true, true, false, false, false, true, false, false);
+        }
+        else if (suite == "hunt14")
+        {
+            /// Wave 14: 60 seeds targeting:
+            /// 1. NuRaft concurrent reconfiguration overlap (`update_srv_config`/`set_user_ctx` while `add_srv`
+            ///    or `flip_learner_flag` is uncommitted!) + `NURAFT_CONFIG_ORACLE` checking silent config reversion!
+            /// 2. Torn trailing changelog recovery (`broken_at_end = true`) + leader failover `Changelog::writeAt`!
+            /// 3. Real `DB::DiskLocal` streaming snapshots (`writeSnapshotFile`), `fallocate`, `ftruncate`,
+            ///    byte+count bounded `latest_logs_cache`, `ValidRuns`, `executeReadPlan` with `large_snap_dist`!
+            std::vector<uint64_t> s1, s2, s3;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(130001 + i);
+                s2.push_back(130101 + i);
+                s3.push_back(130201 + i);
+            }
+            add_group("w14-reconfig-overlap-5n", "chaos", 5, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, true, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+            add_group("w14-broken-tail-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+            add_group("w14-local-disk-nocomp-3n", "chaos", 3, "mixed", s3, 18000, true, false, false, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false);
+        }
         else
         {
-            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt, hunt2, hunt3, hunt4, hunt5, hunt6, hunt7, hunt8, or hunt9)");
+            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt..hunt14)");
         }
         return jobs;
     }
@@ -565,6 +720,40 @@ private:
             args.push_back("--rollback-torture");
         if (spec.watch_oracle)
             args.push_back("--watch-oracle");
+        if (spec.remote_snapshots)
+            args.push_back("--remote-snapshots");
+        if (spec.encrypted_logs)
+            args.push_back("--encrypted-logs");
+        if (spec.client_stream)
+            args.push_back("--client-stream");
+        if (spec.hot_reconfig)
+            args.push_back("--hot-reconfig");
+        if (spec.snapshot_on_exit)
+            args.push_back("--snapshot-on-exit");
+        if (spec.member_rotation)
+            args.push_back("--member-rotation");
+        if (spec.remote_snap_faults)
+            args.push_back("--remote-snap-faults");
+        if (spec.deep_lsmt_stress)
+            args.push_back("--deep-lsmt-stress");
+        if (spec.quorum_reads)
+            args.push_back("--quorum-reads");
+        if (spec.log_size_cache)
+            args.push_back("--log-size-cache");
+        if (spec.priority_torture)
+            args.push_back("--priority-torture");
+        if (spec.batch_cache_retry)
+            args.push_back("--batch-cache-retry");
+        if (spec.local_disk_cache)
+            args.push_back("--local-disk-cache");
+        if (spec.reconfig_race)
+            args.push_back("--reconfig-race");
+        if (spec.batch_cache_snapshot)
+            args.push_back("--batch-cache-snapshot");
+        if (spec.reconfig_overlap)
+            args.push_back("--reconfig-overlap");
+        if (spec.broken_tail_writeat)
+            args.push_back("--broken-tail-writeat");
         if (spec.host_delay)
             args.push_back("--host-delay");
         if (spec.strict_raft_commit)

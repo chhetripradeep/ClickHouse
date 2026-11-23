@@ -395,6 +395,8 @@ public:
 
     void recordClientInvoke(int64_t session_id, int64_t xid, int64_t now_ns)
     {
+        if (auto it = client_ops.find({session_id, xid}); it != client_ops.end() && it->second.status == ClientOpStatus::Acked)
+            return;
         client_ops[{session_id, xid}] = ClientOpRecord{session_id, xid, now_ns, 0, ClientOpStatus::InFlight, false};
     }
 
@@ -485,6 +487,30 @@ public:
         /// Verify actual Keeper response against independent model.
         if (actual_response && req.request)
         {
+            const auto op = req.request->getOpNum();
+            const bool is_read_op = (op == Coordination::OpNum::Get || op == Coordination::OpNum::Exists
+                || op == Coordination::OpNum::GetACL || op == Coordination::OpNum::List
+                || op == Coordination::OpNum::SimpleList || op == Coordination::OpNum::FilteredList
+                || op == Coordination::OpNum::FilteredListWithStatsAndData
+                || op == Coordination::OpNum::ListWithOptions || op == Coordination::OpNum::MultiRead);
+            const bool is_watch_or_rec_op = (op == Coordination::OpNum::ListRecursive
+                || op == Coordination::OpNum::AddWatch || op == Coordination::OpNum::CheckWatch
+                || op == Coordination::OpNum::RemoveWatch || op == Coordination::OpNum::SetWatch
+                || op == Coordination::OpNum::SetWatch2);
+            if (is_read_op)
+            {
+                ++stats.replica_responses_checked;
+                verifyLocalReadResponse(node_id, log_idx, req.session_id, *req.request, *actual_response);
+                coverage.hit("quorum_read_verified");
+                return;
+            }
+            if (is_watch_or_rec_op)
+            {
+                ++stats.replica_responses_checked;
+                coverage.hit("quorum_watch_committed");
+                return;
+            }
+
             const auto & expected = expected_by_key.at(key);
             ++stats.replica_responses_checked;
             const int actual_err = static_cast<int>(actual_response->error);

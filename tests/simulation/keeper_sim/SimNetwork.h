@@ -271,12 +271,12 @@ public:
             inc);
     }
 
-    void sendRpc(nuraft::ptr<nuraft::req_msg> request, nuraft::rpc_handler callback)
+    void sendRpc(nuraft::ptr<nuraft::req_msg> request, nuraft::rpc_handler callback, int fallback_dst = 0)
     {
         ++stats.requests_sent;
         const int src = request->get_src();
-        const int dst = request->get_dst();
-        const uint64_t src_inc = incarnations[src];
+        const int dst = request->get_dst() != 0 ? request->get_dst() : fallback_dst;
+        const uint64_t src_inc = (src != 0) ? incarnations[src] : 0;
         const uint64_t dst_inc = incarnations[dst];
         const auto mtype = request->get_type();
         const uint64_t req_term = request->get_term();
@@ -518,40 +518,56 @@ private:
 class SimRpcClient : public nuraft::rpc_client
 {
 public:
-    SimRpcClient(SimNetwork & net_, uint64_t id_)
+    SimRpcClient(SimNetwork & net_, uint64_t id_, int target_id_ = 0, bool pipelining_ = false)
         : net(net_)
         , id(id_)
+        , target_id(target_id_)
+        , pipelining(pipelining_)
     {
     }
 
     void send(nuraft::ptr<nuraft::req_msg> & req, nuraft::rpc_handler & cb, uint64_t) override
     {
-        net.sendRpc(req, cb);
+        net.sendRpc(req, cb, target_id);
     }
 
     uint64_t get_id() const override { return id; }
     bool is_abandoned() const override { return false; }
+    bool supports_pipelining() const override { return pipelining; }
 
 private:
     SimNetwork & net;
     uint64_t id;
+    int target_id;
+    bool pipelining;
 };
 
 class SimRpcFactory : public nuraft::rpc_client_factory
 {
 public:
-    explicit SimRpcFactory(SimNetwork & net_)
+    explicit SimRpcFactory(SimNetwork & net_, bool pipelining_ = false)
         : net(net_)
+        , pipelining(pipelining_)
     {
     }
 
-    nuraft::ptr<nuraft::rpc_client> create_client(const std::string &) override
+    nuraft::ptr<nuraft::rpc_client> create_client(const std::string & endpoint) override
     {
-        return nuraft::cs_new<SimRpcClient>(net, ++next_id);
+        int target_id = 0;
+        try
+        {
+            if (!endpoint.empty())
+                target_id = std::stoi(endpoint);
+        }
+        catch (...)
+        {
+        }
+        return nuraft::cs_new<SimRpcClient>(net, ++next_id, target_id, pipelining);
     }
 
 private:
     SimNetwork & net;
+    bool pipelining;
     uint64_t next_id = 0;
 };
 

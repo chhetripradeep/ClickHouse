@@ -162,6 +162,30 @@ struct BuggifyConfig
     bool full_consensus = false;
     bool rollback_torture = false;
     bool watch_oracle = false;
+    bool remote_snapshots = false;
+    bool remote_snapshot_streaming = false;
+    bool dual_snapshot_disks = false;
+    bool encrypted_logs = false;
+    bool client_stream = false;
+    bool hot_reconfig = false;
+    bool snapshot_on_exit = false;
+    bool member_rotation = false;
+    bool remote_snap_faults = false;
+    bool deep_lsmt_stress = false;
+    bool quorum_reads = false;
+    bool log_size_cache = false;
+    bool priority_torture = false;
+    bool batch_cache_retry = false;
+    bool local_disk_cache = false;
+    bool reconfig_race = false;
+    bool batch_cache_snapshot = false;
+    bool reconfig_overlap = false;
+    bool broken_tail_writeat = false;
+    uint64_t log_max_size = 0;
+    uint64_t log_overallocate_size = 0;
+    uint64_t latest_logs_cache_size_threshold = 0;
+    uint64_t max_flush_batch_size = 1;
+    uint64_t min_request_size_for_cache = 50 * 1024;
     int32_t grace_period_lagging_sm_ms = 0;
     uint64_t snapshots_to_keep = 3;
     uint64_t container_gc_max_never_used_ms = 0;
@@ -195,7 +219,24 @@ struct BuggifyConfig
         bool enable_auto_forward = false,
         bool enable_full_consensus = false,
         bool enable_rollback_torture = false,
-        bool enable_watch_oracle = false)
+        bool enable_watch_oracle = false,
+        bool enable_remote_snapshots = false,
+        bool enable_encrypted_logs = false,
+        bool enable_client_stream = false,
+        bool enable_hot_reconfig = false,
+        bool enable_snapshot_on_exit = false,
+        bool enable_member_rotation = false,
+        bool enable_remote_snap_faults = false,
+        bool enable_deep_lsmt_stress = false,
+        bool enable_quorum_reads = false,
+        bool enable_log_size_cache = false,
+        bool enable_priority_torture = false,
+        bool enable_batch_cache_retry = false,
+        bool enable_local_disk_cache = false,
+        bool enable_reconfig_race = false,
+        bool enable_batch_cache_snapshot = false,
+        bool enable_reconfig_overlap = false,
+        bool enable_broken_tail_writeat = false)
     {
         enabled = enable_buggify;
         switches.clear();
@@ -305,7 +346,7 @@ struct BuggifyConfig
         else
             snapshot_transfer_chunk_size = 0;
 
-        force_sync_logs = true;
+        force_sync_logs = !enable_encrypted_logs;
         log_sync_stop_gap = roll("small_log_sync_stop_gap", 0.50) ? static_cast<int32_t>(rng.rangeInt(0, 3)) : static_cast<int32_t>(rng.rangeInt(4, 15));
         use_new_joiner_type = force_new_joiner_ || roll("use_new_joiner_type", 0.50);
         enable_dynamic_membership = dynamic_membership;
@@ -324,6 +365,109 @@ struct BuggifyConfig
         full_consensus = enable_full_consensus;
         rollback_torture = enable_rollback_torture;
         watch_oracle = enable_watch_oracle;
+        remote_snapshots = enable_remote_snapshots || enable_remote_snap_faults;
+        encrypted_logs = enable_encrypted_logs;
+        client_stream = enable_client_stream;
+        hot_reconfig = enable_hot_reconfig;
+        snapshot_on_exit = enable_snapshot_on_exit || enable_deep_lsmt_stress;
+        member_rotation = enable_member_rotation;
+        remote_snap_faults = enable_remote_snap_faults;
+        deep_lsmt_stress = enable_deep_lsmt_stress;
+        quorum_reads = enable_quorum_reads;
+        log_size_cache = enable_log_size_cache;
+        priority_torture = enable_priority_torture;
+        batch_cache_retry = enable_batch_cache_retry;
+        local_disk_cache = enable_local_disk_cache;
+        reconfig_race = enable_reconfig_race;
+        batch_cache_snapshot = enable_batch_cache_snapshot;
+        reconfig_overlap = enable_reconfig_overlap;
+        broken_tail_writeat = enable_broken_tail_writeat;
+        if (enable_reconfig_overlap)
+        {
+            priority_torture = true;
+            auto_forward = false;
+            hot_reconfig = true;
+            enable_dynamic_membership = true;
+            use_new_joiner_type = true;
+        }
+        if (enable_broken_tail_writeat)
+        {
+            switches["torn_writes_on_power_loss"] = true;
+            rollback_torture = true;
+            log_rotate_interval = static_cast<uint64_t>(rng.rangeInt(2, 3));
+            compress_logs = false;
+        }
+        if (enable_quorum_reads)
+        {
+            min_request_size_for_cache = 32;
+            large_values = true;
+        }
+        if (enable_log_size_cache)
+        {
+            compress_logs = false;
+            log_max_size = static_cast<uint64_t>(rng.rangeInt(512, 2048));
+            log_overallocate_size = static_cast<uint64_t>(rng.rangeInt(256, 1024));
+            latest_logs_cache_size_threshold = 0;
+            max_flush_batch_size = 1;
+            large_values = true;
+        }
+        if (enable_local_disk_cache)
+        {
+            compress_logs = false;
+            log_max_size = static_cast<uint64_t>(rng.rangeInt(512, 2048));
+            log_overallocate_size = static_cast<uint64_t>(rng.rangeInt(256, 1024));
+            latest_logs_cache_size_threshold = static_cast<uint64_t>(rng.rangeInt(512, 2048));
+            latest_logs_cache_entry_count_threshold = static_cast<uint64_t>(rng.rangeInt(2, 8));
+            max_flush_batch_size = 1;
+            large_values = true;
+        }
+        if (enable_priority_torture)
+        {
+            auto_forward = true;
+            hot_reconfig = true;
+        }
+        if (enable_reconfig_race)
+        {
+            priority_torture = true;
+            auto_forward = false;
+            hot_reconfig = true;
+            enable_dynamic_membership = true;
+            use_new_joiner_type = true;
+        }
+        if (enable_batch_cache_snapshot)
+        {
+            min_request_size_for_cache = 32;
+            large_values = true;
+            quorum_reads = true;
+            mixed_versions = true;
+        }
+        if (enable_batch_cache_retry)
+        {
+            min_request_size_for_cache = 32;
+            large_values = true;
+            write_log_entry_version = 1;
+            multi_request_batches = true;
+        }
+        if (remote_snapshots)
+        {
+            dual_snapshot_disks = roll("dual_snapshot_disks", 0.50);
+            remote_snapshot_streaming = roll("remote_snapshot_streaming", 0.50);
+            if (remote_snapshot_streaming && snapshot_transfer_chunk_size == 0)
+                snapshot_transfer_chunk_size = static_cast<uint64_t>(rng.rangeInt(64, 256));
+            large_values = true;
+        }
+        if (enable_remote_snap_faults)
+        {
+            switches["transient_disk_io_errors"] = true;
+            if (snapshot_transfer_chunk_size == 0)
+                snapshot_transfer_chunk_size = static_cast<uint64_t>(rng.rangeInt(64, 192));
+        }
+        if (enable_deep_lsmt_stress)
+        {
+            large_values = true;
+            acl_torture = true;
+            switches["transient_disk_io_errors"] = true;
+        }
         if (enable_rollback_torture)
         {
             switches["slow_commits"] = true;

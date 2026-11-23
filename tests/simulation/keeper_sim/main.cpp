@@ -116,6 +116,23 @@ int main(int argc, char ** argv)
         bool full_consensus = false;
         bool rollback_torture = false;
         bool watch_oracle = false;
+        bool remote_snapshots = false;
+        bool encrypted_logs = false;
+        bool client_stream = false;
+        bool hot_reconfig = false;
+        bool snapshot_on_exit = false;
+        bool member_rotation = false;
+        bool remote_snap_faults = false;
+        bool deep_lsmt_stress = false;
+        bool quorum_reads = false;
+        bool log_size_cache = false;
+        bool priority_torture = false;
+        bool batch_cache_retry = false;
+        bool local_disk_cache = false;
+        bool reconfig_race = false;
+        bool batch_cache_snapshot = false;
+        bool reconfig_overlap = false;
+        bool broken_tail_writeat = false;
         bool strict_raft_commit = false;
         bool unsafe_quorum_control = false;
         bool instrumentation_control = false;
@@ -199,6 +216,40 @@ int main(int argc, char ** argv)
                 rollback_torture = true;
             else if (opt == "--watch-oracle")
                 watch_oracle = true;
+            else if (opt == "--remote-snapshots")
+                remote_snapshots = true;
+            else if (opt == "--encrypted-logs")
+                encrypted_logs = true;
+            else if (opt == "--client-stream")
+                client_stream = true;
+            else if (opt == "--hot-reconfig")
+                hot_reconfig = true;
+            else if (opt == "--snapshot-on-exit")
+                snapshot_on_exit = true;
+            else if (opt == "--member-rotation")
+                member_rotation = true;
+            else if (opt == "--remote-snap-faults")
+                remote_snap_faults = true;
+            else if (opt == "--deep-lsmt-stress")
+                deep_lsmt_stress = true;
+            else if (opt == "--quorum-reads")
+                quorum_reads = true;
+            else if (opt == "--log-size-cache")
+                log_size_cache = true;
+            else if (opt == "--priority-torture")
+                priority_torture = true;
+            else if (opt == "--batch-cache-retry")
+                batch_cache_retry = true;
+            else if (opt == "--local-disk-cache")
+                local_disk_cache = true;
+            else if (opt == "--reconfig-race")
+                reconfig_race = true;
+            else if (opt == "--batch-cache-snapshot")
+                batch_cache_snapshot = true;
+            else if (opt == "--reconfig-overlap")
+                reconfig_overlap = true;
+            else if (opt == "--broken-tail-writeat")
+                broken_tail_writeat = true;
             else if (opt == "--buggify")
                 enable_buggify = true;
             else if (opt == "--no-buggify")
@@ -284,7 +335,24 @@ int main(int argc, char ** argv)
             auto_forward,
             full_consensus,
             rollback_torture,
-            watch_oracle);
+            watch_oracle,
+            remote_snapshots,
+            encrypted_logs,
+            client_stream,
+            hot_reconfig,
+            snapshot_on_exit,
+            member_rotation,
+            remote_snap_faults,
+            deep_lsmt_stress,
+            quorum_reads,
+            log_size_cache,
+            priority_torture,
+            batch_cache_retry,
+            local_disk_cache,
+            reconfig_race,
+            batch_cache_snapshot,
+            reconfig_overlap,
+            broken_tail_writeat);
 
         ClusterConfig cluster_cfg;
         cluster_cfg.num_nodes = num_nodes;
