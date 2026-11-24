@@ -159,6 +159,8 @@ private:
 
     void runOneWorkloadStep()
     {
+        if (engine.buggify.svs_pause_writes)
+            return;
         const int leader = cluster.findLeader();
         if (leader == 0)
         {
@@ -542,7 +544,16 @@ private:
     std::string makePayload(const std::string & prefix)
     {
         std::string s = prefix + std::to_string(engine.rng.nextU32());
-        if (engine.buggify.large_values)
+        if (engine.buggify.huge_lsmt_values)
+        {
+            const size_t pad = engine.rng.chance(0.45)
+                ? engine.rng.rangeSize(2048, 10240)
+                : engine.rng.rangeSize(256, 1536);
+            s.append(pad, static_cast<char>('a' + (engine.rng.nextU32() % 26)));
+            if (pad >= 2048)
+                engine.coverage.hit("huge_lsmt_value_written");
+        }
+        else if (engine.buggify.large_values)
         {
             const size_t pad = engine.rng.rangeSize(200, 640);
             s.append(pad, static_cast<char>('a' + (engine.rng.nextU32() % 26)));
@@ -592,7 +603,7 @@ private:
             }
             else if (kind == 4)
             {
-                const int64_t sub = engine.buggify.mixed_versions ? 0 : engine.rng.rangeInt(0, 2);
+                const int64_t sub = (engine.buggify.mixed_versions || engine.buggify.snapshot_versions_mix) ? 0 : engine.rng.rangeInt(0, 2);
                 if (sub == 0)
                     req->not_exists = true; // CreateIfNotExists
                 else if (sub == 1)
@@ -714,6 +725,88 @@ private:
     Coordination::ZooKeeperRequestPtr buildMultiRequest(ClientSession & sess)
     {
         auto multi = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+        if (engine.buggify.same_path_multi_churn && engine.rng.chance(0.75))
+        {
+            /// Same-path complex Multi churn: Create -> Set -> SetACL -> CheckStat -> Remove -> Create(ephemeral/TTL/container)
+            /// (50% committing, 50% forced rollback on trailing Check!)
+            const std::string p = "/sim/sp" + std::to_string(engine.rng.rangeInt(0, 2));
+            const bool force_fail = engine.rng.chance(0.50);
+            const auto & tree = cluster.getKeeperOracle().latestTree().nodes;
+            const bool exists_now = tree.contains(p);
+            if (exists_now && engine.rng.chance(0.50))
+            {
+                /// Remove -> Recreate -> Set -> Remove (or keep) -> optional fail!
+                auto r1 = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                r1->path = p;
+                r1->version = -1;
+                auto c1 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+                c1->path = p;
+                c1->data = makePayload("sp-re-");
+                c1->acls = {{Coordination::ACL::All, "world", "anyone"}};
+                const int64_t mode = engine.rng.rangeInt(0, 3);
+                if (mode == 1)
+                    c1->is_ephemeral = true;
+                else if (mode == 2)
+                {
+                    c1->include_ttl = true;
+                    c1->ttl = engine.rng.rangeInt(1500, 4000);
+                }
+                else if (mode == 3)
+                    c1->is_container = true;
+                auto s1 = std::make_shared<Coordination::ZooKeeperSetRequest>();
+                s1->path = p;
+                s1->data = makePayload("sp-upd-");
+                s1->version = 0;
+                multi->requests = {r1, c1, s1};
+                if (engine.rng.chance(0.40))
+                {
+                    auto r2 = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                    r2->path = p;
+                    r2->version = 1;
+                    multi->requests.push_back(r2);
+                }
+            }
+            else
+            {
+                /// Create -> Set -> Set -> Remove -> Create(ephemeral/TTL/container)
+                auto c1 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+                c1->path = p;
+                c1->data = makePayload("sp-c1-");
+                c1->acls = {{Coordination::ACL::All, "world", "anyone"}};
+                c1->is_ephemeral = engine.rng.chance(0.50);
+                auto s1 = std::make_shared<Coordination::ZooKeeperSetRequest>();
+                s1->path = p;
+                s1->data = makePayload("sp-s1-");
+                s1->version = 0;
+                auto r1 = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                r1->path = p;
+                r1->version = 1;
+                auto c2 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+                c2->path = p;
+                c2->data = makePayload("sp-c2-");
+                c2->acls = {{Coordination::ACL::All, "world", "anyone"}};
+                const int64_t mode = engine.rng.rangeInt(0, 3);
+                if (mode == 1)
+                    c2->is_ephemeral = true;
+                else if (mode == 2)
+                {
+                    c2->include_ttl = true;
+                    c2->ttl = engine.rng.rangeInt(1500, 4000);
+                }
+                else if (mode == 3)
+                    c2->is_container = true;
+                multi->requests = {c1, s1, r1, c2};
+            }
+            if (force_fail)
+            {
+                auto chk = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+                chk->path = "/sim/never_exists_sp_rollback";
+                chk->version = 0;
+                multi->requests.push_back(chk);
+            }
+            engine.coverage.hit(force_fail ? "same_path_multi_rollback_submitted" : "same_path_multi_commit_submitted");
+            return multi;
+        }
         const int64_t pattern = engine.rng.rangeInt(0, 3);
         const std::string base = "/sim/m" + std::to_string(engine.rng.rangeInt(0, 4));
         if (pattern == 0)
@@ -1023,6 +1116,7 @@ public:
     void stopAndHeal()
     {
         stopped = true;
+        engine.buggify.svs_pause_writes = false;
         cluster.getNetwork().healAll();
         if (engine.buggify.enable_backpressure)
         {
@@ -1058,11 +1152,130 @@ private:
             {
                 if (stopped || simTimeMs() >= chaos_end_ms)
                     return;
+                if (engine.buggify.snapshot_vote_safety)
+                {
+                    runSnapshotVoteSafetyStep();
+                    scheduleNextChaos(svs_phase == 3 ? 2 : 50);
+                    return;
+                }
+                if (engine.buggify.autofwd_missing_leader)
+                {
+                    runAutoFwdMissingLeaderStep();
+                    scheduleNextChaos(aml_phase >= 2 ? 2 : 50);
+                    return;
+                }
                 runChaosAction();
                 const int64_t min_gap = (profile == "chaos" || profile == "partition-storm") ? 500 : 900;
                 const int64_t max_gap = (profile == "chaos" || profile == "partition-storm") ? 1800 : 2800;
                 scheduleNextChaos(engine.rng.rangeInt(min_gap, max_gap));
             });
+    }
+
+    void runSnapshotVoteSafetyStep()
+    {
+        if (svs_phase == 0)
+        {
+            const int leader = cluster.findLeader();
+            if (leader == 0)
+                return;
+            for (int id = 1; id <= 3; ++id)
+            {
+                const auto & n = cluster.getNodes().at(id);
+                if (!n.online || !n.machine || n.machine->last_commit_index() < 6)
+                    return;
+            }
+            svs_leader = leader;
+            svs_stale = (leader % 3) + 1;
+            svs_victim = ((leader + 1) % 3) + 1;
+            svs_stale_idx = cluster.getNodes().at(svs_stale).machine->last_commit_index();
+            cluster.getNetwork().healAll();
+            cluster.getNetwork().partitionSymmetric({svs_stale}, {svs_leader, svs_victim});
+            engine.trace("SVS_PHASE1_ISOLATE_STALE leader=" + std::to_string(svs_leader)
+                + " stale=" + std::to_string(svs_stale)
+                + " victim=" + std::to_string(svs_victim)
+                + " stale_idx=" + std::to_string(svs_stale_idx));
+            svs_phase = 1;
+        }
+        else if (svs_phase == 1)
+        {
+            const auto & lnode = cluster.getNodes().at(svs_leader);
+            if (!lnode.online || !lnode.machine || !lnode.log_store)
+                return;
+            if (lnode.machine->last_commit_index() >= svs_stale_idx + 14)
+            {
+                /// Pause new client writes BEFORE taking the snapshot so that NO committed entry
+                /// exists above `svs_snap_idx` when `svs_victim` is wiped and installs the snapshot.
+                /// That guarantees 100% quorum durability (both `svs_leader` and `svs_victim` hold
+                /// every committed entry `1..svs_snap_idx`) while leaving `svs_victim` with an empty
+                /// log store (`last_entry()->get_term() == 0`) right after `InstallSnapshot`!
+                engine.buggify.svs_pause_writes = true;
+                const uint64_t l_commit = lnode.machine->last_commit_index();
+                const uint64_t l_last = lnode.log_store->next_slot() - 1;
+                if (l_commit >= l_last)
+                {
+                    cluster.triggerSnapshot(svs_leader);
+                    svs_phase = 2;
+                }
+            }
+        }
+        else if (svs_phase == 2)
+        {
+            const auto & lnode = cluster.getNodes().at(svs_leader);
+            if (!lnode.online || !lnode.machine || !lnode.log_store)
+                return;
+            const uint64_t l_last = lnode.log_store->next_slot() - 1;
+            auto snap = lnode.machine->last_snapshot();
+            if (!snap || snap->get_last_log_idx() < l_last)
+            {
+                cluster.triggerSnapshot(svs_leader);
+                return;
+            }
+            svs_snap_idx = snap->get_last_log_idx();
+            /// Now `svs_snap_idx == l_last`: wiping and rejoining `svs_victim` will install
+            /// `svs_snap_idx` with ZERO trailing log entries (`last_entry()->get_term() == 0`)
+            /// and ZERO loss of quorum durability!
+            cluster.crashNode(svs_victim, KillMode::WipeAndRejoin);
+            cluster.startNode(svs_victim);
+            engine.trace("SVS_PHASE2_WIPED_VICTIM victim=" + std::to_string(svs_victim)
+                + " snap_idx=" + std::to_string(svs_snap_idx));
+            svs_phase = 3;
+        }
+        else if (svs_phase == 3)
+        {
+            const auto & vnode = cluster.getNodes().at(svs_victim);
+            if (!vnode.online || !vnode.machine || !vnode.log_store)
+                return;
+            if (vnode.machine->last_commit_index() >= svs_snap_idx
+                && vnode.log_store->last_entry()->get_term() == 0)
+            {
+                cluster.getNetwork().healAll();
+                cluster.getNetwork().partitionSymmetric({svs_leader}, {svs_stale, svs_victim});
+                engine.coverage.hit("snapshot_vote_safety_trap_sprung");
+                engine.trace("SVS_PHASE3_TRAP_SPRUNG leader=" + std::to_string(svs_leader)
+                    + " stale=" + std::to_string(svs_stale)
+                    + " victim=" + std::to_string(svs_victim)
+                    + " victim_commit=" + std::to_string(vnode.machine->last_commit_index())
+                    + " victim_last_entry_term=" + std::to_string(vnode.log_store->last_entry()->get_term()));
+                svs_phase = 4;
+            }
+            else if (vnode.machine->last_commit_index() > svs_snap_idx + 2)
+            {
+                engine.buggify.svs_pause_writes = false;
+                svs_phase = 1;
+            }
+        }
+        else if (svs_phase == 4)
+        {
+            /// If `svs_victim` happened to win the election before `svs_stale` got a vote,
+            /// heal, resume writes, and try another round!
+            const int cur_leader = cluster.findLeader();
+            if (cur_leader == svs_victim)
+            {
+                cluster.getNetwork().healAll();
+                engine.buggify.svs_pause_writes = false;
+                svs_phase = 0;
+            }
+        }
     }
 
     void runChaosAction()
@@ -1404,12 +1617,122 @@ private:
         }
     }
 
+    void runAutoFwdMissingLeaderStep()
+    {
+        if (aml_phase == 0)
+        {
+            const int leader = cluster.findLeader();
+            if (leader == 0)
+                return;
+            for (int id = 1; id <= 3; ++id)
+            {
+                const auto & n = cluster.getNodes().at(id);
+                if (!n.online || !n.machine || n.machine->last_commit_index() < 5)
+                    return;
+            }
+            aml_old_leader = leader;
+            aml_follower = (leader % 3) + 1;
+            const int other = ((leader + 1) % 3) + 1;
+            cluster.getNetwork().healAll();
+            /// Isolate follower `aml_follower` so it never receives the config change adding node 4.
+            cluster.getNetwork().partitionSymmetric({aml_follower}, {aml_old_leader, other, 4});
+            engine.trace("AML_PHASE0_ISOLATE follower=" + std::to_string(aml_follower) + " old_leader=" + std::to_string(aml_old_leader));
+            aml_phase = 1;
+        }
+        else if (aml_phase == 1)
+        {
+            const int leader = cluster.findLeader();
+            if (leader == 0 || leader == aml_follower)
+                return;
+            const auto & lnode = cluster.getNodes().at(leader);
+            if (!lnode.online || !lnode.server)
+                return;
+            if (!cluster.getNodes().contains(4))
+            {
+                if (cluster.addDynamicNode(leader, /*as_learner=*/false))
+                {
+                    /// Ensure follower `aml_follower` stays partitioned from node 4 as well.
+                    const int other = 6 - aml_old_leader - aml_follower;
+                    cluster.getNetwork().partitionSymmetric({aml_follower}, {aml_old_leader, other, 4});
+                    engine.trace("AML_PHASE1_ADDED_NODE4");
+                }
+                return;
+            }
+            /// Wait until node 4 is committed in leader's config and has caught up.
+            auto cfg = lnode.server->get_config();
+            const auto & n4 = cluster.getNodes().at(4);
+            if (cfg && cfg->get_server(4) && n4.online && n4.machine && n4.server
+                && n4.machine->last_commit_index() >= lnode.machine->last_commit_index() - 2
+                && lnode.machine->last_commit_index() >= 15)
+            {
+                /// Transfer leadership to node 4!
+                lnode.server->yield_leadership(/*immediate_yield=*/true, /*successor_id=*/4);
+                n4.server->request_leadership();
+                aml_last_yield_ms = simTimeMs();
+                engine.trace("AML_PHASE1_YIELD_TO_4");
+                aml_phase = 2;
+            }
+        }
+        else if (aml_phase == 2)
+        {
+            const int leader = cluster.findLeader();
+            if (leader == 4)
+            {
+                /// Node 4 is now Raft leader, while `aml_follower` still has the old 3-node config {1,2,3}!
+                /// Heal network so node 4 sends an AppendEntries to `aml_follower`, setting
+                /// `aml_follower`'s `leader_ = 4` BEFORE `aml_follower` receives/commits the config change adding node 4!
+                cluster.getNetwork().healAll();
+                engine.trace("AML_PHASE2_NODE4_IS_LEADER_HEALED");
+                aml_phase = 3;
+            }
+            else if (leader != 0 && leader != aml_follower && simTimeMs() - aml_last_yield_ms >= 400)
+            {
+                const auto & lnode = cluster.getNodes().at(leader);
+                const auto & n4 = cluster.getNodes().at(4);
+                if (lnode.online && lnode.server)
+                    lnode.server->yield_leadership(/*immediate_yield=*/true, /*successor_id=*/4);
+                if (n4.online && n4.server)
+                    n4.server->request_leadership();
+                aml_last_yield_ms = simTimeMs();
+            }
+        }
+        else if (aml_phase == 3)
+        {
+            const auto & fnode = cluster.getNodes().at(aml_follower);
+            if (!fnode.online || !fnode.server)
+                return;
+            const int f_leader = fnode.server->get_leader();
+            auto f_cfg = fnode.server->get_config();
+            if (f_leader == 4 && f_cfg && !f_cfg->get_server(4))
+            {
+                engine.coverage.hit("autofwd_missing_leader_triggered");
+                engine.trace("AML_PHASE3_TRIGGER_AUTOFWD follower=" + std::to_string(aml_follower)
+                    + " sees_leader=4 cfg_has_4=false");
+                /// Submit a client write directly to follower `aml_follower` with `auto_forwarding_ = true`!
+                auto dummy = nuraft::buffer::alloc(16);
+                std::vector<nuraft::ptr<nuraft::buffer>> bufs{dummy};
+                fnode.server->append_entries(bufs);
+                aml_phase = 4;
+            }
+        }
+    }
+
     SimEngine & engine;
     SimCluster & cluster;
     std::string profile;
     int64_t chaos_end_ms;
     bool stopped = false;
     bool bp_enabled = false;
+    int svs_phase = 0;
+    int svs_leader = 0;
+    int svs_stale = 0;
+    int svs_victim = 0;
+    uint64_t svs_stale_idx = 0;
+    uint64_t svs_snap_idx = 0;
+    int aml_phase = 0;
+    int aml_old_leader = 0;
+    int aml_follower = 0;
+    int64_t aml_last_yield_ms = 0;
 };
 
 } // namespace keeper_sim

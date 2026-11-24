@@ -181,6 +181,13 @@ struct BuggifyConfig
     bool batch_cache_snapshot = false;
     bool reconfig_overlap = false;
     bool broken_tail_writeat = false;
+    bool lazy_startup = false;
+    bool snapshot_vote_safety = false;
+    bool svs_pause_writes = false;
+    bool huge_lsmt_values = false;
+    bool same_path_multi_churn = false;
+    bool snapshot_versions_mix = false;
+    bool autofwd_missing_leader = false;
     uint64_t log_max_size = 0;
     uint64_t log_overallocate_size = 0;
     uint64_t latest_logs_cache_size_threshold = 0;
@@ -236,7 +243,13 @@ struct BuggifyConfig
         bool enable_reconfig_race = false,
         bool enable_batch_cache_snapshot = false,
         bool enable_reconfig_overlap = false,
-        bool enable_broken_tail_writeat = false)
+        bool enable_broken_tail_writeat = false,
+        bool enable_lazy_startup = false,
+        bool enable_snapshot_vote_safety = false,
+        bool enable_huge_lsmt_values = false,
+        bool enable_same_path_multi_churn = false,
+        bool enable_snapshot_versions_mix = false,
+        bool enable_autofwd_missing_leader = false)
     {
         enabled = enable_buggify;
         switches.clear();
@@ -382,6 +395,59 @@ struct BuggifyConfig
         batch_cache_snapshot = enable_batch_cache_snapshot;
         reconfig_overlap = enable_reconfig_overlap;
         broken_tail_writeat = enable_broken_tail_writeat;
+        lazy_startup = enable_lazy_startup;
+        snapshot_vote_safety = enable_snapshot_vote_safety;
+        huge_lsmt_values = enable_huge_lsmt_values;
+        same_path_multi_churn = enable_same_path_multi_churn;
+        snapshot_versions_mix = enable_snapshot_versions_mix;
+        autofwd_missing_leader = enable_autofwd_missing_leader;
+        if (enable_autofwd_missing_leader)
+        {
+            auto_forward = true;
+            dynamic_membership = true;
+            snapshot_distance = 100000;
+            switches["transient_disk_io_errors"] = false;
+            switches["torn_writes_on_power_loss"] = false;
+        }
+        if (enable_snapshot_vote_safety)
+        {
+            snapshot_distance = 12;
+            snapshot_transfer_chunk_size = 0;
+            compress_logs = false;
+            switches["transient_disk_io_errors"] = false;
+            switches["torn_writes_on_power_loss"] = false;
+        }
+        if (enable_huge_lsmt_values)
+        {
+            large_values = true;
+            deep_lsmt_stress = true;
+            snapshot_on_exit = true;
+            acl_torture = true;
+            lsmt_memtable_size = static_cast<uint64_t>(rng.rangeInt(1024, 2048));
+            lsmt_block_size = static_cast<uint64_t>(rng.rangeInt(512, 1024));
+            lsmt_file_block_size = static_cast<uint64_t>(rng.rangeInt(512, 1024));
+            lsmt_block_group_compressed_size = static_cast<uint64_t>(rng.rangeInt(512, 1024));
+            lsmt_sorted_file_uncompressed_size = static_cast<uint64_t>(rng.rangeInt(1024, 2048));
+            lsmt_block_cache_size = static_cast<uint64_t>(rng.rangeInt(2048, 4096));
+            lsmt_min_files_to_merge = 2;
+        }
+        if (enable_same_path_multi_churn)
+        {
+            rollback_torture = true;
+            acl_torture = true;
+            multi_request_batches = true;
+            write_log_entry_version = 1;
+            switches["slow_commits"] = true;
+            switches["asymmetric_partitions"] = true;
+            switches["network_reordering"] = true;
+        }
+        if (enable_snapshot_versions_mix)
+        {
+            snapshot_distance = static_cast<int32_t>(rng.rangeInt(8, 16));
+            snapshot_transfer_chunk_size = static_cast<uint64_t>(rng.rangeInt(128, 512));
+            acl_torture = true;
+            large_values = true;
+        }
         if (enable_reconfig_overlap)
         {
             priority_torture = true;

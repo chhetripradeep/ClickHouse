@@ -76,6 +76,11 @@ public:
         bool batch_cache_snapshot = false;
         bool reconfig_overlap = false;
         bool broken_tail_writeat = false;
+        bool lazy_startup = false;
+        bool snapshot_vote_safety = false;
+        bool huge_lsmt_values = false;
+        bool same_path_multi_churn = false;
+        bool snapshot_versions_mix = false;
     };
 
     struct JobResult
@@ -118,7 +123,9 @@ public:
                              bool priority_torture = false, bool batch_cache_retry = false,
                              bool local_disk_cache = false, bool reconfig_race = false,
                              bool batch_cache_snapshot = false, bool reconfig_overlap = false,
-                             bool broken_tail_writeat = false)
+                             bool broken_tail_writeat = false, bool lazy_startup = false,
+                             bool snapshot_vote_safety = false, bool huge_lsmt_values = false,
+                             bool same_path_multi_churn = false, bool snapshot_versions_mix = false)
         {
             for (uint64_t s : seeds)
             {
@@ -165,6 +172,11 @@ public:
                 spec.batch_cache_snapshot = batch_cache_snapshot;
                 spec.reconfig_overlap = reconfig_overlap;
                 spec.broken_tail_writeat = broken_tail_writeat;
+                spec.lazy_startup = lazy_startup;
+                spec.snapshot_vote_safety = snapshot_vote_safety;
+                spec.huge_lsmt_values = huge_lsmt_values;
+                spec.same_path_multi_churn = same_path_multi_churn;
+                spec.snapshot_versions_mix = snapshot_versions_mix;
                 jobs.push_back(std::move(spec));
             }
         };
@@ -465,9 +477,122 @@ public:
             add_group("w14-broken-tail-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
             add_group("w14-local-disk-nocomp-3n", "chaos", 3, "mixed", s3, 18000, true, false, false, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false);
         }
+        else if (suite == "hunt15")
+        {
+            /// Wave 15: 80 seeds exercising exact production `KeeperServer::callbackFunc` lazy startup
+            /// preprocessing (`!localLogsPreprocessed()`) across crashes, power-loss rollbacks,
+            /// snapshot-storm `apply_snapshot` while `!localLogsPreprocessed()`, and 5-node LSMT-Disk!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(140001 + i);
+                s2.push_back(140101 + i);
+                s3.push_back(140201 + i);
+                s4.push_back(140301 + i);
+            }
+            add_group("w15-lazy-chaos-3n", "chaos", 3, "mixed", s1, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+            add_group("w15-lazy-pl-3n", "power-loss", 3, "mixed", s2, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+            add_group("w15-lazy-snap-3n", "snapshot-storm", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+            add_group("w15-lazy-lsmt-5n", "chaos", 5, "lsmt-disk", s4, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, true);
+        }
+        else if (suite == "hunt16")
+        {
+            /// Wave 16: 80 seeds targeting:
+            /// 1. NuRaft Raft Election Safety (`handle_vote_req` `last_entry()->get_term()` vs `term_for_log`)
+            ///    after `InstallSnapshot` + log compaction!
+            /// 2. Huge LSMT single values (2-10 KB > block/file/memtable/cache thresholds) + `nodes_count` oracle!
+            /// 3. Same-path complex `Multi` churn (Create->Set->Remove->Recreate(eph/TTL/container) + forced rollbacks)
+            ///    under partition-storm + rollback torture!
+            /// 4. Cross-version snapshot matrix (V5/V6/V7/V8/V9 + Zstd/LZ4 + ACLs + ephemerals + chunked transfer)!
+            std::vector<uint64_t> s1, s2, s3, s4;
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                s1.push_back(150001 + i);
+                s2.push_back(150101 + i);
+                s3.push_back(150201 + i);
+                s4.push_back(150301 + i);
+            }
+            add_group("w16-snap-vote-safety-3n", "chaos", 3, "mixed", s1, 16000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+            add_group("w16-huge-lsmt-3n", "chaos", 3, "lsmt-disk", s2, 18000, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+            add_group("w16-same-path-multi-3n", "partition-storm", 3, "mixed", s3, 18000, true, false, true, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+            add_group("w16-snap-versions-3n", "snapshot-storm", 3, "mixed", s4, 18000, true, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+        }
+        else if (suite == "hunt17")
+        {
+            /// Wave 17: 80 seeds targeting:
+            /// 1. NuRaft `send_msg_to_leader` (`auto_forward` + `member_rotation`) null `srv_conf` SIGSEGV!
+            /// 2. `priority_torture` + `member_rotation` overlapping config changes & `become_leader`!
+            /// 3. 5-node `client_stream` + `member_rotation` + `backpressure` under `partition-storm`!
+            /// 4. 5-node `lsmt-disk` + `huge_lsmt_values` + `same_path_multi_churn` + `snapshot_on_exit` under `power-loss`!
+            for (uint64_t i = 0; i < 20; ++i)
+            {
+                JobSpec j1;
+                j1.name = "w17-autofwd-reconfig-3n_s" + std::to_string(160001 + i);
+                j1.seed = 160001 + i;
+                j1.nodes = 3;
+                j1.profile = "chaos";
+                j1.storage = "mixed";
+                j1.duration_ms = 18000;
+                j1.no_streaming = true;
+                j1.no_bounded_cache = true;
+                j1.no_disk_faults = true;
+                j1.large_snap_dist = true;
+                j1.force_new_joiner = true;
+                j1.auto_forward = true;
+                j1.member_rotation = true;
+                jobs.push_back(std::move(j1));
+
+                JobSpec j2;
+                j2.name = "w17-priority-conf-overlap-3n_s" + std::to_string(160101 + i);
+                j2.seed = 160101 + i;
+                j2.nodes = 3;
+                j2.profile = "chaos";
+                j2.storage = "mixed";
+                j2.duration_ms = 18000;
+                j2.no_streaming = true;
+                j2.no_bounded_cache = true;
+                j2.no_disk_faults = true;
+                j2.large_snap_dist = true;
+                j2.force_new_joiner = true;
+                j2.priority_torture = true;
+                j2.member_rotation = true;
+                jobs.push_back(std::move(j2));
+
+                JobSpec j3;
+                j3.name = "w17-clistream-rotate-5n_s" + std::to_string(160201 + i);
+                j3.seed = 160201 + i;
+                j3.nodes = 5;
+                j3.profile = "partition-storm";
+                j3.storage = "mixed";
+                j3.duration_ms = 18000;
+                j3.no_streaming = true;
+                j3.no_bounded_cache = true;
+                j3.no_disk_faults = true;
+                j3.large_snap_dist = true;
+                j3.force_new_joiner = true;
+                j3.client_stream = true;
+                j3.member_rotation = true;
+                j3.backpressure = true;
+                jobs.push_back(std::move(j3));
+
+                JobSpec j4;
+                j4.name = "w17-5n-heavy-lsmt-disk_s" + std::to_string(160301 + i);
+                j4.seed = 160301 + i;
+                j4.nodes = 5;
+                j4.profile = "power-loss";
+                j4.storage = "lsmt-disk";
+                j4.duration_ms = 18000;
+                j4.no_streaming = true;
+                j4.no_bounded_cache = true;
+                j4.huge_lsmt_values = true;
+                j4.same_path_multi_churn = true;
+                j4.snapshot_on_exit = true;
+                jobs.push_back(std::move(j4));
+            }
+        }
         else
         {
-            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt..hunt14)");
+            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt..hunt17)");
         }
         return jobs;
     }
@@ -754,6 +879,16 @@ private:
             args.push_back("--reconfig-overlap");
         if (spec.broken_tail_writeat)
             args.push_back("--broken-tail-writeat");
+        if (spec.lazy_startup)
+            args.push_back("--lazy-startup");
+        if (spec.snapshot_vote_safety)
+            args.push_back("--snapshot-vote-safety");
+        if (spec.huge_lsmt_values)
+            args.push_back("--huge-lsmt-values");
+        if (spec.same_path_multi_churn)
+            args.push_back("--same-path-multi-churn");
+        if (spec.snapshot_versions_mix)
+            args.push_back("--snapshot-versions-mix");
         if (spec.host_delay)
             args.push_back("--host-delay");
         if (spec.strict_raft_commit)

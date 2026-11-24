@@ -49,9 +49,10 @@ public:
         uint64_t figure8_violations = 0;
     };
 
-    explicit RaftSafetyOracle(int cluster_size_, bool strict_current_term_commit_, CoverageTracker & coverage_)
+    explicit RaftSafetyOracle(int cluster_size_, bool strict_current_term_commit_, CoverageTracker & coverage_, bool check_leader_completeness_ = true)
         : quorum_size(cluster_size_ / 2 + 1)
         , strict_current_term_commit(strict_current_term_commit_)
+        , check_leader_completeness(check_leader_completeness_)
         , coverage(coverage_)
     {
     }
@@ -120,6 +121,27 @@ public:
                 leaders_by_term[snap.term] = snap.id;
                 ++stats.elections_observed;
                 coverage.hit("leader_election");
+            }
+
+            /// 3b. Leader Completeness (Raft §5.4.1): every leader elected in a newer term
+            /// MUST contain all previously committed log indices (either in its log or covered
+            /// by its snapshot). We require `snap.term > high_entry_term` and `snap.term >= highest_leader_term`
+            /// so a stale partitioned leader from an older term that hasn't stepped down yet does not
+            /// falsely trigger against commits made by a newer leader.
+            if (check_leader_completeness && !committed_entries.empty())
+            {
+                const auto & [high_commit, high_val] = *committed_entries.rbegin();
+                const uint64_t high_entry_term = high_val.first;
+                const uint64_t highest_leader_term = leaders_by_term.empty() ? 0 : leaders_by_term.rbegin()->first;
+                if (snap.term > high_entry_term && snap.term >= highest_leader_term)
+                {
+                    require(snap.last_log_idx >= high_commit,
+                        "RAFT_SAFETY leader-completeness violated: node " + std::to_string(snap.id)
+                        + " elected leader in term " + std::to_string(snap.term)
+                        + " with last_log_idx=" + std::to_string(snap.last_log_idx)
+                        + " < highest_committed=" + std::to_string(high_commit)
+                        + " (committed_entry_term=" + std::to_string(high_entry_term) + ")");
+                }
             }
         }
 
@@ -284,6 +306,7 @@ public:
 private:
     int quorum_size;
     bool strict_current_term_commit;
+    bool check_leader_completeness;
     CoverageTracker & coverage;
     std::map<int, uint64_t> max_term_by_node;
     std::map<std::pair<int, uint64_t>, int> persisted_votes;

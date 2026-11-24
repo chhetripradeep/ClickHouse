@@ -264,6 +264,7 @@ public:
         uint32_t next_commit_sub_idx = 0;
 
         /// Track queued background task deduplication per node.
+        uint64_t last_log_idx_on_disk = 0;
         std::set<DB::Changelog::BackgroundTask> queued_log_tasks;
         bool snapshot_task_queued = false;
         bool lsmt_flush_queued = false;
@@ -276,7 +277,7 @@ public:
         , cfg(cfg_)
         , network(engine_)
         , rpc_factory(nuraft::cs_new<SimRpcFactory>(network, engine_.buggify.client_stream && engine_.rng.chance(0.50)))
-        , raft_oracle(cfg_.num_nodes, cfg_.strict_raft_commit, engine_.coverage)
+        , raft_oracle(cfg_.num_nodes, cfg_.strict_raft_commit, engine_.coverage, !engine_.buggify.async_replication)
         , keeper_oracle(engine_.coverage)
     {
         require(cfg.num_nodes == 3 || cfg.num_nodes == 5, "SimCluster supports 3 or 5 nodes");
@@ -411,8 +412,20 @@ public:
         auto settings = std::make_shared<DB::CoordinationSettings>();
         (*settings)[DB::CoordinationSetting::use_lsmt_storage] = node_lsmt;
         (*settings)[DB::CoordinationSetting::storage_memory_only] = !node_lsmt_disk;
-        (*settings)[DB::CoordinationSetting::compress_snapshots_with_zstd_format] = engine.buggify.compress_snapshots_zstd;
-        const uint64_t node_snap_ver = engine.buggify.mixed_versions ? ((id % 2 == 1) ? 8ULL : 9ULL) : engine.buggify.write_snapshot_version;
+        (*settings)[DB::CoordinationSetting::compress_snapshots_with_zstd_format] = engine.buggify.snapshot_versions_mix
+            ? (id % 2 == 0)
+            : engine.buggify.compress_snapshots_zstd;
+        uint64_t node_snap_ver = engine.buggify.write_snapshot_version;
+        if (engine.buggify.snapshot_versions_mix)
+        {
+            static constexpr uint64_t mix_versions[] = {5, 6, 7, 8, 9};
+            node_snap_ver = mix_versions[(static_cast<size_t>(id) + static_cast<size_t>(engine.rng.nextU32())) % 5];
+            engine.coverage.hit("snapshot_version_v" + std::to_string(node_snap_ver));
+        }
+        else if (engine.buggify.mixed_versions)
+        {
+            node_snap_ver = (id % 2 == 1) ? 8ULL : 9ULL;
+        }
         (*settings)[DB::CoordinationSetting::write_snapshot_version] = node_snap_ver;
         (*settings)[DB::CoordinationSetting::snapshot_transfer_chunk_size] = engine.buggify.snapshot_transfer_chunk_size;
         (*settings)[DB::CoordinationSetting::snapshots_to_keep] = engine.buggify.snapshots_to_keep;
@@ -606,9 +619,24 @@ public:
         require(node.log_store->flush(), "SimCluster: startup log flush failed on node " + std::to_string(id));
 
         /// Preprocess any persisted uncommitted log entries above the snapshot (exact KeeperServer::startup semantics).
-        if (node.log_store->next_slot() > snapshot_idx + 1)
-            node.machine->preprocessUncommittedLogEntries(snapshot_idx + 1, node.log_store->next_slot(), /*lock_mutex=*/true);
-        node.context->setLocalLogsPreprocessed();
+        node.last_log_idx_on_disk = node.log_store->next_slot() - 1;
+        if (engine.buggify.lazy_startup)
+        {
+            if (snapshot_idx >= node.last_log_idx_on_disk)
+            {
+                node.context->setLocalLogsPreprocessed();
+            }
+            else
+            {
+                engine.coverage.hit("lazy_startup_deferred_preprocessing");
+            }
+        }
+        else
+        {
+            if (node.log_store->next_slot() > snapshot_idx + 1)
+                node.machine->preprocessUncommittedLogEntries(snapshot_idx + 1, node.log_store->next_slot(), /*lock_mutex=*/true);
+            node.context->setLocalLogsPreprocessed();
+        }
 
         /// Recover latest cluster configuration from snapshot or log (matching KeeperServer::loadLatestConfig).
         auto snap_cfg = node.machine->getClusterConfig();
@@ -1433,16 +1461,20 @@ public:
 
         uint64_t expected_commit = 0;
         uint64_t expected_digest = 0;
+        uint64_t expected_nodes_count = 0;
         for (int id : currentClusterMemberIds())
         {
             auto & node = nodes.at(id);
             require(node.online && node.server && node.machine, "CONVERGENCE_FAILURE: node offline: " + std::to_string(id));
             const uint64_t cidx = node.machine->last_commit_index();
             const uint64_t digest = node.machine->getStorageUnsafe().getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
+            DB::KeeperStorageStats storage_stats{};
+            node.machine->getStorageUnsafe().nodes_storage->getNodeStorageStats(storage_stats);
             if (expected_commit == 0)
             {
                 expected_commit = cidx;
                 expected_digest = digest;
+                expected_nodes_count = storage_stats.nodes_count;
             }
             else
             {
@@ -1452,6 +1484,9 @@ public:
                 require(digest == expected_digest,
                     "CONVERGENCE_FAILURE: KeeperDigest mismatch on node " + std::to_string(id)
                     + " (" + std::to_string(digest) + " vs " + std::to_string(expected_digest) + ")");
+                require(storage_stats.nodes_count == expected_nodes_count,
+                    "CONVERGENCE_FAILURE: nodes_count mismatch on node " + std::to_string(id)
+                    + " (" + std::to_string(storage_stats.nodes_count) + " vs " + std::to_string(expected_nodes_count) + ")");
             }
             keeper_oracle.verifyNodeTree(id, *node.machine);
         }
@@ -1538,6 +1573,62 @@ private:
         if (it == nodes.end() || !it->second.online || !it->second.machine)
             return nuraft::cb_func::ReturnCode::Ok;
         auto & node = it->second;
+
+        /// Exact production `KeeperServer::callbackFunc` lazy startup preprocessing dance (`!localLogsPreprocessed()`).
+        if (node.context && !node.context->localLogsPreprocessed())
+        {
+            auto preprocess_logs = [&]()
+            {
+                if (node.context->localLogsPreprocessed())
+                    return;
+                node.context->setLocalLogsPreprocessed();
+                node.machine->preprocessUncommittedLogEntries(
+                    node.machine->last_commit_index() + 1, node.log_store->next_slot(), /*lock_mutex=*/true);
+                engine.coverage.hit("lazy_startup_logs_preprocessed");
+            };
+
+            switch (type)
+            {
+                case nuraft::cb_func::PreAppendLogLeader:
+                {
+                    engine.coverage.hit("lazy_startup_rejected_leader_append");
+                    return nuraft::cb_func::ReturnCode::ReturnNull;
+                }
+                case nuraft::cb_func::ProcessReq:
+                {
+                    auto & req = *static_cast<nuraft::req_msg *>(param->ctx);
+                    if (req.get_type() == nuraft::msg_type::append_entries_request && !req.log_entries().empty())
+                    {
+                        if (node.machine->last_commit_index() >= node.last_log_idx_on_disk
+                            && node.server && !node.server->isCommitInProgress())
+                        {
+                            preprocess_logs();
+                        }
+                    }
+                    break;
+                }
+                case nuraft::cb_func::GotAppendEntryReqFromLeader:
+                {
+                    auto & req = *static_cast<nuraft::req_msg *>(param->ctx);
+                    if (!req.log_entries().empty())
+                    {
+                        if (req.get_last_log_idx() < node.last_log_idx_on_disk)
+                            node.last_log_idx_on_disk = req.get_last_log_idx();
+                        req.log_entries().clear();
+                        engine.coverage.hit("lazy_startup_dropped_append_entries");
+                    }
+                    break;
+                }
+                case nuraft::cb_func::StateMachineExecution:
+                {
+                    if (node.machine->last_commit_index() >= node.last_log_idx_on_disk)
+                        preprocess_logs();
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
 
         switch (type)
         {

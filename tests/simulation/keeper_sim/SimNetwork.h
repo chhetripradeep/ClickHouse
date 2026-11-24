@@ -37,6 +37,11 @@ public:
     {
         commit_in_bg_exec();
     }
+
+    bool isCommitInProgress() const
+    {
+        return sm_commit_exec_in_progress_;
+    }
 };
 
 /// Real NuRaft timer scheduler wired directly onto SimEngine's virtual-time priority queue.
