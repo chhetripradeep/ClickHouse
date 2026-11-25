@@ -2,6 +2,7 @@
 #include <SimCluster.h>
 #include <SimEngine.h>
 #include <SimFeatureTests.h>
+#include <SimLiveServerTests.h>
 #include <SimSwarm.h>
 #include <SimWorkloads.h>
 
@@ -2479,6 +2480,7 @@ int main(int argc, char ** argv)
         bool block_acl = false;
         bool enable_superdigest = false;
         bool feature_tests = false;
+        bool live_server_tests = false;
         size_t repro_nested_multi_depth = 0;
         std::string repro_nuraft_mode;
         std::string repro_keeper_mode;
@@ -2521,6 +2523,8 @@ int main(int argc, char ** argv)
                 junit_xml_path = argv[++i];
             else if (opt == "--feature-tests")
                 feature_tests = true;
+            else if (opt == "--live-server-tests")
+                live_server_tests = true;
             else if (opt == "--seed" && i + 1 < argc)
                 seed = std::stoull(argv[++i]);
             else if (opt == "--nodes" && i + 1 < argc)
@@ -2684,6 +2688,14 @@ int main(int argc, char ** argv)
             if (state_dir.empty())
                 state_dir = std::filesystem::path("tmp") / "keeper_sim_feature_tests";
             keeper_sim::runKeeperFeatureTests(state_dir);
+            return 0;
+        }
+
+        if (live_server_tests)
+        {
+            if (state_dir.empty())
+                state_dir = std::filesystem::path("tmp") / "keeper_sim_live_server_tests";
+            keeper_sim::runKeeperLiveServerTests(state_dir);
             return 0;
         }
 

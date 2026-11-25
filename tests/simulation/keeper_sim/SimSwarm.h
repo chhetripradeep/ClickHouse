@@ -781,6 +781,28 @@ public:
                 return 1;
             }
             std::cout << "[PASS] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s)\n" << std::flush;
+
+            /// 2c. Run `--live-server-tests` in an isolated child process covering real `KeeperDispatcher`
+            /// (`use_new_dispatcher` true & false), `KeeperRequestDispatcher`, `KeeperRequestDispatcherOld`,
+            /// `KeeperServer`, `KeeperReadThreadPool`, all 27 non-jemalloc 4LW commands + `rcfg`, `OpNum::Reconfig`,
+            /// `KeeperOverDispatcher`, `KeeperTCPHandler` (plain + LZ4 + XID64 + 4LW + `max_request_size`),
+            /// and HTTP handlers (`/ready`, `/dashboard/content`, `/api/v1/commands`, `/api/v1/storage`)!
+            const auto live_dir = work_dir / "state_live_server_tests";
+            auto live = runOneSubprocess(
+                self_exe,
+                {"--live-server-tests", "--state-dir", live_dir.string()},
+                JobSpec{"keeper-live-server-tests"},
+                work_dir);
+            const bool live_ok = (live.exit_code == 0 && live.stdout_text.find("PASS keeper-sim-live-server-tests") != std::string::npos);
+            extra_checks.push_back({"keeper-live-server-tests", live_ok, live.elapsed_s, live_ok ? "" : firstLine(live.stderr_text.empty() ? live.stdout_text : live.stderr_text)});
+            if (!live.stdout_text.empty())
+                std::cout << live.stdout_text << std::flush;
+            if (!live_ok)
+            {
+                std::cerr << "[FAIL] keeper-live-server-tests: " << live.stderr_text << '\n';
+                return 1;
+            }
+            std::cout << "[PASS] keeper-live-server-tests (" << std::fixed << std::setprecision(2) << live.elapsed_s << "s)\n" << std::flush;
         }
 
         /// 3. Run all campaign jobs in parallel across `max_workers` child processes.
@@ -855,6 +877,11 @@ public:
                 "sequential_node_created",
                 "explicit_session_close",
                 "watch_triggered",
+                "add_watch_executed",
+                "check_watch_executed",
+                "remove_watch_executed",
+                "set_watches_executed",
+                "set_watches2_executed",
                 "local_read_verified",
                 "quorum_read_verified",
                 "simple_list_executed",

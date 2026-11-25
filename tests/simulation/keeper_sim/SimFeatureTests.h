@@ -4,30 +4,49 @@
 
 #include <Common/AsynchronousMetrics.h>
 #include <Common/OpenTelemetryTraceContext.h>
+#include <Common/ZooKeeper/KeeperClientCLI/KeeperClient.h>
 #include <Common/ZooKeeper/KeeperFeatureFlags.h>
+#include <Common/ZooKeeper/KeeperOverDispatcher.h>
+#include <Common/ZooKeeper/TestKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperIO.h>
 #include <Coordination/CoordinationSettings.h>
 #include <Coordination/FourLetterCommand.h>
+#include <Coordination/KeeperAsynchronousMetrics.h>
 #include <Coordination/KeeperConnectionStats.h>
 #include <Coordination/KeeperConstants.h>
 #include <Coordination/KeeperContext.h>
 #include <Coordination/KeeperLogStore.h>
 #include <Coordination/KeeperMemNodesStorage.h>
+#include <Coordination/KeeperReadThreadPool.h>
 #include <Coordination/KeeperReconfiguration.h>
+#include <Coordination/KeeperServer.h>
 #include <Coordination/KeeperSnapshotManager.h>
 #include <Coordination/KeeperStateMachine.h>
+#include <Coordination/KeeperStateManager.h>
 #include <Coordination/KeeperStorage.h>
 #include <Coordination/KeeperStorageImpl.h>
 #include <Coordination/RaftServerConfig.h>
+#include <Coordination/SessionExpiryQueue.h>
+#include <Coordination/Storage/Memtable.h>
+#include <Coordination/Storage/SortedRun.h>
+#include <Coordination/Storage/StorageState.h>
+#include <Coordination/ZooKeeperDataReader.h>
+#include <Common/SharedMutex.h>
+#include <Core/ServerUUID.h>
 #include <Disks/DiskLocal.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromString.h>
+#include <Poco/Util/XMLConfiguration.h>
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -38,7 +57,18 @@ namespace DB::CoordinationSetting
     extern const CoordinationSettingsBool check_node_acl_on_remove;
     extern const CoordinationSettingsUInt64 write_snapshot_version;
     extern const CoordinationSettingsUInt64 parallel_read_threads;
+    extern const CoordinationSettingsUInt64 parallel_read_chunk_size;
+    extern const CoordinationSettingsUInt64 parallel_read_min_batch;
     extern const CoordinationSettingsUInt64 max_request_size;
+    extern const CoordinationSettingsMilliseconds heart_beat_interval_ms;
+    extern const CoordinationSettingsMilliseconds election_timeout_lower_bound_ms;
+    extern const CoordinationSettingsMilliseconds election_timeout_upper_bound_ms;
+    extern const CoordinationSettingsUInt64 snapshot_distance;
+    extern const CoordinationSettingsUInt64 unflushed_memtables_soft_limit;
+    extern const CoordinationSettingsUInt64 sorted_runs_soft_limit;
+    extern const CoordinationSettingsUInt64 write_throttling_min_delay_us;
+    extern const CoordinationSettingsUInt64 write_throttling_max_delay_us;
+    extern const CoordinationSettingsFloat write_throttling_factor;
 }
 
 namespace keeper_sim
@@ -1061,6 +1091,422 @@ inline void testChangelogReadAheadAndParallelStartup(const std::filesystem::path
     std::cout << "  [PASS] feature: changelog_readahead_and_parallel_startup\n";
 }
 
+/// 9. `SessionExpiryQueue` bucket rounding / heartbeat extension / expiration,
+/// `KeeperStateManager` XML config parsing + `save_state`/`read_state` persistence +
+/// `getRaftConfigurationDiff`, and `DB::buildRaftParams` settings translation!
+inline void testSessionExpiryStateManagerAndRaftParams(const std::filesystem::path & root_dir)
+{
+    /// Part A: `SessionExpiryQueue` with deterministic injected clock.
+    {
+        int64_t now_ms = 10000;
+        DB::SessionExpiryQueue q(/*expiration_interval_=*/500, [&now_ms]() { return now_ms; });
+        q.addNewSessionOrUpdate(1, 1000); /// expires around 11500
+        q.addNewSessionOrUpdate(2, 2000); /// expires around 12500
+        q.addNewSessionOrUpdate(3, 1000); /// expires around 11500
+        require(q.getExpiredSessions().empty(), "No sessions should be expired at t=10000");
+
+        /// Extend session 1 via heartbeat, explicitly remove session 3.
+        now_ms = 10800;
+        q.addNewSessionOrUpdate(1, 2000); /// moved to ~13000
+        require(q.remove(3), "SessionExpiryQueue::remove(3) expected true");
+        require(!q.remove(999), "SessionExpiryQueue::remove(999) expected false");
+
+        now_ms = 12000;
+        require(q.getExpiredSessions().empty(), "Neither session 1 nor 2 should expire at t=12000");
+
+        now_ms = 12600;
+        auto exp1 = q.getExpiredSessions();
+        require(exp1.size() == 1 && exp1[0] == 2, "Expected only session 2 expired at t=12600");
+        q.remove(2);
+
+        now_ms = 13600;
+        auto exp2 = q.getExpiredSessions();
+        require(exp2.size() == 1 && exp2[0] == 1, "Expected session 1 expired at t=13600");
+        q.clear();
+        require(q.getExpiredSessions().empty(), "Queue should be empty after clear");
+    }
+
+    /// Part B: Real `KeeperStateManager` XML parsing, `save_state`/`read_state`, and `getRaftConfigurationDiff`.
+    {
+        const auto st_dir = root_dir / "state_manager";
+        std::filesystem::create_directories(st_dir / "state");
+        std::filesystem::create_directories(st_dir / "logs");
+        auto state_disk = std::make_shared<DB::DiskLocal>("FeatStateDisk", (st_dir / "state").string() + "/");
+        auto log_disk = std::make_shared<DB::DiskLocal>("FeatLogDisk", (st_dir / "logs").string() + "/");
+
+        const std::string xml_v1 = R"(<clickhouse><keeper_server>
+            <server_id>1</server_id>
+            <raft_configuration>
+                <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port><priority>2</priority></server>
+                <server><id>2</id><hostname>127.0.0.1</hostname><port>9235</port><start_as_follower>true</start_as_follower><priority>1</priority></server>
+                <server><id>3</id><hostname>127.0.0.1</hostname><port>9236</port><can_become_leader>false</can_become_leader><priority>0</priority></server>
+            </raft_configuration>
+        </keeper_server></clickhouse>)";
+        std::istringstream iss1(xml_v1);
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg1(new Poco::Util::XMLConfiguration(iss1));
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setStateFileDisk(state_disk);
+        ctx->setLogDisk(log_disk);
+
+        DB::KeeperStateManager mgr(1, "keeper_server", "raft_state", *cfg1, ctx);
+        require(mgr.getTotalServers() == 3, "KeeperStateManager expected 3 servers");
+        auto cc = mgr.load_config();
+        require(cc && cc->get_server(3) && cc->get_server(3)->is_learner(), "Server 3 should be parsed as learner");
+        require(cc->get_server(1)->get_priority() == 2, "Server 1 priority expected 2");
+
+        /// Persist term/voted_for and verify `read_state` restores them faithfully.
+        auto st = nuraft::cs_new<nuraft::srv_state>();
+        st->set_term(7);
+        st->set_voted_for(2);
+        mgr.save_state(*st);
+        auto loaded = mgr.read_state();
+        require(loaded && loaded->get_term() == 7 && loaded->get_voted_for() == 2,
+            "KeeperStateManager save_state/read_state mismatch");
+
+        /// Verify `getRaftConfigurationDiff` detects added server 4, removed server 3, and priority update on server 2!
+        const std::string xml_v2 = R"(<clickhouse><keeper_server>
+            <server_id>1</server_id>
+            <raft_configuration>
+                <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port><priority>2</priority></server>
+                <server><id>2</id><hostname>127.0.0.1</hostname><port>9235</port><priority>5</priority></server>
+                <server><id>4</id><hostname>127.0.0.1</hostname><port>9237</port><priority>1</priority></server>
+            </raft_configuration>
+        </keeper_server></clickhouse>)";
+        std::istringstream iss2(xml_v2);
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg2(new Poco::Util::XMLConfiguration(iss2));
+        const auto diff = mgr.getRaftConfigurationDiff(*cfg2, *settings);
+        require(diff.size() >= 3, "Expected >= 3 diff actions (add 4, remove 3, update 2), got " + std::to_string(diff.size()));
+    }
+
+    /// Part C: `DB::buildRaftParams` translation from `CoordinationSettings`.
+    {
+        DB::CoordinationSettings cs;
+        cs[DB::CoordinationSetting::heart_beat_interval_ms] = 150;
+        cs[DB::CoordinationSetting::election_timeout_lower_bound_ms] = 400;
+        cs[DB::CoordinationSetting::election_timeout_upper_bound_ms] = 800;
+        cs[DB::CoordinationSetting::snapshot_distance] = 512;
+        const auto rp = DB::buildRaftParams(cs, getLogger("SimFeatureBuildRaftParams"));
+        require(rp.heart_beat_interval_ == 150
+            && rp.election_timeout_lower_bound_ == 400
+            && rp.election_timeout_upper_bound_ == 800
+            && rp.snapshot_distance_ == 512,
+            "DB::buildRaftParams translation mismatch");
+    }
+    std::cout << "  [PASS] feature: session_expiry_state_manager_and_raft_params\n";
+}
+
+/// 10. Apache ZooKeeper snapshot + transaction log migration (`ZooKeeperDataReader`).
+inline void testZooKeeperDataReaderMigration(const std::filesystem::path & root_dir)
+{
+    const auto dir = root_dir / "zk_data_reader";
+    std::filesystem::create_directories(dir / "snaps");
+    std::filesystem::create_directories(dir / "logs");
+
+    const auto snap_path = (dir / "snaps" / "snapshot.5").string();
+    {
+        DB::WriteBufferFromFile wb(snap_path);
+        Coordination::write(static_cast<int32_t>(1514885966), wb); // "ZKSN"
+        Coordination::write(static_cast<int32_t>(2), wb);          // version 2
+        Coordination::write(static_cast<int64_t>(0), wb);          // dbid
+        Coordination::write(static_cast<int32_t>(1), wb);          // 1 session
+        Coordination::write(static_cast<int64_t>(1), wb);          // sid=1
+        Coordination::write(static_cast<int32_t>(30000), wb);      // timeout=30000
+        Coordination::write(static_cast<int32_t>(0), wb);          // 0 ACL entries
+        /// Persistent node "/zk_migrated"
+        Coordination::write(std::string("/zk_migrated"), wb);
+        Coordination::write(std::string("snap-data"), wb);
+        Coordination::write(static_cast<int64_t>(0), wb);
+        Coordination::write(static_cast<int64_t>(5), wb);
+        Coordination::write(static_cast<int64_t>(5), wb);
+        Coordination::write(static_cast<int64_t>(1000), wb);
+        Coordination::write(static_cast<int64_t>(1000), wb);
+        Coordination::write(static_cast<int32_t>(0), wb);
+        Coordination::write(static_cast<int32_t>(0), wb);
+        Coordination::write(static_cast<int32_t>(0), wb);
+        Coordination::write(static_cast<int64_t>(0), wb);
+        Coordination::write(static_cast<int64_t>(5), wb);
+        Coordination::write(std::string("/"), wb); // terminator
+        wb.finalize();
+    }
+
+    const auto log_path = (dir / "logs" / "log.6").string();
+    {
+        DB::WriteBufferFromFile wb(log_path);
+        Coordination::write(static_cast<int32_t>(1514884167), wb); // "ZKLG"
+        Coordination::write(static_cast<int32_t>(2), wb);          // version 2
+        Coordination::write(static_cast<int64_t>(0), wb);          // dbid
+
+        auto write_txn = [&](int64_t sid, int32_t xid, int64_t zxid, int64_t time, int32_t type, const std::string & body)
+        {
+            DB::WriteBufferFromOwnString rec;
+            Coordination::write(sid, rec);
+            Coordination::write(xid, rec);
+            Coordination::write(zxid, rec);
+            Coordination::write(time, rec);
+            Coordination::write(type, rec);
+            rec.write(body.data(), body.size());
+            const std::string payload = rec.str();
+            Coordination::write(static_cast<int64_t>(1), wb);
+            Coordination::write(static_cast<int32_t>(payload.size()), wb);
+            wb.write(payload.data(), payload.size());
+            Coordination::write(static_cast<int8_t>(0x42), wb);
+        };
+
+        /// SetTxn (type=5) updating "/zk_migrated" -> "log-updated"
+        {
+            DB::WriteBufferFromOwnString body;
+            Coordination::write(std::string("/zk_migrated"), body);
+            Coordination::write(std::string("log-updated"), body);
+            Coordination::write(static_cast<int32_t>(1), body); // version
+            write_txn(1, 1, 6, 2000, 5, body.str());
+        }
+        /// CreateTxn (type=1) creating "/zk_migrated/child"
+        {
+            DB::WriteBufferFromOwnString body;
+            Coordination::write(std::string("/zk_migrated/child"), body);
+            Coordination::write(std::string("child-val"), body);
+            Coordination::ACLs empty_acls;
+            Coordination::write(empty_acls, body);
+            Coordination::write(false, body);
+            Coordination::write(static_cast<int32_t>(1), body);
+            write_txn(1, 2, 7, 2001, 1, body.str());
+        }
+        Coordination::write(static_cast<int64_t>(0), wb); // EOF
+        wb.finalize();
+    }
+
+    auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+    ctx->setDigestEnabled(false);
+    DB::KeeperMemoryStorage storage(500, "", ctx);
+    auto logger = getLogger("SimFeatureZKReader");
+    DB::deserializeKeeperStorageFromSnapshotsDir(storage, (dir / "snaps").string(), logger);
+    storage.initializeSystemNodes();
+    DB::deserializeLogsAndApplyToStorage(storage, (dir / "logs").string(), logger);
+
+    auto it_parent = storage.nodes.container.find("/zk_migrated");
+    require(it_parent != storage.nodes.container.end() && it_parent->value.getData() == "log-updated",
+        "ZooKeeperDataReader failed to replay SetTxn on /zk_migrated");
+    auto it_child = storage.nodes.container.find("/zk_migrated/child");
+    require(it_child != storage.nodes.container.end() && it_child->value.getData() == "child-val",
+        "ZooKeeperDataReader failed to replay CreateTxn on /zk_migrated/child");
+    std::cout << "  [PASS] feature: zookeeper_data_reader_migration\n";
+}
+
+/// 11. `KeeperReadThreadPool` (serial fallback + parallel multi-chunk + exception propagation)
+/// and `KeeperOverDispatcher::promotingMultiCallback` error promotion.
+inline void testKeeperReadThreadPoolAndOverDispatcher()
+{
+    DB::CoordinationSettings cs;
+    cs[DB::CoordinationSetting::parallel_read_threads] = 2;
+    cs[DB::CoordinationSetting::parallel_read_chunk_size] = 4;
+    cs[DB::CoordinationSetting::parallel_read_min_batch] = 8;
+
+    DB::KeeperReadThreadPool pool;
+
+    /// Small batch (< parallel_read_min_batch) runs inline without spawning workers.
+    {
+        std::vector<int> visited(4, 0);
+        pool.execute(4, cs, [&](size_t begin, size_t end)
+        {
+            for (size_t i = begin; i < end; ++i)
+                visited[i] += 1;
+        });
+        for (int v : visited)
+            require(v == 1, "KeeperReadThreadPool small batch missed element");
+    }
+
+    /// Larger batch (>= parallel_read_min_batch) fans out across 2 worker threads in chunks of 4.
+    {
+        std::vector<std::atomic<int>> visited(64);
+        for (auto & a : visited)
+            a.store(0);
+        pool.execute(64, cs, [&](size_t begin, size_t end)
+        {
+            for (size_t i = begin; i < end; ++i)
+                visited[i].fetch_add(1);
+        });
+        for (const auto & a : visited)
+            require(a.load() == 1, "KeeperReadThreadPool parallel batch did not visit each index exactly once");
+    }
+
+    /// Exception propagation from worker thread.
+    {
+        bool caught = false;
+        try
+        {
+            pool.execute(32, cs, [&](size_t begin, size_t end)
+            {
+                if (begin <= 16 && 16 < end)
+                    throw std::runtime_error("simulated read worker failure");
+            });
+        }
+        catch (const std::runtime_error & e)
+        {
+            caught = std::string(e.what()).find("simulated read worker failure") != std::string::npos;
+        }
+        require(caught, "KeeperReadThreadPool did not propagate worker exception");
+    }
+    pool.shutdown();
+
+    /// Verify `KeeperOverDispatcher::promotingMultiCallback` promotes failed sub-op error into outer `MultiResponse`.
+    {
+        Coordination::Error promoted = Coordination::Error::ZOK;
+        auto cb = Coordination::KeeperOverDispatcher::promotingMultiCallback(
+            [&promoted](const Coordination::MultiResponse & r) { promoted = r.error; });
+        auto multi_resp = std::make_shared<Coordination::ZooKeeperMultiWriteResponse>();
+        multi_resp->error = Coordination::Error::ZOK;
+        auto sub_ok = std::make_shared<Coordination::ZooKeeperCreateResponse>();
+        sub_ok->error = Coordination::Error::ZOK;
+        auto sub_fail = std::make_shared<Coordination::ZooKeeperErrorResponse>();
+        sub_fail->error = Coordination::Error::ZNODEEXISTS;
+        multi_resp->responses = {sub_ok, sub_fail};
+        cb(multi_resp);
+        require(promoted == Coordination::Error::ZNODEEXISTS,
+            "KeeperOverDispatcher::promotingMultiCallback did not promote ZNODEEXISTS");
+    }
+    std::cout << "  [PASS] feature: keeper_read_thread_pool_and_over_dispatcher\n";
+}
+
+/// 12. `KeeperClientCLI` (`KeeperClientBase` parser + command execution against `TestKeeper`).
+inline void testKeeperClientCLICommands()
+{
+    auto zk = zkutil::ZooKeeper::createFromImpl([]()
+    {
+        zkutil::ZooKeeperArgs args;
+        args.implementation = "testkeeper";
+        return std::make_unique<Coordination::TestKeeper>(args);
+    });
+
+    std::ostringstream out;
+    std::ostringstream err;
+    DB::KeeperClientBase cli(out, err);
+    cli.zookeeper = zk;
+    cli.ask_confirmation = false;
+
+    auto run_cli = [&](const std::string & cmd) -> std::string
+    {
+        out.str("");
+        out.clear();
+        err.str("");
+        err.clear();
+        cli.processQueryText(cmd);
+        require(err.str().empty(), "KeeperClientCLI stderr non-empty for '" + cmd + "': " + err.str());
+        return out.str();
+    };
+
+    run_cli("create /cli_dir dir_val");
+    run_cli("create /cli_dir/k1 v1");
+    require(run_cli("get /cli_dir/k1").find("v1") != std::string::npos, "CLI get /cli_dir/k1 failed");
+    run_cli("set /cli_dir/k1 v2");
+    require(run_cli("get /cli_dir/k1").find("v2") != std::string::npos, "CLI set /cli_dir/k1 failed");
+    require(run_cli("ls /cli_dir").find("k1") != std::string::npos, "CLI ls /cli_dir failed");
+    require(run_cli("exists /cli_dir/k1").find("1") != std::string::npos, "CLI exists failed");
+    require(run_cli("get_stat /cli_dir/k1").find("dataLength") != std::string::npos, "CLI get_stat failed");
+    run_cli("touch /cli_dir/k2");
+    run_cli("cp /cli_dir/k1 /cli_dir/k1_copy");
+    require(run_cli("get /cli_dir/k1_copy").find("v2") != std::string::npos, "CLI cp failed");
+    run_cli("mv /cli_dir/k1_copy /cli_dir/k1_moved");
+    require(run_cli("get /cli_dir/k1_moved").find("v2") != std::string::npos, "CLI mv failed");
+    run_cli("cpr /cli_dir /cli_backup");
+    require(run_cli("get /cli_backup/k1").find("v2") != std::string::npos, "CLI cpr failed");
+    require(run_cli("get_direct_children_number /cli_dir").find("3") != std::string::npos, "CLI get_direct_children_number failed");
+    require(run_cli("get_all_children_number /cli_dir").find("3") != std::string::npos, "CLI get_all_children_number failed");
+    run_cli("cd /cli_dir");
+    require(cli.cwd == "/cli_dir", "CLI cd failed: cwd=" + cli.cwd.string());
+    run_cli("rm k2");
+    run_cli("cd /");
+    require(cli.cwd == "/", "CLI cd / failed");
+    require(run_cli("lsr /cli_dir").find("k1") != std::string::npos, "CLI lsr failed");
+    run_cli("sync /cli_dir");
+    run_cli("rmr /cli_backup");
+    require(!zk->exists("/cli_backup"), "CLI rmr /cli_backup failed");
+    require(DB::formatKeeperNodeName("plain_name") == "plain_name", "formatKeeperNodeName plain failed");
+    require(DB::formatKeeperNodeName("with space") == "with\\ space", "formatKeeperNodeName escaped failed");
+    require(DB::formatKeeperNodeName("a;b") == "'a;b'", "formatKeeperNodeName quoted failed");
+    std::cout << "  [PASS] feature: keeper_client_cli_commands\n";
+}
+
+/// 13. LSMT write-throttling (`StorageState::recalculateWriteThrottling`),
+/// `setKeeperFileDescriptorMetrics` sentinel handling, and `KeeperStateManager` password auth configs.
+inline void testLsmtWriteThrottlingFdMetricsAndAuthConfig(const std::filesystem::path & root_dir)
+{
+    /// Part A: LSMT write-throttling backoff, cap, and recovery.
+    {
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::unflushed_memtables_soft_limit] = 4;
+        (*settings)[DB::CoordinationSetting::sorted_runs_soft_limit] = 2;
+        (*settings)[DB::CoordinationSetting::write_throttling_min_delay_us] = 10000;
+        (*settings)[DB::CoordinationSetting::write_throttling_max_delay_us] = 1000000;
+        (*settings)[DB::CoordinationSetting::write_throttling_factor] = 16.0f;
+
+        auto keeper_context = std::make_shared<DB::KeeperContext>(true, settings);
+        DB::SharedMutex storage_mutex;
+        Coordination::Storage::StorageState storage(keeper_context, &storage_mutex);
+        std::lock_guard lock(storage_mutex);
+
+        storage.recalculateWriteThrottling();
+        require(storage.write_throttling_us.load() == 0, "Expected 0 throttling within limits");
+
+        for (int i = 0; i < 6; ++i)
+            storage.immutable_memtables.push_back(std::make_shared<Coordination::Storage::Memtable>());
+        for (uint32_t i = 0; i < 4; ++i)
+            storage.sorted_runs.push_back(std::make_shared<Coordination::Storage::SortedRun>(i, i));
+        storage.recalculateWriteThrottling();
+        const uint64_t mid_delay = storage.write_throttling_us.load();
+        require(mid_delay >= 639990 && mid_delay <= 640010,
+            "Unexpected mid write-throttling delay: " + std::to_string(mid_delay));
+
+        storage.immutable_memtables.clear();
+        for (uint32_t i = 4; i < 7; ++i)
+            storage.sorted_runs.push_back(std::make_shared<Coordination::Storage::SortedRun>(i, i));
+        storage.recalculateWriteThrottling();
+        require(storage.write_throttling_us.load() == 1000000, "Expected capped write-throttling delay");
+
+        storage.sorted_runs.clear();
+        storage.recalculateWriteThrottling();
+        require(storage.write_throttling_us.load() == 0, "Expected throttling to clear back to 0");
+    }
+
+    /// Part B: `setKeeperFileDescriptorMetrics` normal & undetermined (`-1` / `nullopt`) values.
+    {
+        DB::AsynchronousMetricValues mv;
+        DB::setKeeperFileDescriptorMetrics(mv, 42, 1024);
+        require(mv.at("KeeperOpenFileDescriptorCount").value == 42.0
+            && mv.at("KeeperMaxFileDescriptorCount").value == 1024.0,
+            "setKeeperFileDescriptorMetrics valid values mismatch");
+        DB::setKeeperFileDescriptorMetrics(mv, -1, std::nullopt);
+        require(mv.at("KeeperOpenFileDescriptorCount").value == -1.0
+            && mv.at("KeeperMaxFileDescriptorCount").value == -1.0,
+            "setKeeperFileDescriptorMetrics sentinel mismatch");
+    }
+
+    /// Part C: `KeeperStateManager` SHA-256 client password authentication parsing.
+    {
+        const auto dir = root_dir / "auth_cfg";
+        std::filesystem::create_directories(dir / "logs");
+        std::filesystem::create_directories(dir / "state");
+        const std::string xml = R"(<clickhouse><keeper_server>
+            <server_id>1</server_id>
+            <client_password_sha256_hex>9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08</client_password_sha256_hex>
+            <raft_configuration>
+                <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port></server>
+            </raft_configuration>
+        </keeper_server></clickhouse>)";
+        std::istringstream iss(xml);
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+        auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+        ctx->setLogDisk(std::make_shared<DB::DiskLocal>("AuthLogDisk", (dir / "logs").string() + "/"));
+        ctx->setStateFileDisk(std::make_shared<DB::DiskLocal>("AuthStateDisk", (dir / "state").string() + "/"));
+        DB::KeeperStateManager mgr(1, "keeper_server", "auth_state", *cfg, ctx);
+        const auto auth_data = mgr.getAuthenticationData();
+        require(auth_data.has_value() && auth_data->getType() == DB::AuthenticationType::SHA256_PASSWORD,
+            "KeeperStateManager did not parse client_password_sha256_hex");
+    }
+    std::cout << "  [PASS] feature: lsmt_write_throttling_fd_metrics_and_auth_config\n";
+}
+
 } // namespace feature_tests_detail
 
 inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
@@ -1073,6 +1519,8 @@ inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
     /// Feature tests exercise real multi-threaded Changelog read-ahead & parallel startup,
     /// so keep virtual POSIX time disabled here.
     g_virtual_time_enabled = false;
+    DB::ServerUUID::setRandomForUnitTests();
+    std::cout << std::unitbuf;
 
     feature_tests_detail::testWireProtocolRoundtrip();
     feature_tests_detail::testFeatureFlagsAndContext();
@@ -1082,6 +1530,11 @@ inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
     feature_tests_detail::testReconfigParsingAndActions();
     feature_tests_detail::testFourLetterWordsAndStats(state_dir);
     feature_tests_detail::testChangelogReadAheadAndParallelStartup(state_dir);
+    feature_tests_detail::testSessionExpiryStateManagerAndRaftParams(state_dir);
+    feature_tests_detail::testZooKeeperDataReaderMigration(state_dir);
+    feature_tests_detail::testKeeperReadThreadPoolAndOverDispatcher();
+    feature_tests_detail::testKeeperClientCLICommands();
+    feature_tests_detail::testLsmtWriteThrottlingFdMetricsAndAuthConfig(state_dir);
 
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);

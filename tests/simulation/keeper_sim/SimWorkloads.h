@@ -991,6 +991,7 @@ private:
             r->mode = engine.rng.chance(0.5)
                 ? Coordination::AddWatchRequest::AddWatchMode::PERSISTENT
                 : Coordination::AddWatchRequest::AddWatchMode::PERSISTENT_RECURSIVE;
+            engine.coverage.hit("add_watch_executed");
             req = r;
         }
         else if (kind == 4)
@@ -1036,6 +1037,7 @@ private:
             auto r = std::make_shared<Coordination::ZooKeeperCheckWatchRequest>();
             r->path = path;
             r->type = Coordination::CheckWatchRequest::CheckWatchType::ANY;
+            engine.coverage.hit("check_watch_executed");
             req = r;
         }
         else if (kind == 9)
@@ -1043,6 +1045,7 @@ private:
             auto r = std::make_shared<Coordination::ZooKeeperRemoveWatchRequest>();
             r->path = path;
             r->type = Coordination::RemoveWatchRequest::WatchType::ANY;
+            engine.coverage.hit("remove_watch_executed");
             req = r;
         }
         else if (kind == 10)
