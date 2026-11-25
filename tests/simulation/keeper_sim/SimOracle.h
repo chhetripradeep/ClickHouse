@@ -416,6 +416,13 @@ public:
         tree_by_index[0] = current_tree;
     }
 
+    void setPolicy(bool check_node_acl_on_remove_, bool block_acl_, std::string superdigest_ = "")
+    {
+        check_node_acl_on_remove = check_node_acl_on_remove_;
+        block_acl = block_acl_;
+        superdigest = std::move(superdigest_);
+    }
+
     void recordClientInvoke(int64_t session_id, int64_t xid, int64_t now_ns)
     {
         if (auto it = client_ops.find({session_id, xid}); it != client_ops.end() && it->second.status == ClientOpStatus::Acked)
@@ -1104,6 +1111,14 @@ private:
         return false;
     }
 
+    static bool isKeeperSystemPath(std::string_view path)
+    {
+        return path == DB::keeper_system_path
+            || (path.size() > DB::keeper_system_path.size()
+                && path.starts_with(DB::keeper_system_path)
+                && path[DB::keeper_system_path.size()] == '/');
+    }
+
     static bool checkACL(
         const TreeState & state,
         const std::vector<Coordination::ACL> & acls,
@@ -1113,6 +1128,8 @@ private:
         if (acls.empty())
             return true;
         auto auth_it = state.session_auths.find(session_id);
+        if (auth_it != state.session_auths.end() && auth_it->second.contains({"super", ""}))
+            return true;
         for (const auto & acl : acls)
         {
             if ((acl.permissions & perm) == 0)
@@ -1125,13 +1142,15 @@ private:
         return false;
     }
 
-    static bool fixupACL(
+    bool fixupACL(
         const TreeState & state,
         const std::vector<Coordination::ACL> & request_acls,
         int64_t session_id,
-        std::vector<Coordination::ACL> & out_acls)
+        std::vector<Coordination::ACL> & out_acls) const
     {
         out_acls.clear();
+        if (block_acl)
+            return true;
         if (request_acls.empty())
             return true;
         bool valid_found = false;
@@ -1170,7 +1189,7 @@ private:
         return valid_found;
     }
 
-    static int applySingleOp(
+    int applySingleOp(
         TreeState & state,
         const Coordination::ZooKeeperRequest & zk_req,
         int64_t session_id,
@@ -1186,12 +1205,23 @@ private:
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperAuthRequest &>(zk_req);
                 if (req.scheme != "digest" || std::count(req.data.begin(), req.data.end(), ':') != 1)
                     return static_cast<int>(Error::ZAUTHFAILED);
-                state.session_auths[session_id].emplace(req.scheme, DB::KeeperStorage::generateDigest(req.data));
+                const std::string digest = DB::KeeperStorage::generateDigest(req.data);
+                if (!superdigest.empty() && digest == superdigest)
+                {
+                    state.session_auths[session_id].emplace("super", "");
+                    coverage.hit("superdigest_authenticated");
+                }
+                else
+                {
+                    state.session_auths[session_id].emplace(req.scheme, digest);
+                }
                 return static_cast<int>(Error::ZOK);
             }
             case Coordination::OpNum::SetACL:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperSetACLRequest &>(zk_req);
+                if (isKeeperSystemPath(req.path))
+                    return static_cast<int>(Error::ZBADARGUMENTS);
                 state.known_paths.insert(req.path);
                 auto it = state.nodes.find(req.path);
                 if (it == state.nodes.end())
@@ -1214,6 +1244,8 @@ private:
             case Coordination::OpNum::CreateTTL:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperCreateRequest &>(zk_req);
+                if (isKeeperSystemPath(req.path))
+                    return static_cast<int>(Error::ZBADARGUMENTS);
                 const std::string parent = parentPath(req.path);
                 if (parent.empty() || !state.nodes.contains(parent))
                     return static_cast<int>(Error::ZNONODE);
@@ -1283,6 +1315,8 @@ private:
             case Coordination::OpNum::Set:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperSetRequest &>(zk_req);
+                if (isKeeperSystemPath(req.path))
+                    return static_cast<int>(Error::ZBADARGUMENTS);
                 state.known_paths.insert(req.path);
                 auto it = state.nodes.find(req.path);
                 if (it == state.nodes.end())
@@ -1300,6 +1334,8 @@ private:
             case Coordination::OpNum::TryRemove:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperRemoveRequest &>(zk_req);
+                if (isKeeperSystemPath(req.path))
+                    return static_cast<int>(Error::ZBADARGUMENTS);
                 state.known_paths.insert(req.path);
                 const bool is_ttl_gc = req.try_remove && session_id == DB::keeper_internal_ttl_garbage_collector_session_id;
                 const bool is_container_gc = req.try_remove && session_id == DB::keeper_internal_container_garbage_collector_session_id;
@@ -1312,6 +1348,11 @@ private:
                 auto it = state.nodes.find(req.path);
                 if (it == state.nodes.end())
                     return req.try_remove ? static_cast<int>(Error::ZOK) : static_cast<int>(Error::ZNONODE);
+                if (!is_internal_gc && check_node_acl_on_remove && !checkACL(state, it->second.acls, Coordination::ACL::Delete, session_id))
+                {
+                    coverage.hit("check_node_acl_on_remove_denied");
+                    return static_cast<int>(Error::ZNOAUTH);
+                }
                 if (req.version != -1 && req.version != it->second.version)
                     return req.try_remove ? static_cast<int>(Error::ZOK) : static_cast<int>(Error::ZBADVERSION);
                 if (is_ttl_gc && (!it->second.is_ttl || req_time < it->second.mtime + it->second.ttl_ms))
@@ -1321,12 +1362,16 @@ private:
                 if (hasChildren(state, req.path))
                     return req.try_remove ? static_cast<int>(Error::ZOK) : static_cast<int>(Error::ZNOTEMPTY);
                 state.nodes.erase(it);
+                if (is_ttl_gc)
+                    coverage.hit("ttl_gc_node_deleted");
+                else if (is_container_gc)
+                    coverage.hit("container_gc_node_deleted");
                 return static_cast<int>(Error::ZOK);
             }
             case Coordination::OpNum::RemoveRecursive:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperRemoveRecursiveRequest &>(zk_req);
-                if (req.path == "/")
+                if (req.path == "/" || isKeeperSystemPath(req.path))
                     return static_cast<int>(Error::ZBADARGUMENTS);
                 const std::string parent = parentPath(req.path);
                 if (parent.empty() || !state.nodes.contains(parent))
@@ -1373,6 +1418,8 @@ private:
             case Coordination::OpNum::CheckStat:
             {
                 const auto & req = dynamic_cast<const Coordination::ZooKeeperCheckRequest &>(zk_req);
+                if (isKeeperSystemPath(req.path))
+                    return static_cast<int>(Error::ZBADARGUMENTS);
                 state.known_paths.insert(req.path);
                 auto it = state.nodes.find(req.path);
                 if (it != state.nodes.end() && !checkACL(state, it->second.acls, Coordination::ACL::Read, session_id))
@@ -1536,6 +1583,9 @@ private:
     }
 
     CoverageTracker & coverage;
+    bool check_node_acl_on_remove = false;
+    bool block_acl = false;
+    std::string superdigest;
     TreeState current_tree;
     uint64_t highest_modeled_idx = 0;
     std::pair<uint64_t, uint32_t> highest_modeled_key{0, 0};

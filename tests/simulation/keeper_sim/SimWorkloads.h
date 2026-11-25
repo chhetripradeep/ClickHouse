@@ -195,7 +195,12 @@ private:
                 auto auth = std::make_shared<Coordination::ZooKeeperAuthRequest>();
                 auth->xid = sess.next_xid++;
                 auth->scheme = "digest";
-                if (engine.buggify.acl_torture)
+                if (engine.buggify.enable_superdigest && sid == 1)
+                {
+                    auth->data = "super:simsuperpass";
+                    engine.coverage.hit("superdigest_auth_submitted");
+                }
+                else if (engine.buggify.acl_torture)
                 {
                     const int64_t uid = (sid == 1) ? 0 : engine.rng.rangeInt(0, 29);
                     auth->data = "u" + std::to_string(uid) + ":p" + std::to_string(uid);
@@ -223,15 +228,30 @@ private:
             }
         }
 
-        /// Occasionally let a secondary session expire naturally to test virtual-time SessionExpiryQueue + ephemeral cleanup!
-        if (sessions.size() >= 3 && engine.rng.chance(0.03))
+        /// Occasionally let a secondary session expire naturally OR explicitly close it via `OpNum::Close`
+        /// to test both virtual-time `SessionExpiryQueue` AND immediate explicit Close + ephemeral/watch cleanup!
+        if (sessions.size() >= 3 && engine.rng.chance(0.035))
         {
             for (auto & [sid, sess] : sessions)
             {
                 if (sid > 1 && sess.alive && !sess.letting_expire)
                 {
                     sess.letting_expire = true;
-                    engine.trace("WORKLOAD_LET_SESSION_EXPIRE sid=" + std::to_string(sid));
+                    if (engine.rng.chance(0.45))
+                    {
+                        auto close_req = std::make_shared<Coordination::ZooKeeperCloseRequest>();
+                        close_req->xid = Coordination::CLOSE_XID;
+                        if (auto res = cluster.submitRequest(leader, close_req, sid); res && res->get_accepted())
+                        {
+                            sess.alive = false;
+                            engine.coverage.hit("explicit_session_close");
+                            engine.trace("WORKLOAD_EXPLICIT_CLOSE sid=" + std::to_string(sid));
+                        }
+                    }
+                    else
+                    {
+                        engine.trace("WORKLOAD_LET_SESSION_EXPIRE sid=" + std::to_string(sid));
+                    }
                     break;
                 }
             }
@@ -368,7 +388,7 @@ private:
                 batch_ids.emplace_back(b_sid, req->xid);
                 DB::KeeperRequestForSession entry;
                 entry.session_id = b_sid;
-                entry.time = simTimeMs();
+                entry.time = simWallTimeMs();
                 entry.request = std::move(req);
                 batch_entries.push_back(std::move(entry));
             }
@@ -587,7 +607,41 @@ private:
                 return {{Coordination::ACL::All, "digest", simuser_digest}};
             return {{Coordination::ACL::All, "world", "anyone"}};
         };
-        const int64_t kind = engine.rng.rangeInt(0, 16);
+        const int64_t kind = engine.rng.rangeInt(0, 17);
+        if (kind == 17 && !for_multi)
+        {
+            /// Probe `/keeper` system-node write protection (Create/Set/Remove/SetACL/Check must return ZBADARGUMENTS).
+            const int64_t sp = engine.rng.rangeInt(0, 3);
+            engine.coverage.hit("system_node_verified");
+            if (sp == 0)
+            {
+                auto r = std::make_shared<Coordination::ZooKeeperSetRequest>();
+                r->path = "/keeper";
+                r->data = "illegal";
+                r->version = -1;
+                return r;
+            }
+            if (sp == 1)
+            {
+                auto r = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                r->path = "/keeper";
+                r->version = -1;
+                return r;
+            }
+            if (sp == 2)
+            {
+                auto r = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+                r->path = "/keeper/sim_illegal";
+                r->data = "x";
+                r->acls = {{Coordination::ACL::All, "world", "anyone"}};
+                return r;
+            }
+            auto r = std::make_shared<Coordination::ZooKeeperSetACLRequest>();
+            r->path = "/keeper";
+            r->version = -1;
+            r->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            return r;
+        }
         if (kind <= 4)
         {
             /// Create (persistent, ephemeral, sequential, Create2, CreateIfNotExists, CreateContainer, or CreateTTL)
@@ -880,7 +934,34 @@ private:
             return;
         const std::string path = engine.rng.chance(0.3) ? "/sim" : pickPath();
 
-        const int64_t kind = engine.rng.rangeInt(0, 12);
+        const int64_t kind = engine.rng.rangeInt(0, 14);
+        if (kind == 13)
+        {
+            /// `SimpleList` (legacy ZooKeeper `OpNum::SimpleList`)
+            auto r = std::make_shared<Coordination::ZooKeeperSimpleListRequest>();
+            r->path = "/sim";
+            r->has_watch = engine.rng.chance(0.5);
+            r->xid = 500000 + static_cast<int64_t>(++reads_executed);
+            engine.coverage.hit("simple_list_executed");
+            cluster.executeLocalRead(target_node, r, sid);
+            return;
+        }
+        if (kind == 14)
+        {
+            /// System-node read verification (`/keeper`, `/keeper/max_request_size`).
+            auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g->path = engine.rng.chance(0.5) ? "/keeper" : "/keeper/max_request_size";
+            g->xid = 500000 + static_cast<int64_t>(++reads_executed);
+            auto resp = cluster.executeLocalRead(target_node, g, sid, /*verify_response=*/false);
+            if (resp)
+            {
+                require(resp->error == Coordination::Error::ZOK,
+                    "SYSTEM_NODE_ORACLE: Get " + g->path + " failed with error="
+                    + std::to_string(static_cast<int>(resp->error)));
+                engine.coverage.hit("system_node_verified");
+            }
+            return;
+        }
         Coordination::ZooKeeperRequestPtr req;
         if (kind == 0)
         {

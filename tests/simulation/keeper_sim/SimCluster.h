@@ -52,6 +52,7 @@ namespace DB::CoordinationSetting
     extern const CoordinationSettingsUInt64 min_request_size_for_cache;
     extern const CoordinationSettingsBool use_xid_64;
     extern const CoordinationSettingsBool quorum_reads;
+    extern const CoordinationSettingsBool check_node_acl_on_remove;
 }
 
 namespace keeper_sim
@@ -283,6 +284,11 @@ public:
         require(cfg.num_nodes == 3 || cfg.num_nodes == 5, "SimCluster supports 3 or 5 nodes");
         std::filesystem::create_directories(cfg.root_dir);
 
+        keeper_oracle.setPolicy(
+            engine.buggify.check_node_acl_on_remove,
+            engine.buggify.block_acl,
+            engine.buggify.enable_superdigest ? DB::KeeperStorage::generateDigest("super:simsuperpass") : "");
+
         for (int id = 1; id <= cfg.num_nodes; ++id)
             initial_raft_config.get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(id, std::to_string(id)));
         if (engine.buggify.async_replication)
@@ -433,8 +439,15 @@ public:
         (*settings)[DB::CoordinationSetting::min_request_size_for_cache] = engine.buggify.min_request_size_for_cache;
         (*settings)[DB::CoordinationSetting::use_xid_64] = engine.buggify.quorum_reads;
         (*settings)[DB::CoordinationSetting::quorum_reads] = engine.buggify.quorum_reads;
+        (*settings)[DB::CoordinationSetting::check_node_acl_on_remove] = engine.buggify.check_node_acl_on_remove;
         (*settings)[DB::CoordinationSetting::dead_session_check_period_ms] = 500;
         (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+        if (engine.buggify.check_node_acl_on_remove)
+            engine.coverage.hit("check_node_acl_on_remove_enabled");
+        if (engine.buggify.block_acl)
+            engine.coverage.hit("block_acl_enabled");
+        if (engine.buggify.enable_superdigest)
+            engine.coverage.hit("superdigest_enabled");
         if (engine.buggify.latest_logs_cache_entry_count_threshold > 0)
             engine.coverage.hit("bounded_log_cache_active");
         if (engine.buggify.latest_logs_cache_size_threshold > 0)
@@ -481,6 +494,8 @@ public:
 
         node.context->setManualLSMTBackgroundWork(true);
         node.context->setDigestEnabled(true);
+        if (engine.buggify.block_acl)
+            node.context->setBlockACL(true);
         if (engine.buggify.local_disk_cache && node.local_snapshot_disk)
         {
             node.context->setSnapshotDisk(node.local_snapshot_disk);
@@ -589,7 +604,8 @@ public:
 
                 const uint64_t digest = n.machine->getStorageUnsafe().getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
                 keeper_oracle.onKeeperCommit(id, log_idx, sub_idx, /*is_last_in_batch=*/false, req, resp_ptr, digest);
-            });
+            },
+            engine.buggify.enable_superdigest ? DB::KeeperStorage::generateDigest("super:simsuperpass") : "");
 
         node.machine->init();
         const uint64_t snapshot_idx = node.machine->last_commit_index();
@@ -843,7 +859,7 @@ public:
     {
         DB::KeeperRequestForSession entry;
         entry.session_id = session_id;
-        entry.time = simTimeMs();
+        entry.time = simWallTimeMs();
         if (engine.buggify.quorum_reads && request)
         {
             if (request->xid >= (1LL << 32) || engine.rng.chance(0.50))
@@ -910,7 +926,7 @@ public:
             return false;
         DB::KeeperRequestForSession entry;
         entry.session_id = session_id;
-        entry.time = simTimeMs();
+        entry.time = simWallTimeMs();
         entry.request = std::move(request);
         DB::KeeperRequestBatch batch;
         batch.dispatcher_server_id = -1;
@@ -1161,7 +1177,7 @@ public:
         auto req_copy = request;
         DB::KeeperRequestForSession req;
         req.session_id = session_id;
-        req.time = simTimeMs();
+        req.time = simWallTimeMs();
         req.request = std::move(request);
         node.machine->processReadRequests({req});
         if (!node.last_commit_response)
@@ -1276,6 +1292,7 @@ public:
             return false;
 
         engine.coverage.hit(as_learner ? "dynamic_add_srv_learner" : "dynamic_add_srv_voter");
+        engine.coverage.hit("dynamic_membership_changed");
         engine.trace("DYNAMIC_ADD_SRV leader=" + std::to_string(leader_id)
             + " dyn=" + std::to_string(dyn_id) + " learner=" + std::to_string(as_learner ? 1 : 0));
         if (engine.buggify.reconfig_overlap)
@@ -1443,13 +1460,41 @@ public:
 
     const std::vector<int64_t> & getRecentlyClosedSessions() const { return recently_closed_sessions; }
 
-    /// Verify every online node's tree and digest against the independent Keeper semantic oracle.
+    /// Verify every online node's tree and digest against the independent Keeper semantic oracle,
+    /// plus consistency of live 4LW / monitoring readouts (`getStorageStats`, watches, ephemerals, snapshots).
     void verifyAllOnlineNodes()
     {
         for (auto & [id, node] : nodes)
         {
             if (node.online && node.machine)
+            {
                 keeper_oracle.verifyNodeTree(id, *node.machine);
+                const auto st = node.machine->getStorageStats();
+                require(st.nodes_count >= 1, "4LW_INVARIANT: nodes_count < 1 on node " + std::to_string(id));
+                require(st.watched_paths_count <= st.total_watches_count,
+                    "4LW_INVARIANT: watched_paths_count > total_watches_count on node " + std::to_string(id)
+                    + " total=" + std::to_string(st.total_watches_count)
+                    + " paths=" + std::to_string(st.watched_paths_count));
+                /// Strict watch-session invariant (known unfixed Keeper bug #83: WatchEvents::collectAndRemove /
+                /// collectAndRemoveIf leave empty entries in sessions_and_watchers when one-shot watches fire,
+                /// causing sessions_with_watches_count > total_watches_count until session close).
+                if (engine.buggify.watch_oracle)
+                {
+                    require(st.sessions_with_watches_count <= st.total_watches_count,
+                        "4LW_INVARIANT: watch count inconsistency on node " + std::to_string(id)
+                        + " total=" + std::to_string(st.total_watches_count)
+                        + " sessions=" + std::to_string(st.sessions_with_watches_count)
+                        + " paths=" + std::to_string(st.watched_paths_count));
+                }
+                DB::WriteBufferFromOwnString w_buf;
+                node.machine->dumpWatches(w_buf);
+                DB::WriteBufferFromOwnString wp_buf;
+                node.machine->dumpWatchesByPath(wp_buf);
+                DB::WriteBufferFromOwnString e_buf;
+                node.machine->dumpSessionsAndEphemerals(e_buf);
+                (void)node.machine->getSnapshotsStatus();
+                engine.coverage.hit("four_lw_metrics_verified");
+            }
         }
     }
 
@@ -1562,7 +1607,10 @@ private:
             engine.coverage.hit("backpressure_params_active");
         }
         if (cfg.unsafe_quorum_control)
+        {
             raft_params_cfg.custom_commit_quorum_size_ = 1;
+            raft_params_cfg.custom_election_quorum_size_ = 1;
+        }
     }
 
     /// Replicates production `KeeperServer::callbackFunc` behavior for `PreAppendLogLeader`,
@@ -1926,7 +1974,8 @@ private:
                             }
                         }
 
-                        /// Also run real TTL & Container GC sweeps on virtual time!
+                        /// Also run real TTL & Container GC sweeps on virtual wall time using the
+                        /// exact production internal GC session IDs and `try_remove = true`!
                         const auto expired_ttls = leader.machine->getExpiredTTLPathsForGarbageCollector(8);
                         for (const auto & [path, ver] : expired_ttls)
                         {
@@ -1934,7 +1983,8 @@ private:
                             rm->xid = 700000 + (++gc_xid_counter);
                             rm->path = path;
                             rm->version = ver;
-                            if (auto res = submitRequest(leader_id, rm, -1); res && res->get_accepted())
+                            rm->try_remove = true;
+                            if (auto res = submitRequest(leader_id, rm, DB::keeper_internal_ttl_garbage_collector_session_id); res && res->get_accepted())
                                 engine.coverage.hit("ttl_gc_submitted");
                         }
                         const auto containers = leader.machine->getContainerCandidatesForGarbageCollector(
@@ -1945,7 +1995,8 @@ private:
                             rm->xid = 700000 + (++gc_xid_counter);
                             rm->path = path;
                             rm->version = ver;
-                            if (auto res = submitRequest(leader_id, rm, -1); res && res->get_accepted())
+                            rm->try_remove = true;
+                            if (auto res = submitRequest(leader_id, rm, DB::keeper_internal_container_garbage_collector_session_id); res && res->get_accepted())
                                 engine.coverage.hit("container_gc_submitted");
                         }
                     }

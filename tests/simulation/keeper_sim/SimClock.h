@@ -34,6 +34,14 @@ inline int64_t simTimeMs()
     return g_sim_time_ns / 1'000'000LL;
 }
 
+/// Virtual wall-clock milliseconds matching `CLOCK_REALTIME` in `wrappedClockGettime`.
+/// Using this for `KeeperRequestForSession::time` keeps TTL and Container GC clocks
+/// (which read `std::chrono::system_clock::now()`) on the exact same virtual epoch.
+inline int64_t simWallTimeMs()
+{
+    return 1700000000000LL + simTimeMs();
+}
+
 inline void require(bool condition, const std::string & message)
 {
     if (!condition)
@@ -188,6 +196,9 @@ struct BuggifyConfig
     bool same_path_multi_churn = false;
     bool snapshot_versions_mix = false;
     bool autofwd_missing_leader = false;
+    bool check_node_acl_on_remove = false;
+    bool block_acl = false;
+    bool enable_superdigest = false;
     uint64_t log_max_size = 0;
     uint64_t log_overallocate_size = 0;
     uint64_t latest_logs_cache_size_threshold = 0;
@@ -249,7 +260,10 @@ struct BuggifyConfig
         bool enable_huge_lsmt_values = false,
         bool enable_same_path_multi_churn = false,
         bool enable_snapshot_versions_mix = false,
-        bool enable_autofwd_missing_leader = false)
+        bool enable_autofwd_missing_leader = false,
+        bool enable_check_node_acl_on_remove = false,
+        bool enable_block_acl = false,
+        bool enable_superdigest_ = false)
     {
         enabled = enable_buggify;
         switches.clear();
@@ -401,6 +415,9 @@ struct BuggifyConfig
         same_path_multi_churn = enable_same_path_multi_churn;
         snapshot_versions_mix = enable_snapshot_versions_mix;
         autofwd_missing_leader = enable_autofwd_missing_leader;
+        check_node_acl_on_remove = enable_check_node_acl_on_remove;
+        block_acl = enable_block_acl;
+        enable_superdigest = enable_superdigest_;
         if (enable_autofwd_missing_leader)
         {
             auto_forward = true;

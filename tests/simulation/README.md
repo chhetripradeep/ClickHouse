@@ -1,29 +1,10 @@
 # FoundationDB-Inspired Deterministic Simulation Framework for ClickHouse Keeper
 
-`tests/simulation/keeper_sim/` implements a single-threaded C++20 deterministic simulation testing (DST) framework for real ClickHouse Keeper (`KeeperStateMachine`, `KeeperStorage` Mem & LSMT, `KeeperLogStore`, `Changelog`, `KeeperStateManager`, `KeeperSnapshotManager`, `SessionExpiryQueue`) + pinned `NuRaft`, modeled on FoundationDB's `Sim2`, `AsyncFileNonDurable`, `BUGGIFY`, `SwizzleClogger`, `SOMETIMES`, and Joshua swarm testing.
+`tests/simulation/keeper_sim/` implements a single-threaded C++20 deterministic simulation testing (DST) framework for real ClickHouse Keeper (`KeeperStateMachine`, `KeeperStorage` Mem & LSMT, `KeeperLogStore`, `Changelog`, `KeeperStateManager`, `KeeperSnapshotManager`, `SessionExpiryQueue`, `KeeperReconfiguration`, `KeeperFeatureFlags`, `FourLetterCommand`) + pinned `NuRaft`, modeled on FoundationDB's `Sim2`, `AsyncFileNonDurable`, `BUGGIFY`, `SwizzleClogger`, `SOMETIMES`, and Joshua swarm testing.
 
-## Architecture
+## Quick Start: PR CI Suite (~20-45s wall-clock)
 
-- `keeper_sim/SimClock.h`: Nanosecond virtual clock, optional per-node clock skew, deterministic `SimRandom` + `thread_local_rng` seeding, linker wrappers (`__wrap_pthread_create`, `__wrap_clock_gettime`) guaranteeing zero uncontrolled OS threads and zero host-clock leaks, per-seed `BuggifyConfig` (including `batched_log_entries`, `tiny_log_rotation`, `frequent_snapshots`, `small_append_batch`, `slow_disk_flush`, `slow_commits`, `network_reordering`, `aggressive_clogging`, `asymmetric_partitions`, `clock_skew`, `torn_writes_on_power_loss`, `transient_disk_io_errors`, `delayed_snapshot_publish`, `lsmt_tiny_memtables`), and `CoverageTracker` (`SOMETIMES` counters).
-- `keeper_sim/SimEngine.h`: `Sim2`-style discrete-event virtual-time min-heap scheduler ordered by `(due_ns, seq)`, per-node incarnation filtering and event purging, diagnostic `--host-delay` perturbation, streaming FNV-1a trace hashing, and isolated single-node `SimNodeSystemExit` recovery handling.
-- `keeper_sim/SimCrashDisk.h`: `AsyncFileNonDurable`-inspired crash-consistent simulated disk (`SimCrashDisk` subclassing `DB::DiskLocal`) modeling volatile page cache (`live_dir`) vs. durable synced storage (`durable_dir`). Sudden power loss (`simulatePowerLoss`) reverts unsynced files, injects torn partial writes, or corrupts unsynced tails while preserving all `sync`-completed files. Also supports `simulateGracefulStop`, `simulateDiskWipe` (forcing real network Raft snapshot installation), and transient I/O faults (open, partial write, sync error, remove error).
-- `keeper_sim/SimNetwork.h`: `Sim2` simulated network, `SimTimers` (`nuraft::delayed_task_scheduler` wired onto `SimEngine`), and `nuraft::global_mgr` driving NuRaft `appendStep` and `commitStep` single-threaded. Supports 3-node and 5-node topologies, symmetric/asymmetric partitions, `SwizzleClogger` link delays, jitter/reordering, packet drops, reply-only drops after execution, deferred NuRaft async durability callbacks, and multi-chunk `install_snapshot_request` RPCs.
-- `keeper_sim/SimOracle.h`: Always-on inline `RaftSafetyOracle` (election safety, persisted term monotonicity, one vote per term across crashes, log matching, state-machine safety, rollback safety, and exact current-term quorum certification for Figure 8 detection) + independent `KeeperSemanticOracle` (reference ZooKeeper tree, response & `Multi` sub-response verification, cross-replica committed `KeeperDigest` equality, deep tree checks at any replica's `last_commit_index`, sequential node numbering, ephemeral cleanup on session expiry, watch delivery, and client-ack linearizability).
-- `keeper_sim/SimCluster.h`: Manages an N-node (3 or 5) real Keeper cluster in one process with `SimKeeperStateManager` (isolated single-node `system_exit`), `SimKeeperStateMachine` (rollback & `apply_snapshot` verification), `SimNuRaftLogger`, production `PreAppendLogLeader` / `PreAppendLogFollower` / `AppendLogFailed` callbacks (real `zxid` + digest verification), manual `Changelog` scheduling (`Write`, `Completion`, `FileOperation`), manual `CreateSnapshotTask` scheduling, and manual LSMT `BackgroundWork` scheduling (`Flush`, `Merge`, `FileDelete`) via `KeeperContext::setManualLSMTBackgroundWork`.
-- `keeper_sim/SimWorkloads.h`: Multi-session concurrent `ZooKeeperWorkload` (`Create` persistent/ephemeral/sequential, versioned `Set`/`Remove`/`Check`, atomic `Multi` with commit & rollback patterns, local `Get`/`List`/`Exists` with real watches, deliberate virtual-time session expiry, and a monotonic `/sim/lin_reg` linearizability register) + continuous `ChaosActor` (`SwizzleClogger`, symmetric/asymmetric partitions, graceful/power-loss/disk-wipe crashes, transient snapshot disk faults, and `figure8-hunt` mode).
-- `keeper_sim/SimSwarm.h` & `keeper_sim/main.cpp`: Single-seed CLI (`keeper_sim`) plus a pure C++ POSIX multi-process parallel swarm runner (`--swarm`) with instrumentation control, negative unsafe-quorum control, cross-run `--host-delay` determinism verification, and aggregated `SOMETIMES` coverage reporting.
-
-## Runtime Seams (`src/Coordination/`)
-
-Production defaults are unchanged; every simulation seam is opt-in:
-
-- `SessionExpiryQueue`: optional instance-local millisecond `Clock` callback propagated through `KeeperContext` and `KeeperStorage` across storage and snapshot recreation.
-- `Changelog` / `KeeperLogStore` / `KeeperStateManager`: `Changelog::ExecutionMode::Manual` starts no changelog threads and exposes single-step `hasPendingTask` / `runTask` (`Write`, `Completion`, `FileOperation`) plus `discardUnexecutedWritesForTesting` and custom `KeeperLogStore` injection.
-- LSMT `BackgroundWork` / `StorageState`: `KeeperContext::setManualLSMTBackgroundWork` starts no flush/merge threads, skips sleep-based `throttleWrite`, and exposes single-step `hasPendingFlush` / `runFlushStep`, `hasPendingMerge` / `runMergeStep`, and `hasPendingFileDeletes` / `runFileDeleteStep` sharing the exact production flush/merge code paths.
-
-## Build & Run
-
-Configure with `-DENABLE_KEEPER_SIMULATION=1` (and `-DENABLE_TESTS=1 -DENABLE_NURAFT=1`) and build `keeper_sim`:
+Build `keeper_sim` once:
 
 ```shell
 cmake -S . -B build_keeper_sim -G Ninja \
@@ -34,33 +15,68 @@ cmake -S . -B build_keeper_sim -G Ninja \
     -DENABLE_CLICKHOUSE_SELF_EXTRACTING=0 \
     -DENABLE_KEEPER_SIMULATION=1 \
     > build_keeper_sim/configure.log 2>&1
-cmake --build build_keeper_sim --target keeper_sim \
-    > build_keeper_sim/build_keeper_sim.log 2>&1
+ninja -C build_keeper_sim keeper_sim > build_keeper_sim/build_keeper_sim.log 2>&1
 ```
 
-Run the pure C++ multi-core swarm campaign (covers 3-node & 5-node Mem, PowerLoss, SnapshotStorm, Chaos, LSMT-Mem, LSMT-Disk, controls, `--host-delay` determinism verification, and `SOMETIMES` coverage):
+Run the full PR-CI suite in one command (auto-detects CPU cores, runs controls, full Keeper functional feature tests, 14 parallel distributed chaos/storage/consensus scenarios, `--host-delay` determinism replay, mandatory `SOMETIMES` feature-coverage gate, and writes `junit.xml`):
+
+```shell
+./build_keeper_sim/src/keeper_sim --ci --output build_keeper_sim/ci_out
+```
+
+Or run via the Praktika CI job script (`ci/jobs/keeper_simulation_job.py`):
+
+```shell
+python3 ./ci/jobs/keeper_simulation_job.py --binary ./build_keeper_sim/src/keeper_sim
+```
+
+Options for CI customization:
+- `--workers N`: explicit parallelism (`0` = auto-detect `std::thread::hardware_concurrency()`, clamped to `[2, 16]`).
+- `--seed-offset N`: deterministically shift all CI seeds (e.g., per PR commit SHA or nightly date) while keeping every failure 100% reproducible.
+- `--junit-xml <path>`: write standard JUnit XML report for CI reporting.
+
+## Complete Keeper Functionality Coverage
+
+Every `--ci` run verifies ALL of the following Keeper subsystems end-to-end:
+
+1. **Deterministic Foundation Controls**:
+   - `--instrumentation-control`: verifies `__wrap_clock_gettime` virtual clock interception and `__wrap_pthread_create` zero-thread isolation.
+   - `--unsafe-quorum-control`: negative safety control proving `RaftSafetyOracle` immediately catches split-brain commits when `custom_commit_quorum_size_ = 1`.
+   - `--host-delay` determinism replay: proves bit-identical `trace_hash`, `executed_events`, `final_commit_index`, and `final_digest` across runs with injected host timing jitter.
+2. **Functional Subsystem Self-Tests (`--feature-tests`, ~1s)**:
+   - Binary wire-format serialize/deserialize round-trip across all 34 `Coordination::OpNum` types with both 32-bit and 64-bit XIDs and `OpenTelemetry::TracingContext`.
+   - `KeeperFeatureFlags` (`fromApiVersion`, `enableFeatureFlag`, `disableFeatureFlag`) and `KeeperContext::isOperationSupported`.
+   - Full ACL policy matrix on both `Mem` and `LSMT-Mem`: `check_node_acl_on_remove = true`, `superdigest` bypass, `cleanup_old_and_ignore_new_acl` (`block_acl`), `auth` fixup, and `/keeper` system-node read/write-protection invariants.
+   - Exact virtual-time TTL GC (`mtime` refresh on `Set`, ACL bypass for internal GC session `-2`) and Container GC (non-empty preservation, emptied-container GC via session `-3`).
+   - Orphaned-node startup recovery (`remove_orphaned_nodes_on_startup`, `findOrphanConflictInLogTail` rejecting conflicting log tails and persisting repaired snapshots on clean tails).
+   - `RaftServerConfig` parsing, `joiningToClusterUpdates`, `leavingToClusterUpdates`, and `serializeClusterConfig`.
+   - 4LW command codes (`IFourLetterCommand::toCode`/`toName`), `KeeperConnectionStats`, and `KeeperStateMachine::getStorageStatsAndAsynchronousMetrics`.
+   - Multi-file `KeeperLogStore` / `Changelog` parallel startup read (`startup_read_max_streams = 4`), bounded `latest_logs_cache`, per-peer decoded read-ahead (`log_readahead_enabled = true`), and commit decoded read-ahead (`log_readahead_commit_window_bytes > 0`) across file boundaries and backward rewinds.
+3. **14 Parallel Distributed Cluster Scenarios (3-node & 5-node, ~15-35s total)**:
+   - **All Storage Engines**: `Mem`, `LSMT-Mem`, `LSMT-Disk` (with tiny memtables, block cache eviction, sorted-run merges, and data-disk I/O faults), and **5-node Mixed heterogeneous clusters** (Mem + LSMT-Mem + LSMT-Disk in one Raft quorum as a continuous differential oracle!).
+   - **All ZooKeeper & Keeper Ops**: `Create`, `Create2`, `CreateIfNotExists`, `CreateContainer`, `CreateTTL`, `Set`, `Remove`, `TryRemove`, `RemoveRecursive`, `Check`, `CheckNotExists`, `CheckStat`, `Multi` (commit & rollback), `MultiRead`, `Get`, `Exists`, `List`, `SimpleList`, `FilteredList`, `FilteredListWithStatsAndData`, `ListRecursive`, `ListWithOptions`, `Auth`, `GetACL`, `SetACL`, `Sync`, `Heartbeat`, `SessionID`, explicit `Close`, session expiry, `AddWatch`/`CheckWatch`/`RemoveWatch`/`SetWatch`/`SetWatch2`, `/keeper` system nodes, and live 4LW metrics (`getStorageStats`, `dumpWatches*`, `dumpSessionsAndEphemerals`).
+   - **All Fault & Consensus Profiles**: `balanced`, `chaos`, `power-loss` (unsynced dirty-file revert + torn writes), `partition-storm` (asymmetric partitions + `SwizzleClogger`), `snapshot-storm` (Zstd/LZ4, chunked transfer, wipe-and-rejoin), `quorum_reads` + `use_xid_64` + tracing, `remote_snapshots` + `encrypted_logs` + dual-disk migration, `dynamic_membership` (`add_srv`/`remove_srv`/`use_new_joiner_type`), `backpressure` (`bpon`/`bpoff`) + `full_consensus` + `leadership_expiry`, `lazy_startup` + `mixed_versions` (V0/V1 batches, V8/V9 snapshots) + `snapshot_on_exit`.
+   - **Mandatory `SOMETIMES` Coverage Gate**: fails CI if any required Keeper feature counter drops to `0`.
+
+## Architecture
+
+- `keeper_sim/SimClock.h`: Nanosecond virtual clock (`simTimeMs` / `simWallTimeMs`), per-node clock skew, deterministic `SimRandom` + `thread_local_rng` seeding, linker wrappers (`__wrap_pthread_create`, `__wrap_clock_gettime`), per-seed `BuggifyConfig`, and `CoverageTracker`.
+- `keeper_sim/SimEngine.h`: `Sim2`-style discrete-event virtual-time min-heap scheduler ordered by `(due_ns, seq)`, per-node incarnation filtering, `--host-delay` perturbation, FNV-1a trace hashing, and isolated `SimNodeSystemExit` recovery handling.
+- `keeper_sim/SimCrashDisk.h`: `AsyncFileNonDurable`-inspired crash-consistent simulated disk (`SimCrashDisk` subclassing `DB::DiskLocal`) modeling volatile page cache vs. durable synced storage, torn writes, disk wipes, and transient I/O faults.
+- `keeper_sim/SimNetwork.h`: `Sim2` simulated network, `SimTimers`, and `nuraft::global_mgr` driving NuRaft `appendStep` and `commitStep` single-threaded.
+- `keeper_sim/SimOracle.h`: Always-on inline `RaftSafetyOracle` + independent `KeeperSemanticOracle` verifying responses, `Multi` subresponses, cross-replica committed `KeeperDigest`, deep trees, ACL policies (`check_node_acl_on_remove`, `superdigest`, `block_acl`), ephemerals, watches, TTL/Container GC, and linearizability.
+- `keeper_sim/SimCluster.h`: Manages an N-node (3 or 5) real Keeper cluster with manual `Changelog`, `CreateSnapshotTask`, and LSMT `BackgroundWork` scheduling, plus live 4LW metrics verification.
+- `keeper_sim/SimWorkloads.h`: Multi-session concurrent `ZooKeeperWorkload` + continuous `ChaosActor`.
+- `keeper_sim/SimFeatureTests.h`: Fast deterministic functional verifier covering wire protocol, feature flags, ACL/system-node policies, TTL/Container GC, orphan recovery, reconfiguration parsing, 4LW stats, and parallel startup + changelog read-ahead.
+- `keeper_sim/SimSwarm.h` & `keeper_sim/main.cpp`: Single-seed CLI plus pure C++ POSIX multi-process parallel swarm runner (`--ci` / `--swarm --suite <ci|quick|full|hunt..hunt17>`).
+
+## Single-Seed Debugging
+
+Reproduce any failing seed deterministically (with optional `--keeper-log-level warning --nuraft-log-level 3 --trace-file tmp/trace.log`):
 
 ```shell
 ./build_keeper_sim/src/keeper_sim \
-    --swarm --suite full --workers 6 \
-    --output build_keeper_sim/fdb_swarm_out \
-    > build_keeper_sim/test_fdb_swarm.log 2>&1
+    --seed 106 --nodes 3 --profile chaos --lsmt-disk --deep-lsmt-stress \
+    --no-streaming --no-bounded-cache \
+    --duration-ms 13000 --state-dir tmp/repro_s106 --json-summary
 ```
-
-Run a single reproducible seed (supports `--nodes 3|5`, `--profile balanced|chaos|power-loss|partition-storm|snapshot-storm|figure8-hunt`, `--lsmt`, `--lsmt-disk`, `--strict-raft-commit`, `--keeper-log-level warning`, `--nuraft-log-level 3`, `--trace-file <path>`, `--host-delay`, `--json-summary`):
-
-```shell
-./build_keeper_sim/src/keeper_sim \
-    --seed 61 --nodes 3 --profile chaos --lsmt-disk \
-    --duration-ms 15000 --state-dir build_keeper_sim/fdb_s61 --json-summary
-```
-
-## Production Bugs Discovered Organically
-
-1. **ClickHouse Keeper fatal digest mismatch & crash loop on `apply_snapshot` with stale uncommitted log tail** (`src/Coordination/KeeperStateMachine.cpp`, `src/Coordination/Changelog.cpp`):
-   - Repro: `./build_keeper_sim/src/keeper_sim --seed 11 --nodes 3 --profile chaos --duration-ms 15000 --state-dir tmp/repro_bug1 --keeper-log-level warning`
-   - When a node with a diverged uncommitted tail `[S+1..M]` from an old term receives `InstallSnapshot(S)` from a new leader, `Changelog::compact` retains entries `> S` (since `S <= max_log_id`), and `KeeperStateMachine::apply_snapshot` runs `preprocessUncommittedLogEntries` over `[S+1..M]` on top of the new leader's snapshot tree, hitting `assertDigest` -> `std::terminate`.
-
-2. **NuRaft permanent `InstallSnapshot` livelock in streaming mode (`max_log_gap_in_stream_ > 0`)** (`contrib/NuRaft/src/handle_snapshot_sync.cxx`, `contrib/NuRaft/src/handle_append_entries.cxx`):
-   - Repro: `./build_keeper_sim/src/keeper_sim --seed 42 --nodes 5 --profile partition-storm --duration-ms 15000 --state-dir tmp/repro_bug2 --nuraft-log-level 3`
-   - When a follower declines an outdated snapshot (`handle_install_snapshot_resp`), NuRaft updates `p->set_next_log_idx` and clears `snapshot_sync_ctx`, but never calls `p->reset_stream`. The stale `last_streamed_log_idx` remains below `log_store_->start_index()`, causing `request_append_entries` to bypass `p->make_busy` and pass the stale streamed index into `create_append_entries_req`, permanently looping on `InstallSnapshotRequest` / `declined snapshot` even after all faults heal.

@@ -169,6 +169,9 @@ public:
     /// Optional callback invoked whenever an RPC response is delivered to the caller (for Raft safety oracle).
     std::function<void(const RpcObservation &)> on_rpc_response;
 
+    /// Optional repro hook to intercept/duplicate a scheduled response delivery before invoking callback.
+    std::function<void(int src, int dst, nuraft::ptr<nuraft::resp_msg> &, nuraft::rpc_handler &)> on_deliver_response_hook;
+
     void registerServer(int node_id, nuraft::ptr<SimRaftServer> server, uint64_t incarnation)
     {
         servers[node_id] = std::move(server);
@@ -397,6 +400,11 @@ public:
                                     end_idx,
                                     response->get_next_idx(),
                                 });
+                            }
+                            if (on_deliver_response_hook)
+                            {
+                                on_deliver_response_hook(src, dst, response, callback);
+                                return;
                             }
                             nuraft::ptr<nuraft::rpc_exception> no_err;
                             callback(response, no_err);

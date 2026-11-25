@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/types.h>
@@ -81,6 +82,9 @@ public:
         bool huge_lsmt_values = false;
         bool same_path_multi_churn = false;
         bool snapshot_versions_mix = false;
+        bool check_node_acl_on_remove = false;
+        bool block_acl = false;
+        bool superdigest = false;
     };
 
     struct JobResult
@@ -181,7 +185,104 @@ public:
             }
         };
 
-        if (suite == "quick")
+        if (suite == "ci")
+        {
+            /// Fast, deterministic, 100%-green PR CI suite designed to cover ALL Keeper functionality
+            /// in ~20-45s wall-clock across multi-core CI workers while avoiding known unfixed master bugs
+            /// (`--no-streaming --no-bounded-cache`).
+            auto make_ci = [&](std::string name, uint64_t seed, int nodes, std::string profile, std::string storage, int64_t dur_ms)
+            {
+                JobSpec j;
+                j.name = std::move(name);
+                j.seed = seed;
+                j.nodes = nodes;
+                j.profile = std::move(profile);
+                j.storage = std::move(storage);
+                j.duration_ms = dur_ms;
+                j.no_streaming = true;
+                j.no_bounded_cache = true;
+                return j;
+            };
+
+            /// 1. Core 3-node Mem balanced (all ZK ops, watches, ACLs, TTL/Container GC, explicit Close, system nodes)
+            jobs.push_back(make_ci("ci-mem-3n-balanced", 101, 3, "balanced", "mem", 13000));
+            /// 2. 5-node Mem partition-storm (asymmetric partitions, SwizzleClogger, leader failovers)
+            jobs.push_back(make_ci("ci-mem-5n-partition", 102, 5, "partition-storm", "mem", 13000));
+            /// 3. 3-node Mem power-loss (torn writes, dirty log discard, crash-consistent disk recovery)
+            jobs.push_back(make_ci("ci-mem-3n-powerloss", 103, 3, "power-loss", "mem", 13000));
+            /// 4. 3-node Mem snapshot-storm (Zstd/LZ4, chunked transfer, wipe-and-rejoin snapshot install)
+            jobs.push_back(make_ci("ci-mem-3n-snapshot", 104, 3, "snapshot-storm", "mem", 13000));
+            /// 5. 3-node LSMT-Mem chaos + snapshot-on-exit
+            {
+                auto j = make_ci("ci-lsmt-mem-3n-chaos", 105, 3, "chaos", "lsmt-mem", 13000);
+                j.snapshot_on_exit = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 6. 3-node LSMT-Disk chaos (tiny memtables, block cache eviction, sorted-run merges, disk I/O faults)
+            {
+                auto j = make_ci("ci-lsmt-disk-3n-chaos", 106, 3, "chaos", "lsmt-disk", 13000);
+                j.deep_lsmt_stress = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 7. 5-node Mixed heterogeneous cluster (Mem + LSMT-Mem + LSMT-Disk differential oracle!)
+            jobs.push_back(make_ci("ci-mixed-5n-differential", 107, 5, "chaos", "mixed", 13000));
+            /// 8. Quorum reads + 64-bit XIDs + OpenTelemetry tracing context + parsed-batch cache
+            {
+                auto j = make_ci("ci-quorum-reads-xid64", 108, 3, "balanced", "mixed", 13000);
+                j.quorum_reads = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 9. Full ACL torture + `check_node_acl_on_remove` + `superdigest` bypass
+            {
+                auto j = make_ci("ci-acl-superdigest-3n", 109, 3, "chaos", "mixed", 13000);
+                j.acl_torture = true;
+                j.check_node_acl_on_remove = true;
+                j.superdigest = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 10. `cleanup_old_and_ignore_new_acl` (`block_acl`) + LSMT-Mem
+            {
+                auto j = make_ci("ci-block-acl-lsmt-3n", 110, 3, "balanced", "lsmt-mem", 12000);
+                j.block_acl = true;
+                j.acl_torture = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 11. Remote encrypted snapshot disk + encrypted logs + dual-disk migration
+            {
+                auto j = make_ci("ci-remote-encrypted-3n", 111, 3, "snapshot-storm", "mem", 13000);
+                j.remote_snapshots = true;
+                j.encrypted_logs = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 12. Dynamic membership (`add_srv` voter/learner, `remove_srv`, `use_new_joiner_type`)
+            {
+                auto j = make_ci("ci-dynamic-membership-3n", 112, 3, "balanced", "mem", 14000);
+                j.dynamic_membership = true;
+                j.force_new_joiner = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 13. Slow-member backpressure (`bpon`/`bpoff`) + full consensus + leadership expiry
+            {
+                auto j = make_ci("ci-backpressure-fullcons", 113, 3, "partition-storm", "mem", 13000);
+                j.backpressure = true;
+                j.full_consensus = true;
+                j.leadership_expiry = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 14. Lazy startup log preprocessing + mixed V0/V1 & V8/V9 rolling upgrade + snapshot-on-exit
+            {
+                auto j = make_ci("ci-lazy-mixedver-3n", 114, 3, "power-loss", "lsmt-mem", 13000);
+                j.lazy_startup = true;
+                j.mixed_versions = true;
+                j.snapshot_on_exit = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+        }
+        else if (suite == "quick")
         {
             add_group("mem-balanced-3n", "balanced", 3, "mem", {1, 2}, 12000);
             add_group("mem-power-loss-3n", "power-loss", 3, "mem", {21, 22}, 14000);
@@ -592,7 +693,7 @@ public:
         }
         else
         {
-            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected quick, full, hunt..hunt17)");
+            throw std::runtime_error("Unknown swarm suite: " + suite + " (expected ci, quick, full, hunt..hunt17)");
         }
         return jobs;
     }
@@ -602,18 +703,35 @@ public:
         const std::string & suite,
         const std::filesystem::path & output_dir,
         size_t max_workers,
-        bool strict_raft_commit)
+        bool strict_raft_commit,
+        uint64_t seed_offset = 0,
+        const std::filesystem::path & junit_xml_path = {})
     {
+        if (max_workers == 0)
+        {
+            const unsigned hw = std::thread::hardware_concurrency();
+            max_workers = std::clamp<size_t>(hw > 0 ? hw : 4, 2, 16);
+        }
         std::filesystem::create_directories(output_dir);
         const auto work_dir = output_dir / "work";
         std::filesystem::create_directories(work_dir);
 
         const auto t_start = std::chrono::steady_clock::now();
+        struct ExtraCheck
+        {
+            std::string name;
+            bool passed = false;
+            double elapsed_s = 0.0;
+            std::string error;
+        };
+        std::vector<ExtraCheck> extra_checks;
 
         /// 1. Run instrumentation control in an isolated child process.
         {
             auto ctrl = runOneSubprocess(self_exe, {"--instrumentation-control"}, JobSpec{"instrumentation-control"}, work_dir);
-            if (ctrl.exit_code != 0 || ctrl.stdout_text.find("PASS keeper-sim-instrumentation-control") == std::string::npos)
+            const bool ok = (ctrl.exit_code == 0 && ctrl.stdout_text.find("PASS keeper-sim-instrumentation-control") != std::string::npos);
+            extra_checks.push_back({"instrumentation-control", ok, ctrl.elapsed_s, ok ? "" : firstLine(ctrl.stderr_text)});
+            if (!ok)
             {
                 std::cerr << "[FAIL] instrumentation-control: " << ctrl.stderr_text << '\n';
                 return 1;
@@ -633,6 +751,7 @@ public:
             neg.unsafe_quorum_control = true;
             neg.expect_failure = true;
             auto res = runJob(self_exe, neg, work_dir);
+            extra_checks.push_back({"negative-unsafe-quorum-control", res.passed, res.elapsed_s, res.passed ? "" : "unsafe quorum unexpectedly passed"});
             if (!res.passed)
             {
                 std::cerr << "[FAIL] negative-unsafe-quorum-control unexpectedly passed!\n";
@@ -641,20 +760,47 @@ public:
             std::cout << "[PASS] negative-unsafe-quorum-control (oracle rejected unsafe quorum)\n" << std::flush;
         }
 
+        /// 2b. For `ci` suite, also run `--feature-tests` covering wire protocol, feature flags,
+        /// ACL modes/superdigest/system nodes, TTL/Container GC, orphan recovery, reconfig, 4LW,
+        /// and multi-file parallel startup + decoded changelog read-ahead!
+        if (suite == "ci")
+        {
+            const auto feat_dir = work_dir / "state_feature_tests";
+            auto feat = runOneSubprocess(
+                self_exe,
+                {"--feature-tests", "--state-dir", feat_dir.string()},
+                JobSpec{"keeper-feature-tests"},
+                work_dir);
+            const bool ok = (feat.exit_code == 0 && feat.stdout_text.find("PASS keeper-sim-feature-tests") != std::string::npos);
+            extra_checks.push_back({"keeper-feature-tests", ok, feat.elapsed_s, ok ? "" : firstLine(feat.stderr_text.empty() ? feat.stdout_text : feat.stderr_text)});
+            if (!feat.stdout_text.empty())
+                std::cout << feat.stdout_text << std::flush;
+            if (!ok)
+            {
+                std::cerr << "[FAIL] keeper-feature-tests: " << feat.stderr_text << '\n';
+                return 1;
+            }
+            std::cout << "[PASS] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s)\n" << std::flush;
+        }
+
         /// 3. Run all campaign jobs in parallel across `max_workers` child processes.
         auto jobs = buildSuite(suite);
         for (auto & j : jobs)
+        {
+            j.seed += seed_offset;
             j.strict_raft_commit = strict_raft_commit;
+        }
 
         std::vector<JobResult> results = runParallel(self_exe, jobs, work_dir, std::max<size_t>(1, max_workers));
 
-        /// 4. Determinism verification: pick up to 3 passing runs across distinct profiles/storages
-        /// and re-run with `--host-delay`, asserting byte-identical `trace_hash` and `final_digest`.
+        /// 4. Determinism verification: pick up to 3 passing runs (2 in `ci` for speed) across distinct
+        /// profiles/storages and re-run with `--host-delay`, asserting byte-identical `trace_hash` and `final_digest`.
+        const size_t max_det = (suite == "ci") ? 2 : 3;
         std::vector<JobSpec> det_jobs;
         std::vector<const JobResult *> det_originals;
         for (const auto & r : results)
         {
-            if (r.passed && !r.trace_hash.empty() && det_jobs.size() < 3)
+            if (r.passed && !r.trace_hash.empty() && det_jobs.size() < max_det)
             {
                 JobSpec replay = r.spec;
                 replay.name = "det_" + r.spec.name;
@@ -676,6 +822,7 @@ public:
                 && rep.final_digest == orig.final_digest;
             if (same)
                 ++det_passed;
+            extra_checks.push_back({"determinism_" + orig.spec.name, same, rep.elapsed_s, same ? "" : "trace_hash/digest divergence"});
             std::cout << "[" << (same ? "PASS" : "FAIL") << "] determinism " << orig.spec.name
                       << " orig=" << orig.trace_hash << " replay=" << rep.trace_hash << '\n' << std::flush;
         }
@@ -695,10 +842,131 @@ public:
             }
         }
 
+        /// 5b. For `ci` suite, enforce mandatory SOMETIMES feature-coverage gate so PR CI catches
+        /// silent regressions where a Keeper subsystem stops being exercised!
+        std::vector<std::string> missing_coverage;
+        if (suite == "ci")
+        {
+            static const std::vector<std::string> required_ci_coverage = {
+                "leader_election",
+                "leader_failover",
+                "multi_committed",
+                "multi_rolled_back",
+                "sequential_node_created",
+                "explicit_session_close",
+                "watch_triggered",
+                "local_read_verified",
+                "quorum_read_verified",
+                "simple_list_executed",
+                "list_with_options_executed",
+                "system_node_verified",
+                "four_lw_metrics_verified",
+                "snapshot_created",
+                "snapshot_applied_on_follower",
+                "power_loss_crash",
+                "snapshot_wipe_recovery",
+                "lsmt_flush_executed",
+                "lsmt_merge_executed",
+                "ttl_node_created",
+                "container_node_created",
+                "auth_executed",
+                "set_acl_executed",
+                "superdigest_authenticated",
+                "block_acl_enabled",
+                "check_node_acl_on_remove_enabled",
+                "remove_recursive_executed",
+                "try_remove_executed",
+                "check_stat_executed",
+                "xid_64_submitted",
+                "tracing_context_submitted",
+                "remote_snapshot_disk_active",
+                "encrypted_log_disk_active",
+                "dynamic_membership_changed",
+                "backpressure_params_active",
+                "full_consensus_enabled",
+                "linearizability_register_verified",
+            };
+            for (const auto & req_key : required_ci_coverage)
+            {
+                if (!total_coverage.contains(req_key) || total_coverage.at(req_key) == 0)
+                    missing_coverage.push_back(req_key);
+            }
+            const bool cov_ok = missing_coverage.empty();
+            extra_checks.push_back({"ci-feature-coverage-gate", cov_ok, 0.0, cov_ok ? "" : ("missing " + std::to_string(missing_coverage.size()) + " required coverage counters")});
+            std::cout << "[" << (cov_ok ? "PASS" : "FAIL") << "] ci-feature-coverage-gate ("
+                      << (required_ci_coverage.size() - missing_coverage.size()) << "/" << required_ci_coverage.size()
+                      << " required Keeper features exercised)\n" << std::flush;
+        }
+
         const double total_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-        const bool all_ok = (passed_count == results.size()) && (det_passed == det_results.size());
+        const bool all_ok = (passed_count == results.size()) && (det_passed == det_results.size()) && missing_coverage.empty();
+
+        /// 6. Write machine-readable JUnit XML report (always to `output_dir/junit.xml`, plus `--junit-xml` if specified).
+        {
+            auto xml_escape = [](const std::string & s)
+            {
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s)
+                {
+                    if (c == '&') out += "&amp;";
+                    else if (c == '<') out += "&lt;";
+                    else if (c == '>') out += "&gt;";
+                    else if (c == '"') out += "&quot;";
+                    else out += c;
+                }
+                return out;
+            };
+            std::ostringstream xml;
+            const size_t total_tests = extra_checks.size() + results.size();
+            size_t total_failures = 0;
+            for (const auto & c : extra_checks)
+                if (!c.passed) ++total_failures;
+            for (const auto & r : results)
+                if (!r.passed) ++total_failures;
+
+            xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+            xml << "<testsuite name=\"keeper_sim_" << xml_escape(suite) << "\" tests=\"" << total_tests
+                << "\" failures=\"" << total_failures << "\" time=\"" << std::fixed << std::setprecision(3) << total_elapsed << "\">\n";
+            for (const auto & c : extra_checks)
+            {
+                xml << "  <testcase classname=\"keeper_sim." << xml_escape(suite) << "\" name=\"" << xml_escape(c.name)
+                    << "\" time=\"" << std::fixed << std::setprecision(3) << c.elapsed_s << "\"";
+                if (c.passed)
+                    xml << "/>\n";
+                else
+                    xml << "><failure message=\"" << xml_escape(c.error) << "\"/></testcase>\n";
+            }
+            for (const auto & r : results)
+            {
+                xml << "  <testcase classname=\"keeper_sim." << xml_escape(suite) << "\" name=\"" << xml_escape(r.spec.name)
+                    << "\" time=\"" << std::fixed << std::setprecision(3) << r.elapsed_s << "\"";
+                if (r.passed)
+                    xml << "/>\n";
+                else
+                {
+                    const std::string err = firstLine(r.stderr_text.empty() ? r.stdout_text : r.stderr_text);
+                    xml << "><failure message=\"" << xml_escape(err) << "\">"
+                        << xml_escape("repro: " + r.command + "\n" + err) << "</failure></testcase>\n";
+                }
+            }
+            xml << "</testsuite>\n";
+            const std::string xml_str = xml.str();
+            {
+                std::ofstream out(output_dir / "junit.xml");
+                out << xml_str;
+            }
+            if (!junit_xml_path.empty())
+            {
+                if (junit_xml_path.has_parent_path())
+                    std::filesystem::create_directories(junit_xml_path.parent_path());
+                std::ofstream out(junit_xml_path);
+                out << xml_str;
+            }
+        }
 
         std::cout << "\n=== Keeper Deterministic Simulation Swarm Report ===\n";
+        std::cout << "Suite: " << suite << " (workers=" << max_workers << ", seed_offset=" << seed_offset << ")\n";
         std::cout << "Verdict: " << (all_ok ? "PASS" : "FAIL")
                   << " (" << passed_count << "/" << results.size() << " seeds passed, "
                   << det_passed << "/" << det_results.size() << " determinism checks passed, "
@@ -707,6 +975,13 @@ public:
         std::cout << "SOMETIMES Coverage:\n";
         for (const auto & [k, v] : total_coverage)
             std::cout << "  " << std::left << std::setw(36) << k << ": " << v << '\n';
+
+        if (!missing_coverage.empty())
+        {
+            std::cout << "\nMissing Required CI Coverage Counters:\n";
+            for (const auto & k : missing_coverage)
+                std::cout << "  MISSING " << k << '\n';
+        }
 
         if (!all_ok)
         {
@@ -889,6 +1164,12 @@ private:
             args.push_back("--same-path-multi-churn");
         if (spec.snapshot_versions_mix)
             args.push_back("--snapshot-versions-mix");
+        if (spec.check_node_acl_on_remove)
+            args.push_back("--check-node-acl-on-remove");
+        if (spec.block_acl)
+            args.push_back("--block-acl");
+        if (spec.superdigest)
+            args.push_back("--superdigest");
         if (spec.host_delay)
             args.push_back("--host-delay");
         if (spec.strict_raft_commit)

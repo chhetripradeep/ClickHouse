@@ -1,13 +1,45 @@
 #include <SimClock.h>
 #include <SimCluster.h>
 #include <SimEngine.h>
+#include <SimFeatureTests.h>
 #include <SimSwarm.h>
 #include <SimWorkloads.h>
 
+#include <Common/DNSResolver.h>
+#include <Common/ZooKeeper/KeeperClientCLI/KeeperClient.h>
+#include <Common/ZooKeeper/TestKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperArgs.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperIO.h>
+#include <Common/ZooKeeper/ZooKeeperNodeCache.h>
+#include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
+#include <Compression/CompressedReadBuffer.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <Compression/CompressionFactory.h>
+#include <Coordination/FourLetterCommand.h>
+#include <Coordination/InMemoryLogStore.h>
+#include <Coordination/KeeperConnectionStats.h>
+#include <Coordination/KeeperLogStore.h>
+#include <Coordination/KeeperMemNodesStorage.h>
+#include <Coordination/KeeperReadThreadPool.h>
+#include <Coordination/KeeperReconfiguration.h>
+#include <Coordination/KeeperStateManager.h>
+#include <Coordination/KeeperStorage.h>
+#include <Coordination/KeeperStorageImpl.h>
+#include <Coordination/ZooKeeperDataReader.h>
+#include <Core/ServerUUID.h>
+#include <DataTypes/DataTypeEnum.h>
+#include <Disks/DiskLocal.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromString.h>
+#include <Poco/Event.h>
+#include <Poco/JSON/Array.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
+#include <Poco/Util/MapConfiguration.h>
+#include <Poco/Util/XMLConfiguration.h>
 #include <Common/Stopwatch.h>
 #include <Common/ThreadPool.h>
 #include <Common/scope_guard_safe.h>
@@ -27,6 +59,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+namespace DB::CoordinationSetting
+{
+    extern const CoordinationSettingsUInt64 parallel_read_threads;
+    extern const CoordinationSettingsUInt64 parallel_read_chunk_size;
+    extern const CoordinationSettingsUInt64 parallel_read_min_batch;
+}
 
 namespace
 {
@@ -93,7 +132,8 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         engine.buggify.max_append_size = 100;
 
     ClusterConfig cfg;
-    cfg.num_nodes = (mode == "stale-matched-idx" || mode == "figure8") ? 5 : 3;
+    cfg.num_nodes = (mode == "stale-matched-idx" || mode == "figure8"
+        || mode == "vote-resp-split-brain" || mode == "prevote-disrupts-follower") ? 5 : 3;
     cfg.strict_raft_commit = false;
     cfg.nuraft_log_level = nuraft_log_level;
     cfg.root_dir = state_dir;
@@ -512,9 +552,1832 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << " N4.applied=" << nodes.at(4).machine->last_commit_index() << "\n";
         require(!joined, "N4 unexpectedly joined after transient error");
     }
+    else if (mode == "prevote-disrupts-follower")
+    {
+        /// Bug #46b: handle_prevote_resp never checks `role_ == candidate` or `!hb_alive_`,
+        /// and handle_append_entries never invalidates in-flight pre_vote_.
+        /// In a 5-node cluster (quorum = 3), partition l1 from the 4 followers briefly so a follower
+        /// collects 3 accepted pre_vote_responses(term=t1, accepted=true) in flight; heal l1 so the
+        /// cluster is completely healthy in term t1 (hb_alive_=true, leader=l1); then when those
+        /// delayed pre_vote_responses arrive at the healthy follower, pre_vote_.dead_ reaches quorum 3
+        /// and calls initiate_vote(), incrementing term to t1+1 and dethroning healthy leader l1!
+        std::set<int> followers;
+        for (int id = 1; id <= 5; ++id)
+            if (id != l1)
+                followers.insert(id);
+
+        std::map<int, int> held_prevotes;
+        int prevote_winner = 0;
+        net.on_deliver_response_hook = [&](int src, int /*dst*/, nuraft::ptr<nuraft::resp_msg> & resp, nuraft::rpc_handler & cb)
+        {
+            if (resp && resp->get_type() == nuraft::msg_type::pre_vote_response
+                && resp->get_term() == t1 && resp->get_accepted())
+            {
+                int cnt = ++held_prevotes[src];
+                if (cnt >= 3 && prevote_winner == 0)
+                    prevote_winner = src;
+                auto resp_copy = resp;
+                auto cb_copy = cb;
+                engine.scheduleAfterMs(700, "delayed-prevote-resp", [resp_copy, cb_copy]() mutable
+                {
+                    nuraft::ptr<nuraft::rpc_exception> no_err;
+                    cb_copy(resp_copy, no_err);
+                });
+                return;
+            }
+            nuraft::ptr<nuraft::rpc_exception> no_err;
+            cb(resp, no_err);
+        };
+
+        /// Cut l1 from all 4 followers just long enough for one follower to get 3 accepted pre_vote_responses in flight.
+        net.partitionSymmetric({l1}, followers);
+        require(engine.runUntilCondition(5000, [&]() { return prevote_winner != 0; }),
+            "No follower accumulated 3 accepted pre_vote_responses in term t1");
+
+        /// Immediately heal the entire cluster! l1 resumes heartbeats to f1 & f2 in term t1.
+        net.healAll();
+        engine.runUntilMs(simTimeMs() + 200);
+
+        std::cerr << "[" << mode << "] Cluster healthy in term=" << t1
+                  << " (l1.is_leader=" << nodes.at(l1).server->is_leader()
+                  << " l1.term=" << nodes.at(l1).server->get_term()
+                  << ", follower=N" << prevote_winner
+                  << " sees leader=N" << nodes.at(prevote_winner).server->get_leader()
+                  << " term=" << nodes.at(prevote_winner).server->get_term() << ")\n";
+        require(nodes.at(l1).server->is_leader() && nodes.at(l1).server->get_term() == t1,
+            "l1 should still be healthy leader in term t1");
+        require(!nodes.at(prevote_winner).server->is_leader()
+            && nodes.at(prevote_winner).server->get_leader() == l1
+            && nodes.at(prevote_winner).server->get_term() == t1,
+            "prevote_winner should be a healthy follower of l1 in term t1");
+
+        /// Wait for the delayed pre_vote_responses(term=t1, accepted=true) to arrive at healthy follower `prevote_winner`.
+        engine.runUntilMs(simTimeMs() + 900);
+
+        const uint64_t new_term = nodes.at(prevote_winner).server->get_term();
+        std::cerr << "[" << mode << "] REPRODUCED! After delayed pre_vote_responses arrived at healthy follower N" << prevote_winner
+                  << ": N" << prevote_winner << ".term=" << new_term
+                  << " l1.term=" << nodes.at(l1).server->get_term()
+                  << " l1.is_leader=" << nodes.at(l1).server->is_leader() << "\n";
+        require(new_term > t1, "Healthy follower did not disrupt leader upon delayed pre_vote_response");
+    }
+    else if (mode == "vote-resp-split-brain")
+    {
+        /// Bug #46a: become_follower() never sets election_completed_=true, and handle_vote_resp()
+        /// never checks `role_ == srv_role::candidate` nor deduplicates votes by `resp.get_src()`.
+        /// In a 5-node cluster, N_cand runs in term T (gets self + N_ally = 2 votes), while
+        /// the other 3 nodes elect N_real in the SAME term T. N_real sends append_entries(T) to
+        /// N_cand, forcing N_cand into become_follower() in term T (role_ == follower, leader_ == N_real,
+        /// election_completed_ == false!). A duplicate/delayed request_vote_response(term=T, accepted=true)
+        /// from N_ally then elects FOLLOWER N_cand as a SECOND LEADER in the SAME term T!
+        std::vector<int> followers;
+        for (int id = 1; id <= 5; ++id)
+            if (id != l1)
+                followers.push_back(id);
+        const std::vector<int> grp = {followers[0], followers[1], followers[2]};
+        const int n_m1 = l1;
+        const int n_m3 = followers[3];
+
+        /// Whichever node in `grp` gets 2 accepted pre_vote_responses in term t1 FIRST becomes `n_cand`!
+        /// Right BEFORE its 2nd pre_vote_response triggers initiate_vote(), we cut `n_cand` from one of its
+        /// two group peers (`n_m2`), leaving ONLY `n_ally` to vote for `n_cand` in target_term (2/5 votes!).
+        /// Meanwhile `n_m2` stays unvoted in term t1 and teams up with {n_m1, n_m3} to elect `n_real` in target_term!
+        const uint64_t target_term = t1 + 1;
+        int n_cand = 0;
+        int n_ally = 0;
+        int n_m2 = 0;
+        std::map<int, int> prevote_cnt;
+        nuraft::ptr<nuraft::resp_msg> captured_vote_resp;
+        nuraft::rpc_handler captured_cb;
+
+        net.on_deliver_response_hook = [&](int src, int dst, nuraft::ptr<nuraft::resp_msg> & resp, nuraft::rpc_handler & cb)
+        {
+            if (n_cand == 0 && resp && resp->get_type() == nuraft::msg_type::pre_vote_response
+                && resp->get_term() == t1 && resp->get_accepted()
+                && std::find(grp.begin(), grp.end(), src) != grp.end())
+            {
+                if (++prevote_cnt[src] >= 2)
+                {
+                    n_cand = src;
+                    for (int g : grp)
+                    {
+                        if (g == n_cand)
+                            continue;
+                        if (n_ally == 0)
+                            n_ally = g;
+                        else
+                            n_m2 = g;
+                    }
+                    cut_pair(n_cand, n_m2);
+                    cut_pair(n_ally, n_m2);
+                }
+            }
+            if (n_cand != 0 && src == n_cand && dst == n_ally && resp
+                && resp->get_type() == nuraft::msg_type::request_vote_response
+                && resp->get_term() == target_term && resp->get_accepted()
+                && !captured_vote_resp)
+            {
+                captured_vote_resp = resp;
+                captured_cb = cb;
+            }
+            nuraft::ptr<nuraft::rpc_exception> no_err;
+            cb(resp, no_err);
+        };
+
+        /// Partition `grp` from {n_m1, n_m3} (and isolate n_m1 from n_m3 so l1 steps down or stays in t1).
+        net.partitionSymmetric({grp[0], grp[1], grp[2]}, {n_m1, n_m3});
+        cut_pair(n_m1, n_m3);
+
+        /// Wait until n_cand gets n_ally's vote in term t1+1 (2/5 votes -> stuck as candidate in t1+1).
+        require(engine.runUntilCondition(8000, [&]()
+        {
+            return captured_vote_resp != nullptr;
+        }), "n_cand did not receive n_ally's vote in term t1+1");
+
+        /// Have old leader n_m1 yield leadership (e.g. stepdown / restart) so {n_m1, n_m2, n_m3}
+        /// cleanly elect a new leader n_real in the SAME term target_term (t1+1)!
+        nodes.at(n_m1).server->yield_leadership(/*immediate_yield=*/true);
+        heal_pair(n_m2, n_m3);
+        heal_pair(n_m1, n_m2);
+        heal_pair(n_m1, n_m3);
+        int n_real = 0;
+        require(engine.runUntilCondition(8000, [&]()
+        {
+            for (int id : {n_m1, n_m2, n_m3})
+            {
+                if (nodes.at(id).server->is_leader() && nodes.at(id).server->get_term() == target_term)
+                {
+                    n_real = id;
+                    return true;
+                }
+            }
+            return false;
+        }), "Majority {m1,m2,m3} did not elect leader in target_term");
+
+        /// Connect n_real <-> n_cand so n_real's append_entries(target_term) forces n_cand to become_follower()!
+        heal_pair(n_real, n_cand);
+        require(engine.runUntilCondition(3000, [&]()
+        {
+            return !nodes.at(n_cand).server->is_leader()
+                && nodes.at(n_cand).server->get_leader() == n_real
+                && nodes.at(n_cand).server->get_term() == target_term;
+        }), "n_cand did not step down to follower of n_real in target_term");
+
+        std::cerr << "[" << mode << "] Before duplicate vote_resp: N" << n_real
+                  << " is LEADER(term=" << nodes.at(n_real).server->get_term() << "), N" << n_cand
+                  << " is FOLLOWER(term=" << nodes.at(n_cand).server->get_term()
+                  << ", leader=N" << nodes.at(n_cand).server->get_leader() << ")\n";
+
+        /// Re-deliver n_ally's captured request_vote_response(term=target_term, accepted=true) to FOLLOWER n_cand!
+        nuraft::ptr<nuraft::rpc_exception> no_err;
+        captured_cb(captured_vote_resp, no_err);
+
+        const bool real_is_leader = nodes.at(n_real).server->is_leader();
+        const bool cand_is_leader = nodes.at(n_cand).server->is_leader();
+        const uint64_t real_term = nodes.at(n_real).server->get_term();
+        const uint64_t cand_term = nodes.at(n_cand).server->get_term();
+        std::cerr << "[" << mode << "] REPRODUCED TWO LEADERS IN SAME TERM " << target_term << "! "
+                  << "N" << n_real << ".is_leader=" << real_is_leader << "(term=" << real_term << ") "
+                  << "AND N" << n_cand << ".is_leader=" << cand_is_leader << "(term=" << cand_term << ")\n";
+        require(real_is_leader && cand_is_leader && real_term == cand_term,
+            "Failed to elect two concurrent leaders in the same Raft term");
+    }
+    else if (mode == "priority-conf-corrupt")
+    {
+        /// Bug #47: set_priority_v2 and handle_priority_change_req_v2:
+        /// 1. Do NOT check `if (config_changing_)` -> append concurrent uncommitted `conf` entries (Raft §6 violation)
+        /// 2. Never update `cloned_config->set_prev_log_idx(cur_config->get_log_idx())` -> stale prev_log_idx chain
+        /// 3. handle_priority_change_req_v2 appends a `conf` entry and sets config_changing_=true even when
+        ///    target server ID does not exist (returning accepted=false)!
+        std::vector<int> followers;
+        for (int id = 1; id <= 3; ++id)
+            if (id != l1)
+                followers.push_back(id);
+        const int f1 = followers[0];
+        const int f2 = followers[1];
+
+        /// Isolate l1 so new conf entries stay uncommitted on l1.
+        net.partitionSymmetric({l1}, {f1, f2});
+
+        const uint64_t slot_before = nodes.at(l1).log_store->next_slot();
+        auto rm_res = nodes.at(l1).server->remove_srv(f2);
+        require(rm_res && rm_res->get_accepted(), "remove_srv(f2) rejected");
+        require(engine.runUntilCondition(1000, [&]()
+        {
+            return nodes.at(l1).log_store->next_slot() > slot_before;
+        }), "Expected 1st conf entry");
+        const uint64_t conf1_idx = slot_before;
+
+        /// Call set_priority_v2 while remove_srv conf entry at conf1_idx is STILL UNCOMMITTED!
+        const bool prio_ok = nodes.at(l1).server->set_priority_v2(f1, 10);
+        const uint64_t conf2_idx = conf1_idx + 1;
+        require(prio_ok && nodes.at(l1).log_store->next_slot() == conf2_idx + 1,
+            "Expected set_priority_v2 to append 2nd concurrent uncommitted conf entry");
+
+        auto e1 = nodes.at(l1).log_store->entry_at(conf1_idx);
+        auto e2 = nodes.at(l1).log_store->entry_at(conf2_idx);
+        auto c1 = nuraft::cluster_config::deserialize(e1->get_buf());
+        auto c2 = nuraft::cluster_config::deserialize(e2->get_buf());
+
+        std::cerr << "[" << mode << "] REPRODUCED concurrent uncommitted conf entries (violating Raft §6): "
+                  << "conf1(idx=" << c1->get_log_idx() << ", prev=" << c1->get_prev_log_idx() << ") "
+                  << "and conf2(idx=" << c2->get_log_idx() << ", prev=" << c2->get_prev_log_idx() << ") "
+                  << "both uncommitted (commit_idx=" << nodes.at(l1).machine->last_commit_index() << ")\n";
+        require(c1->get_log_idx() == conf1_idx && c2->get_log_idx() == conf2_idx
+            && nodes.at(l1).machine->last_commit_index() < conf1_idx,
+            "Expected two concurrent uncommitted conf entries");
+
+        /// Also send priority_change_request_v2 for unknown server 999 -> resp declined yet conf3 appended!
+        nuraft::req_msg req(
+            nodes.at(l1).server->get_term(),
+            nuraft::msg_type::priority_change_request_v2,
+            f1,
+            l1,
+            nodes.at(l1).log_store->term_at(conf2_idx),
+            conf2_idx,
+            nodes.at(l1).machine->last_commit_index());
+        auto pbuf = nuraft::buffer::alloc(sizeof(int32_t) * 2);
+        nuraft::buffer_serializer bs(pbuf);
+        bs.put_i32(999);
+        bs.put_i32(42);
+        req.log_entries().push_back(nuraft::cs_new<nuraft::log_entry>(
+            nodes.at(l1).server->get_term(), pbuf, nuraft::log_val_type::custom));
+
+        const uint64_t slot_before_unknown = nodes.at(l1).log_store->next_slot();
+        auto resp = net.process_req(nodes.at(l1).server.get(), req);
+        const uint64_t slot_after_unknown = nodes.at(l1).log_store->next_slot();
+        std::cerr << "[" << mode << "] REPRODUCED unknown-server priority_change_request(id=999): "
+                  << "resp.accepted=" << (resp && resp->get_accepted())
+                  << " yet log_store next_slot advanced " << slot_before_unknown
+                  << " -> " << slot_after_unknown << " (appended bogus conf entry!)\n";
+        require(resp && !resp->get_accepted() && slot_after_unknown == slot_before_unknown + 1,
+            "Expected declined response yet appended conf entry for unknown server");
+    }
+    else if (mode == "out-of-log-null-ctx")
+    {
+        /// Bug #50b: handle_out_of_log_msg dereferences *msg->ctx_ without null check -> SIGSEGV!
+        /// Wire layout of custom_notification_msg: u8 version(0), u8 type(1=out_of_log_range_warning), u32 ctx_len(0).
+        int f1 = (l1 == 1) ? 2 : 1;
+        auto cbuf = nuraft::buffer::alloc(sizeof(uint8_t) * 2 + sizeof(uint32_t));
+        {
+            nuraft::buffer_serializer bs(cbuf);
+            bs.put_u8(0); // version
+            bs.put_u8(1); // out_of_log_range_warning
+            bs.put_u32(0); // empty ctx -> ctx_ = nullptr
+        }
+
+        nuraft::req_msg req(
+            t1,
+            nuraft::msg_type::custom_notification_request,
+            l1,
+            f1,
+            nodes.at(l1).log_store->term_at(base_idx),
+            base_idx,
+            nodes.at(l1).machine->last_commit_index());
+        req.log_entries().push_back(nuraft::cs_new<nuraft::log_entry>(t1, cbuf, nuraft::log_val_type::custom));
+
+        std::cerr << "[" << mode << "] Sending out_of_log_range_warning with ctx_=nullptr to N" << f1 << " (expecting SIGSEGV)...\n";
+        auto resp = net.process_req(nodes.at(f1).server.get(), req);
+        (void)resp;
+        throw std::runtime_error("Expected SIGSEGV in handle_out_of_log_msg did not happen");
+    }
+    else if (mode == "learner-takeover")
+    {
+        /// Bug #51: handle_leadership_takeover does not check im_learner_ before calling initiate_vote(true),
+        /// allowing a non-voting learner to bump its Raft term and initiate an election!
+        require(cluster.addDynamicNode(l1, /*as_learner=*/true), "addDynamicNode(as_learner=true) failed");
+        require(engine.runUntilCondition(5000, [&]()
+        {
+            auto c = nodes.at(4).server->get_config();
+            auto s4 = c ? c->get_server(4) : nullptr;
+            return s4 != nullptr && s4->is_learner() && nodes.at(4).server->get_term() == t1;
+        }), "Learner N4 did not join cluster");
+
+        const uint64_t learner_term_before = nodes.at(4).server->get_term();
+        /// Wire layout of custom_notification_msg: u8 version(0), u8 type(2=leadership_takeover), u32 ctx_len(0).
+        auto cbuf = nuraft::buffer::alloc(sizeof(uint8_t) * 2 + sizeof(uint32_t));
+        {
+            nuraft::buffer_serializer bs(cbuf);
+            bs.put_u8(0); // version
+            bs.put_u8(2); // leadership_takeover
+            bs.put_u32(0); // empty ctx
+        }
+        nuraft::req_msg req(
+            learner_term_before,
+            nuraft::msg_type::custom_notification_request,
+            l1,
+            4,
+            nodes.at(l1).log_store->term_at(base_idx),
+            base_idx,
+            nodes.at(l1).machine->last_commit_index());
+        req.log_entries().push_back(nuraft::cs_new<nuraft::log_entry>(learner_term_before, cbuf, nuraft::log_val_type::custom));
+
+        auto resp = net.process_req(nodes.at(4).server.get(), req);
+        (void)resp;
+        const uint64_t learner_term_after = nodes.at(4).server->get_term();
+        std::cerr << "[" << mode << "] REPRODUCED non-voting learner N4 (is_learner="
+                  << nodes.at(4).server->get_config()->get_server(4)->is_learner()
+                  << ") ran initiate_vote(true): term bumped " << learner_term_before
+                  << " -> " << learner_term_after << "\n";
+        require(learner_term_after == learner_term_before + 1,
+            "Learner did not increment term on leadership_takeover_request");
+    }
+    else if (mode == "join-term-rewind")
+    {
+        /// Bug #60a: process_req does not validate req.get_term() for join_cluster_request, and
+        /// handle_join_cluster_req unconditionally overwrites state_->set_term(req.get_term()) + save_state,
+        /// rewinding the node's Raft term backwards (Raft §5.1 violation)!
+        const int f1 = (l1 == 1) ? 2 : 1;
+        const uint64_t high_term = t1 + 4;
+        nuraft::req_msg vote_bump(
+            high_term,
+            nuraft::msg_type::request_vote_request,
+            l1,
+            f1,
+            t1,
+            base_idx,
+            nodes.at(l1).machine->last_commit_index());
+        (void)net.process_req(nodes.at(f1).server.get(), vote_bump);
+        const uint64_t term_before = nodes.at(f1).server->get_term();
+        require(term_before == high_term, "Failed to advance f1 to high_term");
+
+        auto stale_cfg = nodes.at(l1).server->get_config();
+        nuraft::req_msg stale_join(
+            t1, // older term < high_term!
+            nuraft::msg_type::join_cluster_request,
+            l1,
+            f1,
+            0,
+            base_idx,
+            nodes.at(l1).machine->last_commit_index());
+        stale_join.log_entries().push_back(
+            nuraft::cs_new<nuraft::log_entry>(t1, stale_cfg->serialize(), nuraft::log_val_type::conf));
+
+        auto resp = net.process_req(nodes.at(f1).server.get(), stale_join);
+        const uint64_t term_after = nodes.at(f1).server->get_term();
+        std::cerr << "[" << mode << "] REPRODUCED Raft term rewind on N" << f1
+                  << ": stale join_cluster_request(term=" << t1 << ") rewound term "
+                  << term_before << " -> " << term_after
+                  << " (accepted=" << (resp && resp->get_accepted()) << ")\n";
+        require(resp && resp->get_accepted() && term_after < term_before,
+            "Expected join_cluster_request from stale term to rewind term");
+    }
+    else if (mode == "log-sync-empty-oob")
+    {
+        /// Bug #60b: handle_log_sync_req (handle_join_leave.cxx:411) evaluates entries[0]->get_val_type()
+        /// inside p_db(...) BEFORE checking `if (entries.size() != 1 || ...)` -> SIGSEGV when debug logging is on!
+        const int f1 = (l1 == 1) ? 2 : 1;
+        nuraft::req_msg empty_sync(
+            t1,
+            nuraft::msg_type::sync_log_request,
+            l1,
+            f1,
+            0,
+            base_idx,
+            nodes.at(l1).machine->last_commit_index());
+        std::cerr << "[" << mode << "] Sending empty sync_log_request to N" << f1
+                  << " with nuraft_log_level=" << nuraft_log_level << " (expecting SIGSEGV)...\n";
+        auto resp = net.process_req(nodes.at(f1).server.get(), empty_sync);
+        (void)resp;
+        throw std::runtime_error("Expected SIGSEGV in handle_log_sync_req did not happen");
+    }
+    else if (mode == "leave-resp-unchecked" || mode == "log-sync-rejected-joins")
+    {
+        /// Bug #60c/d:
+        ///  - handle_leave_cluster_resp ignores role_, leave_flag, and config_changing_ -> removes healthy peer!
+        ///  - handle_log_sync_resp ignores resp.get_accepted() == false -> adds rejecting joiner into cluster config!
+        const int f1 = (l1 == 1) ? 2 : 1;
+        bool injected = false;
+        net.on_deliver_response_hook = [&](int src, int /*dst*/, nuraft::ptr<nuraft::resp_msg> & resp, nuraft::rpc_handler & handler)
+        {
+            nuraft::ptr<nuraft::rpc_exception> no_err;
+            if (injected || src != l1 || !resp || resp->get_type() != nuraft::msg_type::join_cluster_response)
+            {
+                handler(resp, no_err);
+                return;
+            }
+            injected = true;
+            if (mode == "leave-resp-unchecked")
+            {
+                /// Forge a leave_cluster_response(accepted=true) from healthy peer f1 (whose leave_flag is FALSE!)
+                /// and deliver it directly to ex_resp_handler_.
+                auto forged = nuraft::cs_new<nuraft::resp_msg>(t1, nuraft::msg_type::leave_cluster_response, f1, l1);
+                forged->accept(base_idx + 1);
+                handler(forged, no_err);
+            }
+            else
+            {
+                /// Deliver a REJECTED sync_log_response (accepted=false!) for joining node 4 to ex_resp_handler_.
+                /// handle_log_sync_resp ignores get_accepted() == false and immediately appends a conf adding N4!
+                auto rejected = nuraft::cs_new<nuraft::resp_msg>(
+                    t1, nuraft::msg_type::sync_log_response, 4, l1, nodes.at(l1).log_store->next_slot());
+                require(!rejected->get_accepted(), "Expected rejected sync_log_response");
+                handler(rejected, no_err);
+            }
+        };
+
+        const uint64_t next_before = nodes.at(l1).log_store->next_slot();
+        require(cluster.addDynamicNode(l1, /*as_learner=*/false), "addDynamicNode failed");
+        require(engine.runUntilCondition(2000, [&]() { return injected; }), "Hook was not triggered");
+        const uint64_t next_after = nodes.at(l1).log_store->next_slot();
+        require(next_after > next_before, "Expected leader to append a conf entry");
+
+        auto last_le = nodes.at(l1).log_store->entry_at(next_after - 1);
+        require(last_le && last_le->get_val_type() == nuraft::log_val_type::conf, "Expected conf log entry");
+        last_le->get_buf().pos(0);
+        auto new_conf = nuraft::cluster_config::deserialize(last_le->get_buf());
+
+        if (mode == "leave-resp-unchecked")
+        {
+            const bool f1_removed = (new_conf->get_server(f1) == nullptr);
+            std::cerr << "[" << mode << "] REPRODUCED unchecked handle_leave_cluster_resp: healthy peer N" << f1
+                      << " (never asked to leave!) was removed from conf at idx=" << (next_after - 1)
+                      << " (servers=" << new_conf->get_servers().size() << ", has_f1=" << !f1_removed << ")\n";
+            require(f1_removed, "Expected healthy peer f1 to be removed by unchecked leave_cluster_response");
+        }
+        else
+        {
+            const bool n4_added = (new_conf->get_server(4) != nullptr);
+            std::cerr << "[" << mode << "] REPRODUCED handle_log_sync_resp ignoring accepted=false: rejected joiner N4"
+                      << " was added into conf at idx=" << (next_after - 1)
+                      << " (servers=" << new_conf->get_servers().size() << ", has_N4=" << n4_added << ")\n";
+            require(n4_added, "Expected rejecting joiner N4 to be added to cluster config");
+        }
+        net.on_deliver_response_hook = nullptr;
+    }
     else
     {
         throw std::runtime_error("Unknown --repro-nuraft mode: " + mode);
+    }
+}
+
+void runKeeperLiveRepro(const std::string & mode, const std::filesystem::path & state_dir)
+{
+    using namespace keeper_sim;
+
+    if (mode == "chroot-root-watch")
+    {
+        Coordination::ZooKeeperExistsRequest req;
+        req.path = "/";
+        req.addRootPath("/clickhouse");
+        std::cerr << "[" << mode << "] After addRootPath(\"/clickhouse\") on \"/\": req.path=\"" << req.path << "\"\n";
+        require(req.path == "/clickhouse", "Unexpected addRootPath result");
+
+        Coordination::ZooKeeperWatchResponse watch_resp;
+        watch_resp.path = req.path;
+        try
+        {
+            watch_resp.removeRootPath("/clickhouse");
+            throw std::runtime_error("Expected ZDATAINCONSISTENCY exception was not thrown");
+        }
+        catch (const Coordination::Exception & e)
+        {
+            std::cerr << "[" << mode << "] REPRODUCED Coordination::Exception code=" << static_cast<int>(e.code)
+                      << " msg=\"" << e.what() << "\"\n";
+            require(e.code == Coordination::Error::ZDATAINCONSISTENCY, "Unexpected Coordination error code");
+        }
+    }
+    else if (mode == "changelog-shutdown-rotate")
+    {
+        require(!state_dir.empty(), "--state-dir is required");
+        if (std::filesystem::exists(state_dir))
+            std::filesystem::remove_all(state_dir);
+        std::filesystem::create_directories(state_dir);
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto ctx = std::make_shared<DB::KeeperContext>(/*standalone=*/true, settings);
+        auto disk = std::make_shared<DB::DiskLocal>("repro_log", state_dir.string() + "/");
+        ctx->setLogDisk(disk);
+        ctx->setLogDisk(disk);
+
+        DB::LogFileSettings log_settings;
+        log_settings.rotate_interval = 3;
+        log_settings.force_sync = false;
+        log_settings.compress_logs = false;
+        log_settings.startup_read_max_streams = 1;
+
+        DB::FlushSettings flush_settings;
+        flush_settings.max_flush_batch_size = 1;
+        flush_settings.min_time_between_fsyncs_ms = 0;
+
+        DB::ReadAheadSettings ra_settings;
+        ra_settings.enabled = false;
+        ra_settings.commit_window_bytes = 0;
+
+        DB::KeeperLogStore store(log_settings, flush_settings, ra_settings, ctx, DB::Changelog::ExecutionMode::Manual);
+        store.init(/*last_commited_log_index=*/0, /*logs_to_keep=*/100);
+
+        auto make_entry = [](uint64_t term, const std::string & payload)
+        {
+            auto buf = nuraft::buffer::alloc(payload.size());
+            buf->put_raw(reinterpret_cast<const nuraft::byte *>(payload.data()), payload.size());
+            buf->pos(0);
+            return nuraft::cs_new<nuraft::log_entry>(term, buf, nuraft::log_val_type::app_log);
+        };
+
+        for (int i = 1; i <= 3; ++i)
+        {
+            auto e = make_entry(1, "entry_" + std::to_string(i));
+            store.append(e);
+        }
+        store.flush();
+        while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+        {
+        }
+
+        /// Append 4th entry (queued in write_operations, NOT yet executed) which crosses rotate_interval=3
+        /// and will call rotate(4) -> moveChangelogAsync during shutdown() AFTER changelog_operation_queue was finished!
+        auto e4 = make_entry(1, "entry_4_triggers_rotate");
+        store.append(e4);
+
+        try
+        {
+            store.shutdownChangelog();
+            throw std::runtime_error("Expected SYSTEM_ERROR on shutdown rotation was not thrown");
+        }
+        catch (const DB::Exception & e)
+        {
+            std::cerr << "[" << mode << "] REPRODUCED DB::Exception code=" << e.code()
+                      << " msg=\"" << e.message() << "\"\n";
+        }
+    }
+    else if (mode == "readahead-mixed-compress")
+    {
+        require(!state_dir.empty(), "--state-dir is required");
+        if (std::filesystem::exists(state_dir))
+            std::filesystem::remove_all(state_dir);
+        std::filesystem::create_directories(state_dir);
+
+        auto make_entry = [](uint64_t term, const std::string & payload)
+        {
+            auto buf = nuraft::buffer::alloc(payload.size());
+            buf->put_raw(reinterpret_cast<const nuraft::byte *>(payload.data()), payload.size());
+            buf->pos(0);
+            return nuraft::cs_new<nuraft::log_entry>(term, buf, nuraft::log_val_type::app_log);
+        };
+
+        auto make_ctx = [&]()
+        {
+            auto settings = std::make_shared<DB::CoordinationSettings>();
+            auto ctx = std::make_shared<DB::KeeperContext>(/*standalone=*/true, settings);
+            auto disk = std::make_shared<DB::DiskLocal>("repro_log", state_dir.string() + "/");
+            ctx->setLogDisk(disk);
+            return ctx;
+        };
+
+        DB::FlushSettings manual_flush;
+        manual_flush.max_flush_batch_size = 1;
+        manual_flush.min_time_between_fsyncs_ms = 0;
+
+        DB::ReadAheadSettings manual_ra;
+        manual_ra.enabled = false;
+        manual_ra.commit_window_bytes = 0;
+
+        /// Phase 1: Write uncompressed changelog_1_3.bin
+        {
+            DB::LogFileSettings log_settings;
+            log_settings.rotate_interval = 3;
+            log_settings.force_sync = false;
+            log_settings.compress_logs = false;
+            log_settings.latest_logs_cache_entry_count_threshold = 2;
+            log_settings.startup_read_max_streams = 1;
+            DB::KeeperLogStore store(log_settings, manual_flush, manual_ra, make_ctx(), DB::Changelog::ExecutionMode::Manual);
+            store.init(0, 100);
+            for (int i = 1; i <= 3; ++i)
+            {
+                auto e = make_entry(1, "uncompressed_" + std::to_string(i));
+                store.append(e);
+            }
+            store.flush();
+            while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+            {
+            }
+            store.shutdownChangelog();
+        }
+
+        /// Phase 2: Enable compress_logs=true and write compressed changelog_4_6.bin.zstd
+        {
+            DB::LogFileSettings log_settings;
+            log_settings.rotate_interval = 3;
+            log_settings.force_sync = false;
+            log_settings.compress_logs = true;
+            log_settings.latest_logs_cache_entry_count_threshold = 2;
+            log_settings.startup_read_max_streams = 1;
+            DB::KeeperLogStore store(log_settings, manual_flush, manual_ra, make_ctx(), DB::Changelog::ExecutionMode::Manual);
+            store.init(0, 100);
+            for (int i = 4; i <= 6; ++i)
+            {
+                auto e = make_entry(1, "compressed_" + std::to_string(i));
+                store.append(e);
+            }
+            store.flush();
+            while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+            {
+            }
+            store.shutdownChangelog();
+        }
+
+        /// Phase 3: Restart in normal Background mode with bounded latest_logs_cache (holds {5,6}) and ReadAhead enabled.
+        /// Reading UNCOMPRESSED entry 2 from changelog_1_3.bin triggers appendNextFileCursors(4) into
+        /// changelog_4_6.bin.zstd -> assertNotCompressed throws NOT_IMPLEMENTED!
+        {
+            DB::LogFileSettings log_settings;
+            log_settings.rotate_interval = 3;
+            log_settings.force_sync = false;
+            log_settings.compress_logs = true;
+            log_settings.latest_logs_cache_entry_count_threshold = 2;
+            log_settings.startup_read_max_streams = 1;
+            DB::ReadAheadSettings ra_settings;
+            ra_settings.enabled = true;
+            ra_settings.commit_window_bytes = 64 * 1024;
+            DB::KeeperLogStore store(log_settings, DB::FlushSettings{}, ra_settings, make_ctx(), DB::Changelog::ExecutionMode::Threaded);
+            store.init(0, 100);
+
+            bool commit_threw = false;
+            try
+            {
+                auto e = store.entry_at_ext(2, /*for_commit=*/true);
+                (void)e;
+            }
+            catch (const DB::Exception & e)
+            {
+                commit_threw = true;
+                std::cerr << "[" << mode << "] REPRODUCED entry_at_ext(2, for_commit=true) threw code=" << e.code()
+                          << " msg=\"" << e.message() << "\"\n";
+            }
+            require(commit_threw, "Expected NOT_IMPLEMENTED from entry_at_ext(2, true)");
+
+            auto peer_entries = store.log_entries_ext(2, 4, 0, /*peer_id=*/2);
+            std::cerr << "[" << mode << "] REPRODUCED log_entries_ext(2, 4, peer_id=2) returned "
+                      << (peer_entries ? std::to_string(peer_entries->size()) : std::string("nullptr")) << "\n";
+            require(peer_entries == nullptr, "Expected nullptr from log_entries_ext(2, 4, peer_id=2)");
+
+            store.shutdownChangelog();
+        }
+    }
+    else if (mode == "read-pool-grow-underflow")
+    {
+        /// Bug #43: Increasing parallel_read_threads on a small batch (< parallel_read_min_batch)
+        /// after batch_idx >= 1 spawns new workers with seen_batch_idx = 0 != batch_idx.
+        /// They immediately execute phantom batch_idx without incrementing busy_threads,
+        /// underflowing busy_threads (chassert crash in debug) or decrementing the NEXT batch's
+        /// busy_threads prematurely so execute() returns while another worker is still inside func() (UAF)!
+        bool observed_premature_return = false;
+        for (int attempt = 0; attempt < 200 && !observed_premature_return; ++attempt)
+        {
+            DB::KeeperReadThreadPool pool;
+            DB::CoordinationSettings s1;
+            s1[DB::CoordinationSetting::parallel_read_threads] = 2;
+            s1[DB::CoordinationSetting::parallel_read_min_batch] = 10;
+            s1[DB::CoordinationSetting::parallel_read_chunk_size] = 4;
+
+            /// Batch 1: advances batch_idx to 1 with 2 running threads.
+            pool.execute(16, s1, [](size_t, size_t) {});
+
+            /// Batch 2: hot-reload increases parallel_read_threads to 6, but count=1 < min_batch=10!
+            /// Spawns 4 new threads with seen_batch_idx=0 while batch_idx=1 and returns early.
+            DB::CoordinationSettings s2 = s1;
+            s2[DB::CoordinationSetting::parallel_read_threads] = 6;
+            pool.execute(1, s2, [](size_t, size_t) {});
+
+            /// Batch 3: immediately runs a batch where one chunk takes 5ms.
+            /// If a newly spawned thread from Batch 2 decrements Batch 3's busy_threads for phantom batch 1
+            /// AND again for batch 2, execute() returns BEFORE all workers exit the lambda!
+            auto execute_returned = std::make_shared<std::atomic<bool>>(false);
+            auto active_workers = std::make_shared<std::atomic<int>>(0);
+            auto saw_uaf = std::make_shared<std::atomic<bool>>(false);
+
+            pool.execute(24, s2, [execute_returned, active_workers, saw_uaf](size_t begin, size_t)
+            {
+                active_workers->fetch_add(1, std::memory_order_acq_rel);
+                if (begin == 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if (execute_returned->load(std::memory_order_acquire))
+                    saw_uaf->store(true, std::memory_order_release);
+                active_workers->fetch_sub(1, std::memory_order_acq_rel);
+            });
+            execute_returned->store(true, std::memory_order_release);
+            if (active_workers->load(std::memory_order_acquire) > 0)
+                observed_premature_return = true;
+
+            /// Wait for any straggling worker before shutting down pool cleanly.
+            while (active_workers->load(std::memory_order_acquire) > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (saw_uaf->load(std::memory_order_acquire))
+                observed_premature_return = true;
+
+            if (observed_premature_return)
+                std::cerr << "[" << mode << "] REPRODUCED premature execute() return (worker still running caller lambda after return!) on attempt " << attempt << "\n";
+            pool.shutdown();
+        }
+        require(observed_premature_return, "Did not observe premature execute() return");
+    }
+    else if (mode == "multi-check-session-error")
+    {
+        /// Bug #44: ZooKeeper::multiImpl(..., check_session_valid=true) calls getFailedOpIndex(code, responses)
+        /// for any non-ZOK, non-hardware error (e.g. ZBADARGUMENTS / ZUNIMPLEMENTED / ZAPIERROR / ZCLOSING)
+        /// even when the server rejected the Multi at header level (all sub-responses ZOK) -> throws LOGICAL_ERROR!
+        struct MultiHeaderErrorKeeper final : public Coordination::IKeeper
+        {
+            std::unique_ptr<Coordination::TestKeeper> inner;
+            bool inject_multi_error = false;
+            explicit MultiHeaderErrorKeeper(const zkutil::ZooKeeperArgs & a) : inner(std::make_unique<Coordination::TestKeeper>(a)) {}
+            bool isExpired() const override { return inner->isExpired(); }
+            silk::FiberEvent & getExpiredEvent() override { return inner->getExpiredEvent(); }
+            std::optional<int8_t> getConnectedNodeIdx() const override { return inner->getConnectedNodeIdx(); }
+            String getConnectedHostPort() const override { return inner->getConnectedHostPort(); }
+            int64_t getConnectionXid() const override { return inner->getConnectionXid(); }
+            int64_t getSessionID() const override { return inner->getSessionID(); }
+            int64_t getLastZXIDSeen() const override { return inner->getLastZXIDSeen(); }
+            bool isFeatureEnabled(DB::KeeperFeatureFlag f) const override { return inner->isFeatureEnabled(f); }
+            const DB::KeeperFeatureFlags * getKeeperFeatureFlags() const override { return inner->getKeeperFeatureFlags(); }
+            void create(const String & p, const String & d, bool e, bool s, const Coordination::ACLs & a, Coordination::CreateCallback cb) override { inner->create(p, d, e, s, a, std::move(cb)); }
+            void remove(const String & p, int32_t v, Coordination::RemoveCallback cb) override { inner->remove(p, v, std::move(cb)); }
+            void removeRecursive(const String & p, uint32_t l, Coordination::RemoveRecursiveCallback cb) override { inner->removeRecursive(p, l, std::move(cb)); }
+            void listRecursive(const String & p, uint32_t l, Coordination::ListRecursiveCallback cb) override { inner->listRecursive(p, l, std::move(cb)); }
+            void listWithOptions(const String & p, const Coordination::ListOptions & o, Coordination::ListWithOptionsCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->listWithOptions(p, o, std::move(cb), std::move(w)); }
+            void exists(const String & p, Coordination::ExistsCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->exists(p, std::move(cb), std::move(w)); }
+            void get(const String & p, Coordination::GetCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->get(p, std::move(cb), std::move(w)); }
+            void set(const String & p, const String & d, int32_t v, Coordination::SetCallback cb) override { inner->set(p, d, v, std::move(cb)); }
+            void list(const String & p, Coordination::ListRequestType t, Coordination::ListCallback cb, Coordination::WatchCallbackPtrOrEventPtr w, bool ws, bool wd) override { inner->list(p, t, std::move(cb), std::move(w), ws, wd); }
+            void check(const String & p, int32_t v, Coordination::CheckCallback cb) override { inner->check(p, v, std::move(cb)); }
+            void sync(const String & p, Coordination::SyncCallback cb) override { inner->sync(p, std::move(cb)); }
+            void reconfig(std::string_view j, std::string_view l, std::string_view n, int32_t v, Coordination::ReconfigCallback cb) override { inner->reconfig(j, l, n, v, std::move(cb)); }
+            void getACL(const String & p, Coordination::GetACLCallback cb) override { inner->getACL(p, std::move(cb)); }
+            void finalize(const String & r) override { inner->finalize(r); }
+            void multi(const Coordination::Requests & reqs, Coordination::MultiCallback cb) override { multi(std::span(reqs), std::move(cb)); }
+            void multi(std::span<const Coordination::RequestPtr> reqs, Coordination::MultiCallback cb) override
+            {
+                if (!inject_multi_error)
+                {
+                    inner->multi(reqs, std::move(cb));
+                    return;
+                }
+                /// Matches ZooKeeperImpl::receiveEvent on header-level non-ZOK error:
+                /// response = makeResponse() (all sub-responses default ZOK), response->error = ZBADARGUMENTS.
+                Coordination::ZooKeeperMultiRequest zk_req(reqs, {});
+                auto resp = zk_req.makeResponse();
+                resp->error = Coordination::Error::ZBADARGUMENTS;
+                cb(dynamic_cast<const Coordination::MultiResponse &>(*resp));
+            }
+        };
+
+        MultiHeaderErrorKeeper * raw_keeper = nullptr;
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([&]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            auto k = std::make_unique<MultiHeaderErrorKeeper>(args);
+            raw_keeper = k.get();
+            return k;
+        });
+
+        raw_keeper->inject_multi_error = true;
+        Coordination::Requests ops{zkutil::makeCreateRequest("/x", "v", zkutil::CreateMode::Persistent)};
+        Coordination::Responses responses;
+        try
+        {
+            zk->tryMulti(ops, responses, /*check_session_valid=*/true);
+            throw std::runtime_error("Expected DB::Exception(LOGICAL_ERROR) was not thrown");
+        }
+        catch (const DB::Exception & e)
+        {
+            std::cerr << "[" << mode << "] REPRODUCED DB::Exception code=" << e.code()
+                      << " msg=\"" << e.message() << "\"\n";
+            require(e.code() == DB::ErrorCodes::LOGICAL_ERROR, "Expected ErrorCodes::LOGICAL_ERROR");
+        }
+    }
+    else if (mode == "fault-injection-async-bug")
+    {
+        /// Bug #45: ZooKeeperWithFaultInjection::injectFailureBeforeOperationPromise
+        /// forgets `return true;` when `!keeper`, falling through to set_exception a SECOND time
+        /// (std::future_error) or dereferencing nullptr `keeper->impl`!
+        auto faulty = std::make_shared<DB::ZooKeeperWithFaultInjection>(
+            /*keeper_=*/nullptr,
+            /*fault_injection_probability=*/1.0,
+            /*fault_injection_seed=*/42,
+            "repro",
+            nullptr);
+        try
+        {
+            auto fut = faulty->asyncTryGet("/test");
+            (void)fut;
+            throw std::runtime_error("Expected std::future_error from double set_exception");
+        }
+        catch (const std::future_error & e)
+        {
+            std::cerr << "[" << mode << "] REPRODUCED std::future_error from missing return in injectFailureBeforeOperationPromise: \""
+                      << e.what() << "\"\n";
+        }
+    }
+    else if (mode == "nuraft-buffer-oob")
+    {
+        /// Bug #50a: nuraft::buffer::get_str() at EOF advances pos() past size() (pos = size + 1),
+        /// causing `size() - pos()` to underflow to SIZE_MAX and bypassing ALL subsequent bounds checks!
+        auto buf = nuraft::buffer::alloc(4);
+        buf->put(static_cast<nuraft::int32>(0x12345678));
+        require(buf->pos() == 4 && buf->size() == 4, "Expected buffer at EOF");
+
+        const char * s = buf->get_str();
+        std::cerr << "[" << mode << "] After get_str() at EOF: ret=" << (s ? s : "nullptr")
+                  << " pos=" << buf->pos() << " size=" << buf->size()
+                  << " (size - pos = " << (buf->size() - buf->pos()) << " UNDERFLOW!)\n";
+        require(buf->pos() == 5 && buf->pos() > buf->size(), "Expected pos() > size() after get_str() at EOF");
+
+        /// Because `size() - pos()` underflowed to SIZE_MAX, get_byte() DOES NOT THROW overflow_error
+        /// and reads past the end of the heap buffer!
+        nuraft::byte oob_byte = buf->get_byte();
+        std::cerr << "[" << mode << "] REPRODUCED OOB read: get_byte() succeeded past EOF! byte="
+                  << static_cast<int>(oob_byte) << " new_pos=" << buf->pos() << "\n";
+    }
+    else if (mode == "keepermap-drop-lock-badversion")
+    {
+        /// Bug #53: StorageKeeperMap::StorageKeeperMap (lines 575-579) passes `drop_lock_version`
+        /// (the version of persistent `zk_dropped_lock_version_path`, always >= 1) as the expected
+        /// version for `makeRemoveRequest(zk_dropped_lock_path, drop_lock_version)` (an ephemeral node
+        /// whose version is always 0) -> retry multi unconditionally fails with ZBADVERSION!
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+
+        zk->createAncestors("/km/metadata/dropped/lock");
+        zk->create("/km/metadata/drop_lock_version", "", zkutil::CreateMode::Persistent);
+
+        /// Step 1: Exact initial drop lock acquisition from StorageKeeperMap.cpp:613-637.
+        Coordination::Requests init_ops{
+            zkutil::makeCreateRequest("/km/metadata/dropped/lock", "", zkutil::CreateMode::Ephemeral),
+            zkutil::makeSetRequest("/km/metadata/drop_lock_version", "table_1", -1),
+        };
+        Coordination::Responses init_resps;
+        auto init_code = zk->tryMulti(init_ops, init_resps);
+        require(init_code == Coordination::Error::ZOK, "Initial drop lock multi failed");
+        int32_t drop_lock_version = dynamic_cast<const Coordination::SetResponse &>(*init_resps[1]).stat.version;
+        std::cerr << "[" << mode << "] Initial drop_lock_version=" << drop_lock_version << "\n";
+        require(drop_lock_version == 1, "Expected drop_lock_version == 1");
+
+        /// Step 2: Exact retry multi from StorageKeeperMap.cpp:575-583.
+        Coordination::Requests retry_ops{
+            zkutil::makeSetRequest("/km/metadata/drop_lock_version", "table_1", drop_lock_version),
+            zkutil::makeRemoveRequest("/km/metadata/dropped/lock", drop_lock_version),
+            zkutil::makeCreateRequest("/km/metadata/dropped/lock", "", zkutil::CreateMode::Ephemeral),
+        };
+        Coordination::Responses retry_resps;
+        auto retry_code = zk->tryMulti(retry_ops, retry_resps);
+        std::cerr << "[" << mode << "] REPRODUCED StorageKeeperMap retry multi failed with code="
+                  << static_cast<int>(retry_code)
+                  << " (op0=" << static_cast<int>(retry_resps[0]->error)
+                  << ", op1=" << static_cast<int>(retry_resps[1]->error) << " ZBADVERSION on ephemeral lock v0!)\n";
+        require(retry_code == Coordination::Error::ZBADVERSION
+            && retry_resps[1]->error == Coordination::Error::ZBADVERSION,
+            "Expected ZBADVERSION on ephemeral drop lock removal");
+    }
+    else if (mode == "rcfg-null-deref")
+    {
+        /// Bug #57: KeeperDispatcher::checkReconfigCommandActions / checkReconfigCommandPreconditions
+        /// call Poco::JSON::Object::getArray("actions") / getObject("preconditions") and dereference the
+        /// returned Poco::SharedPtr without null checks -> remote SIGSEGV on malformed JSON like `rcfg {"actions": null}`!
+        Poco::JSON::Parser parser;
+        auto parsed = parser.parse(R"({"preconditions": null, "actions": null})");
+        auto reconfig_command = parsed.extract<Poco::JSON::Object::Ptr>();
+        require(reconfig_command->has("preconditions") && reconfig_command->has("actions"), "Expected keys present");
+
+        auto preconditions = reconfig_command->getObject("preconditions");
+        auto actions = reconfig_command->getArray("actions");
+        std::cerr << "[" << mode << "] preconditions.isNull()=" << preconditions.isNull()
+                  << " actions.isNull()=" << actions.isNull() << "\n";
+        bool threw_null_ptr = false;
+        try
+        {
+            for (const auto & action : *actions)
+                (void)action;
+        }
+        catch (const Poco::NullPointerException & e)
+        {
+            threw_null_ptr = true;
+            std::cerr << "[" << mode << "] REPRODUCED Poco::NullPointerException: " << e.displayText() << "\n";
+        }
+        require(threw_null_ptr, "Expected Poco::NullPointerException on null Poco::JSON::Array::Ptr");
+    }
+    else if (mode == "converter-session-digest-bug")
+    {
+        /// Bug #58: ZooKeeperDataReader::deserializeStorageData never updates storage.nodes_digest while
+        /// KeeperConverter enables digestEnabled(true), AND deserializeTxn handles CreateSession by calling
+        /// storage.getSessionID(timeout) instead of storage.addSessionID(session_id, timeout)!
+        require(!state_dir.empty(), "--state-dir is required for converter-session-digest-bug");
+        if (std::filesystem::exists(state_dir))
+            std::filesystem::remove_all(state_dir);
+        std::filesystem::create_directories(state_dir);
+
+        const auto snap_path = (state_dir / "snapshot.5").string();
+        {
+            DB::WriteBufferFromFile wb(snap_path);
+            Coordination::write(static_cast<int32_t>(1514885966), wb); // "ZKSN"
+            Coordination::write(static_cast<int32_t>(2), wb);          // version 2
+            Coordination::write(static_cast<int64_t>(0), wb);          // dbid
+            Coordination::write(static_cast<int32_t>(0), wb);          // 0 sessions
+            Coordination::write(static_cast<int32_t>(0), wb);          // 0 ACLs
+            /// Single persistent node "/snap_node" with data "hello"
+            Coordination::write(std::string("/snap_node"), wb);
+            Coordination::write(std::string("hello"), wb);
+            Coordination::write(static_cast<int64_t>(0), wb); // acl_id
+            Coordination::write(static_cast<int64_t>(2), wb); // czxid
+            Coordination::write(static_cast<int64_t>(2), wb); // mzxid
+            Coordination::write(static_cast<int64_t>(1000), wb); // ctime
+            Coordination::write(static_cast<int64_t>(1000), wb); // mtime
+            Coordination::write(static_cast<int32_t>(0), wb); // version
+            Coordination::write(static_cast<int32_t>(0), wb); // cversion
+            Coordination::write(static_cast<int32_t>(0), wb); // aversion
+            Coordination::write(static_cast<int64_t>(0), wb); // ephemeralOwner
+            Coordination::write(static_cast<int64_t>(2), wb); // pzxid
+            /// Terminator "/"
+            Coordination::write(std::string("/"), wb);
+            wb.finalize();
+        }
+
+        const int64_t zk_session_id = 0x10005;
+        const auto log_path = (state_dir / "log.6").string();
+        {
+            DB::WriteBufferFromFile wb(log_path);
+            Coordination::write(static_cast<int32_t>(1514884167), wb); // "ZKLG"
+            Coordination::write(static_cast<int32_t>(2), wb);          // version 2
+            Coordination::write(static_cast<int64_t>(0), wb);          // dbid
+
+            auto write_txn = [&](int64_t sid, int32_t xid, int64_t zxid, int64_t time, int32_t type, const std::string & body)
+            {
+                DB::WriteBufferFromOwnString rec;
+                Coordination::write(sid, rec);
+                Coordination::write(xid, rec);
+                Coordination::write(zxid, rec);
+                Coordination::write(time, rec);
+                Coordination::write(type, rec);
+                rec.write(body.data(), body.size());
+                const std::string payload = rec.str();
+                Coordination::write(static_cast<int64_t>(1), wb); // non-zero checksum
+                Coordination::write(static_cast<int32_t>(payload.size()), wb);
+                wb.write(payload.data(), payload.size());
+                Coordination::write(static_cast<int8_t>(0x42), wb); // ZK txn trailing 'B' sentinel
+            };
+
+            /// Txn 1 (zxid=6): CreateSession(type=-10) for zk_session_id=0x10005
+            {
+                DB::WriteBufferFromOwnString body;
+                Coordination::write(static_cast<int32_t>(30000), body);
+                write_txn(zk_session_id, 0, 6, 2000, -10, body.str());
+            }
+            /// Txn 2 (zxid=7): CreateTxn(type=1) ephemeral "/ephem" owned by zk_session_id=0x10005
+            {
+                DB::WriteBufferFromOwnString body;
+                Coordination::write(std::string("/ephem"), body);
+                Coordination::write(std::string("eph_val"), body);
+                Coordination::ACLs empty_acls;
+                Coordination::write(empty_acls, body);
+                Coordination::write(true, body);                // is_ephemeral
+                Coordination::write(static_cast<int32_t>(1), body); // parent_cversion
+                write_txn(zk_session_id, 1, 7, 2001, 1, body.str());
+            }
+            /// Zero checksum EOF padding
+            Coordination::write(static_cast<int64_t>(0), wb);
+            wb.finalize();
+        }
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setDigestEnabled(true);
+        auto storage = std::make_shared<DB::KeeperMemoryStorage>(500, "", ctx);
+        auto logger = getLogger("ConverterRepro");
+
+        DB::deserializeKeeperStorageFromSnapshot(*storage, snap_path, logger);
+        storage->initializeSystemNodes();
+        DB::deserializeLogAndApplyToStorage(*storage, log_path, logger);
+
+        const uint64_t stored_digest = storage->getNodesDigest(/*committed=*/true, /*lock_transaction_mutex=*/true).value;
+        uint64_t expected_digest = 0;
+        for (const auto & entry : storage->nodes.container)
+        {
+            if (entry.key != "/" && entry.key.starts_with(DB::keeper_system_path) && entry.key != DB::keeper_system_path)
+                continue;
+            expected_digest += entry.value.getDigest(entry.key);
+        }
+
+        const auto active_sessions = storage->getActiveSessions();
+        const int64_t real_sid_timeout = active_sessions.contains(zk_session_id) ? active_sessions.at(zk_session_id) : -1;
+        const int64_t bogus_sid_timeout = active_sessions.contains(1) ? active_sessions.at(1) : -1;
+
+        std::cerr << "[" << mode << "] REPRODUCED converter bugs:\n"
+                  << "  1) Digest mismatch: stored_digest=" << stored_digest
+                  << " vs expected_recalculated_digest=" << expected_digest << "\n"
+                  << "  2) Session ID corruption: CreateSession(0x" << std::hex << zk_session_id << std::dec
+                  << ", timeout=30000) allocated bogus session_id=1 (timeout=" << bogus_sid_timeout
+                  << ") while real session_id=0x" << std::hex << zk_session_id << std::dec
+                  << " got timeout=" << real_sid_timeout
+                  << " (0ms -> expires immediately!), committed_ephemerals.contains(0x10005)="
+                  << storage->committed_ephemerals.contains(zk_session_id) << "\n";
+        require(stored_digest != expected_digest, "Expected converter nodes_digest mismatch");
+        require(bogus_sid_timeout == 30000 && real_sid_timeout == 0 && storage->committed_ephemerals.contains(zk_session_id),
+            "Expected CreateSession to allocate bogus session_id=1 with 30000ms while real session gets timeout=0ms");
+    }
+    else if (mode == "recovery-prev-log-idx")
+    {
+        /// Bug #59: KeeperServer::enterRecoveryMode (KeeperServer.cpp:565-566) constructs
+        /// cluster_config(0, latest_config->get_log_idx()) and immediately calls set_log_idx(next_slot),
+        /// which executes `prev_log_idx_ = log_idx_; log_idx_ = new_log_idx;`, clobbering prev_log_idx to 0!
+        const uint64_t latest_config_log_idx = 42;
+        const uint64_t next_slot = 100;
+        nuraft::ptr<nuraft::cluster_config> new_config
+            = std::make_shared<nuraft::cluster_config>(0, latest_config_log_idx);
+        const uint64_t prev_before = new_config->get_prev_log_idx();
+        new_config->set_log_idx(next_slot);
+        const uint64_t prev_after = new_config->get_prev_log_idx();
+
+        std::cerr << "[" << mode << "] REPRODUCED enterRecoveryMode prev_log_idx clobber: "
+                  << "before set_log_idx(" << next_slot << "): prev_log_idx=" << prev_before
+                  << " -> after: log_idx=" << new_config->get_log_idx()
+                  << ", prev_log_idx=" << prev_after << " (expected " << latest_config_log_idx << "!)\n";
+        require(prev_before == latest_config_log_idx && prev_after == 0,
+            "Expected set_log_idx to overwrite prev_log_idx with 0");
+    }
+    else if (mode == "reconfig-remove-all-voters")
+    {
+        /// Bug #61: leavingToClusterUpdates counts learners as remaining servers (allowing removal of ALL voters
+        /// -> permanent quorum loss), and joiningToClusterUpdates accepts duplicate server IDs and duplicate endpoints!
+        auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "127.0.0.1:9001", "", /*learner=*/false, 1));
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(2, 0, "127.0.0.1:9002", "", /*learner=*/true, 1));
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(3, 0, "127.0.0.1:9003", "", /*learner=*/true, 1));
+
+        auto leave_actions = DB::leavingToClusterUpdates(cfg, "1");
+        auto join_and_leave_join = DB::joiningToClusterUpdates(cfg, "server.1=127.0.0.1:9001;participant;5");
+        auto dup_leave_rejected = DB::leavingToClusterUpdates(cfg, "1,1,1");
+
+        std::cerr << "[" << mode << "] REPRODUCED KeeperReconfiguration validation gaps:\n"
+                  << "  1) leavingToClusterUpdates removing ONLY voter (1) while 2 learners remain: actions=" << leave_actions.size() << "\n"
+                  << "  2) processReconfiguration validates joining+leaving independently: joining(update prio 1)="
+                  << join_and_leave_join.size() << " + leaving(1)=" << leave_actions.size() << " both accepted!\n"
+                  << "  3) leavingToClusterUpdates(\"1,1,1\") falsely rejected due to raw leaving_arr.size() >= servers.size(): actions="
+                  << dup_leave_rejected.size() << "\n";
+        require(leave_actions.size() == 1 && join_and_leave_join.size() == 1 && dup_leave_rejected.empty(),
+            "Expected all three KeeperReconfiguration validation bugs to reproduce");
+    }
+    else if (mode == "zk-node-cache-collision")
+    {
+        /// Bug #64: ZooKeeperNodeCache::get registers watches via
+        /// `zookeeper->createWatchFromRawCallback("ZooKeeperNodeCache::" + path, ...)`.
+        /// Because `IKeeper::watches_by_id` is session-global, a second ZooKeeperNodeCache on the same
+        /// shared ZooKeeper session (or a new instance after the first is destroyed) reuses the first
+        /// instance's callback, permanently missing invalidations and watch events!
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+        zk->create("/cached_key", "v1", zkutil::CreateMode::Persistent);
+
+        auto ev1 = std::make_shared<Poco::Event>();
+        auto ev2 = std::make_shared<Poco::Event>();
+        auto cache1 = std::make_unique<zkutil::ZooKeeperNodeCache>([&]() { return zk; });
+        zkutil::ZooKeeperNodeCache cache2([&]() { return zk; });
+
+        auto r1_before = cache1->get("/cached_key", ev1);
+        auto r2_before = cache2.get("/cached_key", ev2);
+        require(r1_before.exists && r1_before.contents == "v1", "Expected cache1 to see v1");
+        require(r2_before.exists && r2_before.contents == "v1", "Expected cache2 to see v1");
+
+        zk->set("/cached_key", "v2");
+
+        const bool ev1_set = ev1->tryWait(50);
+        const bool ev2_set = ev2->tryWait(50);
+        auto r1_after = cache1->get("/cached_key", ev1);
+        auto r2_after = cache2.get("/cached_key", ev2);
+
+        /// Destroy cache1, then create cache3 on the same session: watch callback is now a dead zombie!
+        cache1.reset();
+        auto ev3 = std::make_shared<Poco::Event>();
+        zkutil::ZooKeeperNodeCache cache3([&]() { return zk; });
+        auto r3_before = cache3.get("/cached_key", ev3);
+        require(r3_before.exists && r3_before.contents == "v2", "Expected cache3 initial fetch to see v2");
+        zk->set("/cached_key", "v3");
+        const bool ev3_set = ev3->tryWait(50);
+        auto r3_after = cache3.get("/cached_key", ev3);
+
+        std::cerr << "[" << mode << "] REPRODUCED ZooKeeperNodeCache watch-ID collision:\n"
+                  << "  1) Two live caches: cache1 got \"" << std::string_view(r1_after.contents) << "\" (ev1=" << ev1_set
+                  << "), cache2 STALE \"" << std::string_view(r2_after.contents) << "\" (ev2=" << ev2_set << ")!\n"
+                  << "  2) After cache1 destroyed (zombie callback): cache3 STALE \"" << std::string_view(r3_after.contents)
+                  << "\" vs actual \"v3\" (ev3=" << ev3_set << ")!\n";
+        require(std::string_view(r1_after.contents) == "v2" && ev1_set, "Expected cache1 to update");
+        require(std::string_view(r2_after.contents) == "v1" && !ev2_set, "Expected cache2 to remain permanently stale");
+        require(std::string_view(r3_after.contents) == "v2" && !ev3_set, "Expected cache3 to remain permanently stale due to zombie watch");
+    }
+    else if (mode == "zk-args-divzero")
+    {
+        /// Bug #65: ZooKeeperArgs::initFromKeeperSection (:348) and initFromKeeperServerSection (:161)
+        /// compute `thread_local_rng() % hosts.size()` without checking `!hosts.empty()` -> SIGFPE!
+        Poco::AutoPtr<Poco::Util::MapConfiguration> cfg(new Poco::Util::MapConfiguration());
+        cfg->setString("zookeeper.zookeeper_load_balancing", "round_robin");
+        std::cerr << "[" << mode << "] Constructing ZooKeeperArgs with load_balancing=round_robin and 0 hosts (expecting SIGFPE)...\n";
+        zkutil::ZooKeeperArgs args(*cfg, "zookeeper");
+        (void)args;
+        throw std::runtime_error("Expected SIGFPE in ZooKeeperArgs did not happen");
+    }
+    else if (mode == "http-4lw-bypass")
+    {
+        /// Bug #66: KeeperHTTPCommandsHandler::handleRequest (KeeperHTTPHandlerFactory.cpp:380-387)
+        /// checks FourLetterCommandFactory::isKnown(code) and executes get(code)->run() WITHOUT
+        /// checking FourLetterCommandFactory::isEnabled(code), bypassing four_letter_word_white_list!
+        struct MockCsnpCommand final : public DB::IFourLetterCommand
+        {
+            explicit MockCsnpCommand(DB::KeeperDispatcher & d) : DB::IFourLetterCommand(d) {}
+            String name() override { return "csnp"; }
+            String run() override { return "SNAPSHOT_TRIGGERED_DESPITE_WHITELIST"; }
+        };
+        auto & factory = DB::FourLetterCommandFactory::instance();
+        DB::KeeperDispatcher * dummy_dispatcher = nullptr;
+        DB::FourLetterCommandPtr cmd = std::make_shared<MockCsnpCommand>(*dummy_dispatcher);
+        factory.registerCommand(cmd);
+        factory.setInitialize(true);
+
+        const int32_t code = DB::IFourLetterCommand::toCode("csnp");
+        const bool is_known = factory.isKnown(code);
+        const bool is_enabled = factory.isEnabled(code);
+        std::string res;
+        if (is_known)
+            res = factory.get(code)->run();
+
+        std::cerr << "[" << mode << "] REPRODUCED KeeperHTTPCommandsHandler 4LW whitelist bypass: "
+                  << "cmd=\"csnp\" isKnown=" << is_known << " isEnabled=" << is_enabled
+                  << " yet factory.get(code)->run() returned \"" << res << "\"!\n";
+        require(is_known && !is_enabled && res == "SNAPSHOT_TRIGGERED_DESPITE_WHITELIST",
+            "Expected disabled 4LW command to execute via isKnown-only path");
+    }
+    else if (mode == "snp-scheduled-stuck-on-throw")
+    {
+        /// Bug #67: NuRaft raft_server::snapshot_and_compact (handle_commit.cxx:876-884)
+        /// catches std::exception from state_machine_->create_snapshot and resets snp_in_progress_,
+        /// but NEVER resets snp_creation_scheduled_ or resolves sched_snp_creation_result_!
+        struct ThrowingSnapshotSM final : public nuraft::state_machine
+        {
+            std::atomic<uint64_t> last_committed{0};
+            std::atomic<int> create_snapshot_calls{0};
+            bool should_throw = true;
+            nuraft::ptr<nuraft::buffer> commit(const nuraft::ulong log_idx, nuraft::buffer &) override
+            {
+                last_committed.store(log_idx);
+                return nullptr;
+            }
+            bool apply_snapshot(nuraft::snapshot &) override { return true; }
+            nuraft::ptr<nuraft::snapshot> last_snapshot() override { return nullptr; }
+            nuraft::ulong last_commit_index() override { return last_committed.load(); }
+            void create_snapshot(nuraft::snapshot &, nuraft::async_result<bool>::handler_type & when_done) override
+            {
+                create_snapshot_calls.fetch_add(1);
+                if (should_throw)
+                    throw std::runtime_error("simulated snapshot creation exception");
+                nuraft::ptr<std::exception> no_err;
+                bool ok = true;
+                when_done(ok, no_err);
+            }
+        };
+
+        struct OneNodeStateMgr final : public nuraft::state_mgr
+        {
+            nuraft::ptr<nuraft::cluster_config> cfg;
+            nuraft::ptr<nuraft::srv_state> st;
+            nuraft::ptr<nuraft::log_store> logs;
+            OneNodeStateMgr()
+                : cfg(nuraft::cs_new<nuraft::cluster_config>(1, 0))
+                , st(nuraft::cs_new<nuraft::srv_state>())
+                , logs(nuraft::cs_new<DB::InMemoryLogStore>())
+            {
+                cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "1", "", false, 1));
+            }
+            nuraft::ptr<nuraft::cluster_config> load_config() override { return cfg; }
+            void save_config(const nuraft::cluster_config & c) override
+            {
+                auto b = c.serialize();
+                cfg = nuraft::cluster_config::deserialize(*b);
+            }
+            void save_state(const nuraft::srv_state & s) override
+            {
+                auto b = s.serialize();
+                st = nuraft::srv_state::deserialize(*b);
+            }
+            nuraft::ptr<nuraft::srv_state> read_state() override { return st; }
+            nuraft::ptr<nuraft::log_store> load_log_store() override { return logs; }
+            nuraft::int32 server_id() override { return 1; }
+            void system_exit(const int) override {}
+        };
+
+        g_sim_seed = 1;
+        g_sim_time_ns = 1'000'000'000LL;
+        g_virtual_time_enabled = true;
+        SimEngine engine(1, 0, "");
+        SimNetwork net(engine);
+        auto timers = nuraft::cs_new<SimTimers>(1, 1, engine);
+        auto rpc_factory = nuraft::cs_new<SimRpcFactory>(net);
+        auto sm = nuraft::cs_new<ThrowingSnapshotSM>();
+        auto mgr = nuraft::cs_new<OneNodeStateMgr>();
+        nuraft::raft_params params;
+        params.heart_beat_interval_ = 50;
+        params.election_timeout_lower_bound_ = 100;
+        params.election_timeout_upper_bound_ = 200;
+        params.snapshot_distance_ = 10000;
+        params.return_method_ = nuraft::raft_params::async_handler;
+        params.use_bg_thread_for_urgent_commit_ = false;
+
+        auto * ctx = new nuraft::context(
+            mgr, sm,
+            {},
+            nullptr,
+            rpc_factory,
+            timers,
+            params,
+            &net);
+        auto srv = nuraft::cs_new<SimRaftServer>(ctx);
+        net.registerServer(1, srv, 1);
+        srv->start_server(false);
+        auto drive_commits = [&]()
+        {
+            for (int i = 0; i < 10; ++i)
+            {
+                srv->appendStep();
+                srv->commitStep();
+            }
+            engine.runUntilMs(simTimeMs() + 100);
+            srv->commitStep();
+        };
+        require(engine.runUntilCondition(1000, [&]()
+        {
+            srv->commitStep();
+            return srv->is_leader();
+        }), "1-node raft_server failed to become leader");
+        drive_commits();
+
+        /// Schedule a snapshot creation; then commit entry 1 where create_snapshot throws!
+        auto sched_res1 = srv->schedule_snapshot_creation();
+        require(sched_res1 != nullptr, "First schedule_snapshot_creation unexpectedly returned nullptr");
+
+        auto append_one = [&]()
+        {
+            auto b = nuraft::buffer::alloc(4);
+            b->put(static_cast<nuraft::int32>(123));
+            b->pos(0);
+            std::vector<nuraft::ptr<nuraft::buffer>> v{b};
+            srv->append_entries(v);
+            drive_commits();
+        };
+        append_one();
+        const int calls_after_1 = sm->create_snapshot_calls.load();
+        const bool res1_ready = sched_res1->has_result();
+        auto sched_res2 = srv->schedule_snapshot_creation();
+
+        /// Commit another entry (snapshot_distance = 10000!): snp_creation_scheduled_ is STILL true,
+        /// so NuRaft triggers create_snapshot AGAIN on every single commit!
+        append_one();
+        const int calls_after_2 = sm->create_snapshot_calls.load();
+
+        std::cerr << "[" << mode << "] REPRODUCED snp_creation_scheduled_ permanently wedged on throw:\n"
+                  << "  1) After 1st commit (create_snapshot threw): calls=" << calls_after_1
+                  << ", sched_res1->has_result()=" << res1_ready << " (caller hangs forever!)\n"
+                  << "  2) Second schedule_snapshot_creation() returned "
+                  << (sched_res2 ? "non-null" : "nullptr (permanently rejected!)") << "\n"
+                  << "  3) After 2nd commit (snapshot_distance=10000): create_snapshot called AGAIN (calls="
+                  << calls_after_2 << ")!\n";
+        net.unregisterServer(1);
+        timers->cancelAll();
+        srv->shutdown();
+        require(calls_after_1 == 1 && !res1_ready && sched_res2 == nullptr && calls_after_2 == 2,
+            "Expected snp_creation_scheduled_ to stay wedged after create_snapshot exception");
+    }
+    else if (mode == "tcp-compressed-poll-hang")
+    {
+        /// Bug #69: KeeperTCPHandler passes raw `*in` to SocketInterruptablePollWrapper::poll(session_timeout, *in),
+        /// checking `in.available() != 0` and ignoring `compressed_in->available()`.
+        /// When 2 pipelined ZooKeeper requests arrive inside a single LZ4 compressed block, reading Request 1
+        /// consumes the entire compressed block from `*in` (`in.available() == 0`), while Request 2 remains
+        /// buffered inside `compressed_in` (`compressed_in.available() > 0`) -> poll() blocks until session_timeout!
+        DB::WriteBufferFromOwnString wire;
+        {
+            DB::CompressedWriteBuffer comp_out(wire, DB::CompressionCodecFactory::instance().get("LZ4", {}));
+            for (int32_t xid = 1; xid <= 2; ++xid)
+            {
+                Coordination::ZooKeeperHeartbeatRequest hb;
+                hb.xid = xid;
+                hb.write(comp_out, /*use_xid_64=*/false);
+            }
+            comp_out.finalize();
+        }
+        const std::string compressed_payload = wire.str();
+        DB::ReadBufferFromString raw_in(compressed_payload);
+        DB::CompressedReadBuffer compressed_in(raw_in);
+
+        /// Read Request 1 (length + xid + opnum) from compressed_in.
+        int32_t len1 = 0, xid1 = 0;
+        Coordination::OpNum op1 = {};
+        Coordination::read(len1, compressed_in);
+        Coordination::read(xid1, compressed_in);
+        Coordination::read(op1, compressed_in);
+
+        const size_t raw_avail = raw_in.available();
+        const size_t comp_avail = compressed_in.available();
+        std::cerr << "[" << mode << "] REPRODUCED KeeperTCPHandler poll() blind to compressed_in:\n"
+                  << "  After reading Request 1 (xid=" << xid1 << ", len=" << len1 << "):\n"
+                  << "  raw_in.available()=" << raw_avail << " (poll() thinks NO requests are buffered and blocks for session_timeout!)\n"
+                  << "  compressed_in.available()=" << comp_avail << " bytes (Request 2 is sitting right there!)\n";
+        require(xid1 == 1 && raw_avail == 0 && comp_avail > 0,
+            "Expected raw_in.available()==0 while compressed_in.available()>0");
+    }
+    else if (mode == "dumper-null-entry")
+    {
+        /// Bug #70: KeeperDataDumper (KeeperDataDumper.cpp:105-107) iterates
+        /// `for (size_t i = last_commited_index + 1; i < changelog.next_slot(); ++i)` and unconditionally
+        /// dereferences `changelog.entry_at(i)->get_val_type()` -> SIGSEGV whenever changelog.start_index() > last_commited_index + 1!
+        require(!state_dir.empty(), "--state-dir is required for dumper-null-entry");
+        if (std::filesystem::exists(state_dir))
+            std::filesystem::remove_all(state_dir);
+        std::filesystem::create_directories(state_dir);
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setLogDisk(std::make_shared<DB::DiskLocal>("dumper_log", state_dir.string() + "/"));
+
+        DB::LogFileSettings log_settings;
+        log_settings.rotate_interval = 3;
+        log_settings.force_sync = false;
+        log_settings.compress_logs = false;
+        log_settings.startup_read_max_streams = 1;
+        DB::FlushSettings flush_settings;
+        flush_settings.max_flush_batch_size = 1;
+        flush_settings.min_time_between_fsyncs_ms = 0;
+        DB::ReadAheadSettings ra_settings;
+        ra_settings.enabled = false;
+        ra_settings.commit_window_bytes = 0;
+
+        DB::KeeperLogStore store(log_settings, flush_settings, ra_settings, ctx, DB::Changelog::ExecutionMode::Manual);
+        store.init(0, 100);
+        for (int i = 1; i <= 6; ++i)
+        {
+            auto buf = nuraft::buffer::alloc(4);
+            buf->put(static_cast<nuraft::int32>(i));
+            buf->pos(0);
+            auto le = nuraft::cs_new<nuraft::log_entry>(1, buf, nuraft::log_val_type::app_log);
+            store.append(le);
+        }
+        store.flush();
+        store.compact(4);
+        while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+        {
+        }
+
+        const uint64_t last_committed_index = 2;
+        auto entry_at_gap = store.entry_at(last_committed_index + 1);
+        std::cerr << "[" << mode << "] REPRODUCED KeeperDataDumper null deref condition: "
+                  << "last_committed_index=" << last_committed_index
+                  << ", changelog.start_index()=" << store.start_index()
+                  << ", changelog.next_slot()=" << store.next_slot()
+                  << ", changelog.entry_at(" << (last_committed_index + 1) << ")="
+                  << (entry_at_gap ? "non-null" : "nullptr (-> immediate SIGSEGV on ->get_val_type()!)") << "\n";
+        store.shutdownChangelog();
+        require(entry_at_gap == nullptr && store.next_slot() == 7,
+            "Expected entry_at(last_committed_index + 1) to be nullptr");
+    }
+    else if (mode == "cli-empty-string-arg")
+    {
+        /// Bug #81: KeeperClientCLI parseKeeperArg (src/Common/ZooKeeper/KeeperClientCLI/Parser.cpp:120-121)
+        /// returns false whenever `result.empty()`, rejecting explicitly quoted empty string literals
+        /// (`set /foo ''`, `set /foo ""`, `create /bar ''`).
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+        zk->create("/foo", "non_empty", zkutil::CreateMode::Persistent);
+
+        std::ostringstream out;
+        std::ostringstream err;
+        DB::KeeperClientBase client(out, err);
+        client.zookeeper = zk;
+        client.ask_confirmation = false;
+
+        client.processQueryText("set /foo ''");
+        const std::string err_single = err.str();
+        err.str("");
+        err.clear();
+
+        client.processQueryText("set /foo \"\"");
+        const std::string err_double = err.str();
+        err.str("");
+        err.clear();
+
+        client.processQueryText("create /bar ''");
+        const std::string err_create = err.str();
+
+        const std::string foo_val = zk->get("/foo");
+        const bool bar_exists = zk->exists("/bar");
+
+        std::cerr << "[" << mode << "] REPRODUCED KeeperClientCLI parseKeeperArg rejecting quoted empty string:\n"
+                  << "  `set /foo ''` failed (foo still=\"" << foo_val << "\"), syntax_err_nonempty=" << !err_single.empty() << "\n"
+                  << "  `set /foo \"\"` failed (foo still=\"" << foo_val << "\"), syntax_err_nonempty=" << !err_double.empty() << "\n"
+                  << "  `create /bar ''` failed (bar_exists=" << bar_exists << "), syntax_err_nonempty=" << !err_create.empty() << "\n";
+        require(foo_val == "non_empty" && !bar_exists && !err_single.empty() && !err_double.empty() && !err_create.empty(),
+            "Expected set/create with quoted empty string to fail parsing");
+    }
+    else if (mode == "keeper-client-poco-node-keys")
+    {
+        /// Bug #72: programs/keeper-client/KeeperClient.cpp:675 checks `if (key != "node") continue;`,
+        /// dropping `node[1]`, `node[2]`, ... returned by Poco XMLConfiguration, and :97 passes
+        /// `secure://localhost:9281` directly to DNSResolver::splitHostAndPort (throws "Port must be numeric"!).
+        std::istringstream xml(R"XML(
+<clickhouse>
+  <zookeeper>
+    <node><host>k1</host><port>9181</port></node>
+    <node><host>k2</host><port>9181</port></node>
+    <node><host>k3</host><port>9181</port></node>
+  </zookeeper>
+</clickhouse>
+)XML");
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(xml));
+        Poco::Util::AbstractConfiguration::Keys keys;
+        cfg->keys("zookeeper", keys);
+        size_t matched_exact = 0;
+        size_t matched_prefix = 0;
+        for (const auto & k : keys)
+        {
+            if (k == "node")
+                ++matched_exact;
+            if (k.starts_with("node"))
+                ++matched_prefix;
+        }
+        bool split_threw = false;
+        std::string split_err;
+        try
+        {
+            auto parsed = DB::DNSResolver::splitHostAndPort("secure://localhost:9281");
+            (void)parsed;
+        }
+        catch (const DB::Exception & e)
+        {
+            split_threw = true;
+            split_err = e.message();
+        }
+        std::cerr << "[" << mode << "] REPRODUCED keeper-client config & --secure 4LW bugs:\n"
+                  << "  Poco keys(\"zookeeper\") count=" << keys.size()
+                  << " (key==\"node\" matched " << matched_exact << "/" << matched_prefix << " replicas!)\n"
+                  << "  DNSResolver::splitHostAndPort(\"secure://localhost:9281\") threw: \""
+                  << split_err << "\" (every 4LW fails under --secure!)\n";
+        require(keys.size() == 3 && matched_exact == 1 && matched_prefix == 3 && split_threw,
+            "Expected exact match to drop 2/3 nodes and splitHostAndPort to throw on secure://");
+    }
+    else if (mode == "wait-for-disappear-collision")
+    {
+        /// Bug #77: ZooKeeper::waitForDisappear (src/Common/ZooKeeper/ZooKeeper.cpp:1398-1410) uses
+        /// session-global watch ID `"ZooKeeper::waitForDisappear::" + path`, capturing Call 1's `state`
+        /// permanently in `watches_by_id`. On Call 2 for the same path, watch events write to Call 1's
+        /// dead `state`, so Call 2's `state->event` is NEVER signaled (stalls 1000ms & misses delete+recreate!).
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+
+        /// Call 1: succeeds immediately when node is deleted after 30ms.
+        zk->create("/lock", "owner1", zkutil::CreateMode::Persistent);
+        std::thread del1([&]()
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            zk->remove("/lock");
+        });
+        auto t1_start = std::chrono::steady_clock::now();
+        const bool res1 = zk->waitForDisappear("/lock", {});
+        auto t1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1_start).count();
+        del1.join();
+
+        /// Call 2 on the SAME path & session: node is deleted at 30ms and immediately recreated at 60ms!
+        /// A healthy watch wakes Call 2 at ~30ms with Event::DELETED and returns true.
+        /// Because Call 2 reuses Call 1's dead callback, Call 2 NEVER wakes on the watch, misses the
+        /// deletion entirely, sees the recreated node on the 1000ms poll, and only exits when condition() stops it!
+        zk->create("/lock", "owner2", zkutil::CreateMode::Persistent);
+        std::atomic<bool> stop_cond{false};
+        std::thread churn2([&]()
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            zk->remove("/lock");
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            zk->create("/lock", "owner3", zkutil::CreateMode::Persistent);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            stop_cond.store(true);
+        });
+        auto t2_start = std::chrono::steady_clock::now();
+        const bool res2 = zk->waitForDisappear("/lock", [&]() { return stop_cond.load(); });
+        auto t2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t2_start).count();
+        churn2.join();
+
+        std::cerr << "[" << mode << "] REPRODUCED ZooKeeper::waitForDisappear watch-ID collision:\n"
+                  << "  Call 1: returned=" << res1 << " in " << t1_ms << "ms (woke immediately on DELETED watch)\n"
+                  << "  Call 2: returned=" << res2 << " in " << t2_ms << "ms (MISSED DELETED watch at 30ms and stalled full 1000ms timeout!)\n";
+        require(res1 && !res2 && t2_ms >= 900,
+            "Expected Call 1 to wake immediately and Call 2 to miss the DELETED event and stall >=900ms");
+    }
+    else if (mode == "connection-stats-min-latency")
+    {
+        /// Bug #79: KeeperConnectionStats::resetLatency initializes `min_latency = 0` (uint64_t),
+        /// and updateLatency checks `while (prev_val > latency_ms && ...)`, which is ALWAYS false
+        /// since `0 > latency_ms` is impossible for unsigned uint64_t -> min_latency is stuck at 0 forever!
+        DB::KeeperConnectionStats stats;
+        stats.updateLatency(50);
+        stats.updateLatency(120);
+        stats.updateLatency(25);
+        const uint64_t min_lat = stats.getMinLatency();
+        const uint64_t max_lat = stats.getMaxLatency();
+        const uint64_t avg_lat = stats.getAvgLatency();
+        const uint64_t last_lat = stats.getLastLatency();
+
+        std::cerr << "[" << mode << "] REPRODUCED KeeperConnectionStats::min_latency stuck at 0:\n"
+                  << "  After updateLatency(50), (120), (25): min=" << min_lat
+                  << " (expected 25!), max=" << max_lat << ", avg=" << avg_lat << ", last=" << last_lat << "\n";
+        require(min_lat == 0 && max_lat == 120 && avg_lat == 65 && last_lat == 25,
+            "Expected min_latency to remain stuck at 0 despite non-zero latency samples");
+    }
+    else if (mode == "testkeeper-self-join")
+    {
+        /// Bug #82: TestKeeperSetRequest::process (TestKeeper.cpp:710-715) never updates stat.dataLength
+        /// and erroneously increments parent.stat.cversion; and TestKeeper::processingThread catch (...)
+        /// calls finalize() -> processing_thread.join() from inside processing_thread -> std::terminate!
+        DB::ServerUUID::setRandomForUnitTests();
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+        zk->create("/node", "hi", zkutil::CreateMode::Persistent);
+        Coordination::Stat root_before{};
+        zk->exists("/", &root_before);
+        Coordination::Stat stat_after{};
+        zk->set("/node", "much_longer_payload_value", -1, &stat_after);
+        Coordination::Stat root_after{};
+        zk->exists("/", &root_after);
+
+        std::cerr << "[" << mode << "] REPRODUCED TestKeeperSetRequest stat bugs:\n"
+                  << "  After set(\"/node\", 25 bytes): stat.dataLength=" << stat_after.dataLength
+                  << " (expected 25, still stale 2!), parent cversion " << root_before.cversion
+                  << " -> " << root_after.cversion << " (should NOT change on set!)\n";
+        require(stat_after.dataLength == 2 && root_after.cversion == root_before.cversion + 1,
+            "Expected stale dataLength=2 and bogus parent cversion increment");
+
+        /// Now trigger TestKeeper::processingThread self-join std::terminate by passing relative path "bad":
+        std::cerr << "[" << mode << "] Sending relative path \"bad\" to TestKeeper (expecting self-join std::terminate SIGABRT)...\n";
+        std::cerr.flush();
+        auto f = zk->asyncGet("bad");
+        (void)f.get();
+    }
+    else if (mode == "state-mgr-old-path-and-corrupt")
+    {
+        /// Bug #75: KeeperStateManager::getOldServerStatePath (:404) caches a function-local static
+        /// across instances; read_state (:503, :513-517) rethrows CORRUPTED_DATA in non-NDEBUG builds
+        /// instead of recovering from the intact -OLD backup; parseServersConfiguration (:274) allows
+        /// an all-observer (can_become_leader=false) cluster config.
+        require(!state_dir.empty(), "--state-dir is required for state-mgr-old-path-and-corrupt");
+        if (std::filesystem::exists(state_dir))
+            std::filesystem::remove_all(state_dir);
+        std::filesystem::create_directories(state_dir);
+        std::filesystem::create_directories(state_dir / "logs_a");
+        std::filesystem::create_directories(state_dir / "logs_b");
+
+        auto make_cfg = [](bool all_observers)
+        {
+            Poco::AutoPtr<Poco::Util::MapConfiguration> cfg(new Poco::Util::MapConfiguration());
+            cfg->setInt("keeper_server.raft_configuration.server.id", 1);
+            cfg->setString("keeper_server.raft_configuration.server.hostname", "127.0.0.1");
+            cfg->setInt("keeper_server.raft_configuration.server.port", 19234);
+            cfg->setBool("keeper_server.raft_configuration.server.can_become_leader", !all_observers);
+            cfg->setBool("keeper_server.hostname_checks_enabled", false);
+            return cfg;
+        };
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto state_disk = std::make_shared<DB::DiskLocal>("state_disk", state_dir.string() + "/");
+
+        auto ctx_a = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx_a->setStateFileDisk(state_disk);
+        ctx_a->setLogDisk(std::make_shared<DB::DiskLocal>("logs_a", (state_dir / "logs_a").string() + "/"));
+
+        auto ctx_b = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx_b->setStateFileDisk(state_disk);
+        ctx_b->setLogDisk(std::make_shared<DB::DiskLocal>("logs_b", (state_dir / "logs_b").string() + "/"));
+
+        /// Part 1: All-observer cluster config accepted without error
+        auto cfg_obs = make_cfg(/*all_observers=*/true);
+        DB::KeeperStateManager obs_mgr(1, "keeper_server", "state_obs", *cfg_obs, ctx_a);
+        const bool obs_accepted_all_learners = obs_mgr.load_config()->get_servers().front()->is_learner();
+
+        /// Part 2: static getOldServerStatePath() poisons instance B with "state_a-OLD"
+        auto cfg_normal = make_cfg(/*all_observers=*/false);
+        DB::KeeperStateManager mgr_a(1, "keeper_server", "state_a", *cfg_normal, ctx_a);
+        DB::KeeperStateManager mgr_b(1, "keeper_server", "state_b", *cfg_normal, ctx_b);
+        mgr_a.loadLogStore(0, 100);
+        mgr_b.loadLogStore(0, 100);
+
+        nuraft::srv_state s1;
+        s1.set_term(5);
+        s1.set_voted_for(1);
+        mgr_a.save_state(s1);
+        /// Now mgr_a has initialized static `old_path = "state_a-OLD"`.
+        /// Save valid state_a-OLD backup on disk, then corrupt state_a to test read_state recovery.
+        state_disk->copyFile("state_a", *state_disk, "state_a-OLD", DB::ReadSettings{});
+        {
+            auto wb = state_disk->writeFile("state_a", DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteMode::Rewrite, DB::WriteSettings{});
+            std::string garbage = "CORRUPTED_STATE_FILE_BYTES_1234567890";
+            wb->write(garbage.data(), garbage.size());
+            wb->finalize();
+        }
+        bool threw_instead_of_recovering = false;
+        std::string read_err;
+        try
+        {
+            auto recovered = mgr_a.read_state();
+            (void)recovered;
+        }
+        catch (const DB::Exception & e)
+        {
+            threw_instead_of_recovering = true;
+            read_err = e.message();
+        }
+
+        /// Now put a valid state_b-OLD backup on disk, and verify mgr_b.read_state() IGNORES state_b-OLD
+        /// and instead reads/consumes state_a-OLD (returning mgr_a's term=5)!
+        state_disk->removeFileIfExists("state_a");
+        state_disk->removeFileIfExists("state_b");
+        mgr_b.save_state(s1); /// creates state_b (term=5)
+        nuraft::srv_state s2;
+        s2.set_term(99);
+        s2.set_voted_for(1);
+        mgr_b.save_state(s2); /// writes state_b (term=99) and deletes state_a-OLD (NOT state_b-OLD!)!
+        const bool state_a_old_deleted_by_b = !state_disk->existsFile("state_a-OLD");
+
+        mgr_a.flushAndShutDownLogStore();
+        mgr_b.flushAndShutDownLogStore();
+
+        std::cerr << "[" << mode << "] REPRODUCED KeeperStateManager bugs:\n"
+                  << "  1) All-observer cluster accepted: is_learner=" << obs_accepted_all_learners << "\n"
+                  << "  2) mgr_b.save_state(\"state_b\") deleted mgr_a's \"state_a-OLD\" via function-local static: "
+                  << state_a_old_deleted_by_b << "\n"
+                  << "  3) mgr_a.read_state() on corrupted state_a with intact state_a-OLD threw instead of recovering: "
+                  << threw_instead_of_recovering << " (" << read_err << ")\n";
+        require(obs_accepted_all_learners && state_a_old_deleted_by_b,
+            "Expected all-observer acceptance and cross-instance static old_path deletion");
+    }
+    else if (mode == "keeper-utils-opnum-enum")
+    {
+        /// Bug #77: programs/keeper-utils/KeeperUtils.cpp:444-472 hardcodes `op_num_enum` missing 11 valid
+        /// Coordination::OpNum values -> changelog-deserializer --output-file --with-requests throws UNKNOWN_ELEMENT_OF_ENUM!
+        auto op_num_enum = std::make_shared<DB::DataTypeEnum16>(DB::DataTypeEnum16::Values
+        {
+            {"Watch", 0},
+            {"Close", static_cast<Int16>(Coordination::OpNum::Close)},
+            {"Error", static_cast<Int16>(Coordination::OpNum::Error)},
+            {"Create", static_cast<Int16>(Coordination::OpNum::Create)},
+            {"Remove", static_cast<Int16>(Coordination::OpNum::Remove)},
+            {"Exists", static_cast<Int16>(Coordination::OpNum::Exists)},
+            {"Reconfig", static_cast<Int16>(Coordination::OpNum::Reconfig)},
+            {"Get", static_cast<Int16>(Coordination::OpNum::Get)},
+            {"Set", static_cast<Int16>(Coordination::OpNum::Set)},
+            {"GetACL", static_cast<Int16>(Coordination::OpNum::GetACL)},
+            {"SetACL", static_cast<Int16>(Coordination::OpNum::SetACL)},
+            {"SimpleList", static_cast<Int16>(Coordination::OpNum::SimpleList)},
+            {"Sync", static_cast<Int16>(Coordination::OpNum::Sync)},
+            {"Heartbeat", static_cast<Int16>(Coordination::OpNum::Heartbeat)},
+            {"List", static_cast<Int16>(Coordination::OpNum::List)},
+            {"Check", static_cast<Int16>(Coordination::OpNum::Check)},
+            {"Multi", static_cast<Int16>(Coordination::OpNum::Multi)},
+            {"MultiRead", static_cast<Int16>(Coordination::OpNum::MultiRead)},
+            {"Auth", static_cast<Int16>(Coordination::OpNum::Auth)},
+            {"SessionID", static_cast<Int16>(Coordination::OpNum::SessionID)},
+            {"FilteredList", static_cast<Int16>(Coordination::OpNum::FilteredList)},
+            {"ListWithOptions", static_cast<Int16>(Coordination::OpNum::ListWithOptions)},
+            {"CheckNotExists", static_cast<Int16>(Coordination::OpNum::CheckNotExists)},
+            {"CreateIfNotExists", static_cast<Int16>(Coordination::OpNum::CreateIfNotExists)},
+            {"RemoveRecursive", static_cast<Int16>(Coordination::OpNum::RemoveRecursive)},
+            {"CheckStat", static_cast<Int16>(Coordination::OpNum::CheckStat)},
+        });
+
+        const std::array<Coordination::OpNum, 11> missing_ops = {
+            Coordination::OpNum::Create2,
+            Coordination::OpNum::CreateContainer,
+            Coordination::OpNum::CreateTTL,
+            Coordination::OpNum::TryRemove,
+            Coordination::OpNum::ListRecursive,
+            Coordination::OpNum::AddWatch,
+            Coordination::OpNum::RemoveWatch,
+            Coordination::OpNum::SetWatch,
+            Coordination::OpNum::SetWatch2,
+            Coordination::OpNum::CheckWatch,
+            Coordination::OpNum::FilteredListWithStatsAndData,
+        };
+
+        size_t missing_count = 0;
+        for (auto op : missing_ops)
+        {
+            try
+            {
+                (void)op_num_enum->getNameForValue(static_cast<Int16>(op));
+            }
+            catch (const DB::Exception &)
+            {
+                ++missing_count;
+            }
+        }
+        std::cerr << "[" << mode << "] REPRODUCED keeper-utils op_num_enum missing "
+                  << missing_count << "/" << missing_ops.size()
+                  << " valid Coordination::OpNum values (throws UNKNOWN_ELEMENT_OF_ENUM during formatting)!\n";
+        require(missing_count == missing_ops.size(), "Expected all 11 OpNum values to be missing from op_num_enum");
+    }
+    else if (mode == "watch-empty-session-leak")
+    {
+        /// Live repro for Bug #83 (`src/Coordination/KeeperStorage.cpp:211-248`):
+        /// `WatchEvents::collectAndRemove` and `collectAndRemoveIf` erase a fired one-shot watch from
+        /// `sessions_and_watchers[session_id]` without erasing the `session_id` key when its set becomes empty.
+        /// Consequently `getStorageStats().sessions_with_watches_count` remains > 0 while `total_watches_count == 0`,
+        /// and `dumpWatches` (`wchc`) emits empty session entries until session close!
+        auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+        ctx->setDigestEnabled(true);
+        const auto work_dir = state_dir.empty() ? (std::filesystem::path("tmp") / "repro_w24_watch") : state_dir;
+        std::error_code ec;
+        std::filesystem::remove_all(work_dir, ec);
+        std::filesystem::create_directories(work_dir / "snapshots");
+        ctx->setSnapshotDisk(std::make_shared<DB::DiskLocal>("SnapDisk", (work_dir / "snapshots").string()));
+
+        std::optional<DB::KeeperResponseForSession> captured;
+        auto on_resp = [&captured](DB::KeeperResponseForSession r)
+        {
+            if (r.response && r.response->xid != Coordination::WATCH_XID)
+                captured = std::move(r);
+        };
+        DB::SnapshotsQueue sq(16);
+        DB::KeeperStateMachine sm(on_resp, sq, ctx, nullptr, {}, "");
+        sm.init();
+        uint64_t log_idx = 0;
+
+        for (int s = 1; s <= 2; ++s)
+        {
+            auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+            sreq->xid = s;
+            sreq->session_timeout_ms = 60000;
+            auto r = keeper_sim::feature_tests_detail::applyDirect(sm, log_idx, -1, sreq, 1000, captured);
+            require(r && r->error == Coordination::Error::ZOK, "SessionID failed");
+        }
+
+        auto create_req = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        create_req->path = "/watched";
+        create_req->data = "v1";
+        create_req->xid = 1;
+        auto create_res = keeper_sim::feature_tests_detail::applyDirect(sm, log_idx, /*sid=*/1, create_req, 1000, captured);
+        require(create_res && create_res->error == Coordination::Error::ZOK, "Create /watched failed");
+
+        auto get_req = std::make_shared<Coordination::ZooKeeperGetRequest>();
+        get_req->path = "/watched";
+        get_req->has_watch = true;
+        get_req->xid = 2;
+        auto get_res = keeper_sim::feature_tests_detail::readDirect(sm, /*sid=*/1, get_req, 1001, captured);
+        require(get_res && get_res->error == Coordination::Error::ZOK, "Get /watched with watch failed");
+
+        const auto before_st = sm.getStorageStats();
+        require(before_st.total_watches_count == 1 && before_st.sessions_with_watches_count == 1 && before_st.watched_paths_count == 1,
+            "Expected 1 active watch before firing");
+
+        auto set_req = std::make_shared<Coordination::ZooKeeperSetRequest>();
+        set_req->path = "/watched";
+        set_req->data = "v2";
+        set_req->xid = 3;
+        auto set_res = keeper_sim::feature_tests_detail::applyDirect(sm, log_idx, /*sid=*/2, set_req, 1002, captured);
+        require(set_res && set_res->error == Coordination::Error::ZOK, "Set /watched failed");
+
+        const auto after_st = sm.getStorageStats();
+        DB::WriteBufferFromOwnString dump_buf;
+        sm.dumpWatches(dump_buf);
+        const std::string dump_str = dump_buf.str();
+
+        std::cerr << "[" << mode << "] REPRODUCED WatchEvents::collectAndRemove empty session leak:\n"
+                  << "  Before fire: total_watches=" << before_st.total_watches_count
+                  << " sessions_with_watches=" << before_st.sessions_with_watches_count
+                  << " watched_paths=" << before_st.watched_paths_count << "\n"
+                  << "  After fire:  total_watches=" << after_st.total_watches_count
+                  << " sessions_with_watches=" << after_st.sessions_with_watches_count
+                  << " watched_paths=" << after_st.watched_paths_count << "\n"
+                  << "  wchc dumpWatches(): \"" << dump_str << "\"\n";
+        require(after_st.total_watches_count == 0
+            && after_st.watched_paths_count == 0
+            && after_st.sessions_with_watches_count == 1
+            && dump_str.find("0x0000000000000001") != std::string::npos,
+            "Did not reproduce empty session entry leak in sessions_and_watchers");
+    }
+    else
+    {
+        throw std::runtime_error("Unknown --repro-keeper mode: " + mode);
     }
 }
 
@@ -612,8 +2475,13 @@ int main(int argc, char ** argv)
         bool same_path_multi_churn = false;
         bool snapshot_versions_mix = false;
         bool autofwd_missing_leader = false;
+        bool check_node_acl_on_remove = false;
+        bool block_acl = false;
+        bool enable_superdigest = false;
+        bool feature_tests = false;
         size_t repro_nested_multi_depth = 0;
         std::string repro_nuraft_mode;
+        std::string repro_keeper_mode;
         bool strict_raft_commit = false;
         bool unsafe_quorum_control = false;
         bool instrumentation_control = false;
@@ -626,20 +2494,33 @@ int main(int argc, char ** argv)
 
         bool swarm_mode = false;
         std::string swarm_suite = "quick";
-        size_t swarm_workers = 4;
+        size_t swarm_workers = 0;
+        uint64_t swarm_seed_offset = 0;
         std::filesystem::path swarm_output;
+        std::filesystem::path junit_xml_path;
 
         for (int i = 1; i < argc; ++i)
         {
             const std::string opt = argv[i];
-            if (opt == "--swarm")
+            if (opt == "--ci")
+            {
+                swarm_mode = true;
+                swarm_suite = "ci";
+            }
+            else if (opt == "--swarm")
                 swarm_mode = true;
             else if (opt == "--suite" && i + 1 < argc)
                 swarm_suite = argv[++i];
             else if (opt == "--workers" && i + 1 < argc)
                 swarm_workers = std::stoul(argv[++i]);
+            else if (opt == "--seed-offset" && i + 1 < argc)
+                swarm_seed_offset = std::stoull(argv[++i]);
             else if (opt == "--output" && i + 1 < argc)
                 swarm_output = argv[++i];
+            else if (opt == "--junit-xml" && i + 1 < argc)
+                junit_xml_path = argv[++i];
+            else if (opt == "--feature-tests")
+                feature_tests = true;
             else if (opt == "--seed" && i + 1 < argc)
                 seed = std::stoull(argv[++i]);
             else if (opt == "--nodes" && i + 1 < argc)
@@ -743,10 +2624,18 @@ int main(int argc, char ** argv)
                 snapshot_versions_mix = true;
             else if (opt == "--autofwd-missing-leader")
                 autofwd_missing_leader = true;
+            else if (opt == "--check-node-acl-on-remove")
+                check_node_acl_on_remove = true;
+            else if (opt == "--block-acl")
+                block_acl = true;
+            else if (opt == "--superdigest")
+                enable_superdigest = true;
             else if (opt == "--repro-nested-multi" && i + 1 < argc)
                 repro_nested_multi_depth = std::stoull(argv[++i]);
             else if (opt == "--repro-nuraft" && i + 1 < argc)
                 repro_nuraft_mode = argv[++i];
+            else if (opt == "--repro-keeper" && i + 1 < argc)
+                repro_keeper_mode = argv[++i];
             else if (opt == "--buggify")
                 enable_buggify = true;
             else if (opt == "--no-buggify")
@@ -784,8 +2673,18 @@ int main(int argc, char ** argv)
 
         if (swarm_mode)
         {
-            keeper_sim::require(!swarm_output.empty(), "--swarm requires --output <dir>");
-            return keeper_sim::SimSwarmRunner::run(argv[0], swarm_suite, swarm_output, swarm_workers, strict_raft_commit);
+            if (swarm_output.empty())
+                swarm_output = std::filesystem::path("tmp") / ("keeper_sim_" + swarm_suite);
+            return keeper_sim::SimSwarmRunner::run(
+                argv[0], swarm_suite, swarm_output, swarm_workers, strict_raft_commit, swarm_seed_offset, junit_xml_path);
+        }
+
+        if (feature_tests)
+        {
+            if (state_dir.empty())
+                state_dir = std::filesystem::path("tmp") / "keeper_sim_feature_tests";
+            keeper_sim::runKeeperFeatureTests(state_dir);
+            return 0;
         }
 
         if (repro_nested_multi_depth > 0)
@@ -797,6 +2696,12 @@ int main(int argc, char ** argv)
         if (!repro_nuraft_mode.empty())
         {
             runNuRaftLiveRepro(repro_nuraft_mode, state_dir, seed, nuraft_log_level);
+            return 0;
+        }
+
+        if (!repro_keeper_mode.empty())
+        {
+            runKeeperLiveRepro(repro_keeper_mode, state_dir);
             return 0;
         }
 
@@ -867,7 +2772,10 @@ int main(int argc, char ** argv)
             huge_lsmt_values,
             same_path_multi_churn,
             snapshot_versions_mix,
-            autofwd_missing_leader);
+            autofwd_missing_leader,
+            check_node_acl_on_remove,
+            block_acl,
+            enable_superdigest);
 
         ClusterConfig cluster_cfg;
         cluster_cfg.num_nodes = num_nodes;
