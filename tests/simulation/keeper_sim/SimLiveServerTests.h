@@ -1,13 +1,16 @@
 #pragma once
 
-/// Live single-node ClickHouse Keeper server/dispatcher/TCP/HTTP/4LW integration tests.
-/// Executed in an isolated child process (`--live-server-tests`, automatically invoked by `--ci`)
-/// with virtual POSIX time disabled so real `KeeperDispatcher`, `KeeperRequestDispatcher`,
-/// `KeeperRequestDispatcherOld`, `KeeperServer`, `KeeperStateManager`, `SessionExpiryQueue`,
-/// `KeeperReadThreadPool`, `FourLetterCommandFactory` (all non-jemalloc 4LW commands + `rcfg`),
-/// `KeeperOverDispatcher`, `KeeperTCPHandler` (plain + LZ4 compression + XID64 + 4LW + limits),
-/// and `KeeperHTTP*` (`/ready`, `/dashboard/content`, `/api/v1/commands`, `/api/v1/storage`)
-/// are exercised end-to-end on ephemeral loopback ports in ~0.5-1.5s!
+/// Live single-node, 2-node, and 3-node/4-node ClickHouse Keeper integration test suites.
+/// Executed in parallel isolated child processes (`--live-server-tests --live-suite <name>`,
+/// automatically invoked by `--ci`) with virtual POSIX time disabled and disjoint loopback port blocks
+/// so real `KeeperDispatcher`, `KeeperRequestDispatcher`, `KeeperRequestDispatcherOld`, `KeeperServer`,
+/// `KeeperStateManager`, `SessionExpiryQueue`, `KeeperReadThreadPool`, `FourLetterCommandFactory`
+/// (all 28+ 4LW commands + `rcfg`), `KeeperOverDispatcher`, `KeeperTCPHandler` (plain, LZ4, XID64,
+/// OpenTelemetry tracing, TLS 1.3, password auth, `chroot`, session timeout clamping, `SessionExpired`,
+/// cross-client watches, `read_during_close`), `KeeperHTTP*`, client helpers (`ZooKeeperLock`,
+/// `ZooKeeperNodeCache`, `ZooKeeperCachingGetter`, `ZooKeeperRetriesControl`, `path_acls`, AZ preference),
+/// multi-node LSMT-Disk, chunked `InstallSnapshot`, `forceRecovery`, and TLS Raft peers are exercised
+/// end-to-end in ~10s wall-clock.
 
 #include <SimClock.h>
 
@@ -181,16 +184,55 @@ inline Poco::AutoPtr<Poco::Util::XMLConfiguration> makeLiveKeeperConfig(
     return new Poco::Util::XMLConfiguration(iss);
 }
 
-inline void waitUntilActiveLeader(DB::KeeperDispatcher & dispatcher, int timeout_ms = 5000)
+inline void shutdownDispatcher(std::shared_ptr<DB::KeeperDispatcher> & d)
+{
+    if (!d)
+        return;
+    d->signalShutdown();
+    d->beginTCPConnectionDrain();
+    d->shutdownBeforeConnectionsFinish();
+    d->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    d.reset();
+}
+
+template <typename Pred>
+inline void waitUntil(int timeout_ms, Pred && pred, const std::string & msg)
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline)
     {
-        if (dispatcher.checkInit() && dispatcher.isServerActive() && dispatcher.isLeader())
+        if (pred())
             return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
-    require(false, "Live KeeperDispatcher did not become active leader within timeout");
+    throw std::runtime_error(msg);
+}
+
+inline std::shared_ptr<zkutil::ZooKeeper> makeOverDispatcherClient(
+    const std::shared_ptr<DB::KeeperDispatcher> & d, int timeout_s = 10)
+{
+    return zkutil::ZooKeeper::createFromImpl([d, timeout_s]()
+    {
+        return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(timeout_s, 0));
+    });
+}
+
+inline void runRcfgCommand(DB::KeeperDispatcher & leader, const std::string & json_cmd, const std::string & label)
+{
+    Poco::JSON::Parser parser;
+    auto obj = parser.parse(json_cmd).extract<Poco::JSON::Object::Ptr>();
+    auto res = leader.reconfigureClusterFromReconfigureCommand(obj);
+    std::ostringstream res_ss;
+    Poco::JSON::Stringifier::stringify(res, res_ss);
+    require(!res.isNull() && res_ss.str().find("error") == std::string::npos, label + " failed: " + res_ss.str());
+}
+
+inline void waitUntilActiveLeader(DB::KeeperDispatcher & dispatcher, int timeout_ms = 5000)
+{
+    waitUntil(
+        timeout_ms,
+        [&]() { return dispatcher.checkInit() && dispatcher.isServerActive() && dispatcher.isLeader(); },
+        "Live KeeperDispatcher did not become active leader within timeout");
 }
 
 inline std::string sendRawTCPFourLetterWord(uint16_t port, const std::string & cmd)
@@ -242,6 +284,38 @@ inline LiveHTTPResult sendLoopbackHTTP(
     std::ostringstream oss;
     Poco::StreamCopier::copyStream(is, oss);
     return LiveHTTPResult{static_cast<int>(resp.getStatus()), oss.str()};
+}
+
+/// Raw-wire HTTP/1.1 `HEAD` probe (`Connection: close`): `Poco::Net::HTTPClientSession`
+/// forces a zero-length stream for `HEAD` and silently ignores illegal response bodies on the wire,
+/// so read the actual bytes after `\r\n\r\n` directly from the TCP socket.
+inline LiveHTTPResult sendRawLoopbackHTTPHead(uint16_t port, const std::string & uri)
+{
+    Poco::Net::StreamSocket sock(Poco::Net::SocketAddress("127.0.0.1", port));
+    sock.setReceiveTimeout(Poco::Timespan(5, 0));
+    sock.setSendTimeout(Poco::Timespan(5, 0));
+    const std::string req = "HEAD " + uri + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port)
+        + "\r\nConnection: close\r\n\r\n";
+    const int sent = sock.sendBytes(req.data(), static_cast<int>(req.size()));
+    require(sent == static_cast<int>(req.size()), "Raw HTTP HEAD short send for " + uri);
+
+    std::string raw;
+    char buf[4096];
+    for (;;)
+    {
+        const int n = sock.receiveBytes(buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        raw.append(buf, static_cast<size_t>(n));
+    }
+    sock.close();
+
+    const size_t sep = raw.find("\r\n\r\n");
+    require(sep != std::string::npos, "Raw HTTP HEAD missing header terminator for " + uri);
+    const size_t sp1 = raw.find(' ');
+    require(sp1 != std::string::npos && sp1 + 4 <= sep, "Raw HTTP HEAD malformed status line for " + uri);
+    const int status = std::stoi(raw.substr(sp1 + 1, 3));
+    return LiveHTTPResult{status, raw.substr(sep + 4)};
 }
 
 struct SimHTTPContext final : public DB::IHTTPContext
@@ -521,10 +595,7 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
         }
         /// Test `KeeperOverDispatcher` direct in-process `zkutil::ZooKeeper` client!
         {
-            auto zk_over_disp = zkutil::ZooKeeper::createFromImpl([dispatcher]()
-            {
-                return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher, Poco::Timespan(10, 0));
-            });
+            auto zk_over_disp = makeOverDispatcherClient(dispatcher);
             zk_over_disp->create("/over_disp", "inproc-val", zkutil::CreateMode::Persistent);
             require(zk_over_disp->get("/over_disp") == "inproc-val", "KeeperOverDispatcher get mismatch");
             zk_over_disp->set("/over_disp", "inproc-v2");
@@ -671,10 +742,7 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
     {
         auto keeper_http_client = std::make_shared<DB::KeeperHTTPClient>([dispatcher]() -> std::shared_ptr<zkutil::ZooKeeper>
         {
-            return zkutil::ZooKeeper::createFromImpl([dispatcher]()
-            {
-                return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher, Poco::Timespan(10, 0));
-            });
+            return makeOverDispatcherClient(dispatcher);
         });
 
         auto main_factory = std::make_shared<DB::KeeperHTTPRequestHandlerFactory>("SimKeeperHTTP");
@@ -749,12 +817,25 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
         DB::HTTPServer http_server(http_ctx, main_factory, server_pool, http_socket, http_params);
         http_server.start();
 
-        /// 1. Readiness endpoint `/ready`
+        std::vector<std::string> head_violations;
+        auto check_head_empty = [&](const std::string & uri, const std::string & tag)
+        {
+            auto r_head = sendRawLoopbackHTTPHead(http_port, uri);
+            if (r_head.status != 200 || !r_head.body.empty())
+            {
+                head_violations.push_back(
+                    "HTTP HEAD " + uri + " (" + tag + ") status=" + std::to_string(r_head.status)
+                    + " wire_body_bytes=" + std::to_string(r_head.body.size()));
+            }
+        };
+
+        /// 1. Readiness endpoint `/ready` (GET + RFC 9110 HEAD empty-body check, #135025)
         {
             auto r = sendLoopbackHTTP(http_port, "GET", "/ready");
             require(r.status == 200 && r.body.find("\"status\":\"ok\"") != std::string::npos
                 && (r.body.find("\"role\":\"standalone\"") != std::string::npos || r.body.find("\"role\":\"leader\"") != std::string::npos),
                 "HTTP /ready failed: status=" + std::to_string(r.status) + " body=" + r.body);
+            check_head_empty("/ready", "#135025");
         }
         /// 2. Dashboard HTML (`/dashboard`), Dashboard JSON (`/dashboard/content`), Jemalloc UI/Status, and 404 hints
         {
@@ -772,11 +853,12 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
             require(r_404.status == 404 && r_404.body.find("/dashboard") != std::string::npos,
                 "HTTP KeeperNotFoundHandler 404 hints failed: status=" + std::to_string(r_404.status));
         }
-        /// 3. Commands endpoint `/api/v1/commands` (both 4LW `ruok` and KeeperClientCLI `ls /`)
+        /// 3. Commands endpoint `/api/v1/commands` (both 4LW `ruok`, KeeperClientCLI `ls /`, and HEAD empty-body check)
         {
             auto r1 = sendLoopbackHTTP(http_port, "GET", "/api/v1/commands?command=ruok");
             require(r1.status == 200 && r1.body.find("imok") != std::string::npos,
                 "HTTP /api/v1/commands ruok failed: " + r1.body);
+            check_head_empty("/api/v1/commands?command=ruok", "#135025");
             auto r2 = sendLoopbackHTTP(http_port, "GET", "/api/v1/commands?command=ls%20/");
             require(r2.status == 200 && r2.body.find("keeper") != std::string::npos,
                 "HTTP /api/v1/commands ls failed: " + r2.body);
@@ -790,6 +872,8 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
             require(r_get.status == 200 && r_get.body.find("http-v1") != std::string::npos,
                 "HTTP GET /api/v1/storage/http_key failed: " + r_get.body);
 
+            check_head_empty("/api/v1/storage/http_key", "Bug #63");
+
             auto r_put = sendLoopbackHTTP(http_port, "PUT", "/api/v1/storage/http_key?version=0", "http-v2");
             require(r_put.status == 200, "HTTP PUT /api/v1/storage/http_key expected 200, got " + std::to_string(r_put.status));
 
@@ -802,16 +886,21 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
 
             auto r_gone = sendLoopbackHTTP(http_port, "GET", "/api/v1/storage/http_key");
             require(r_gone.status == 404, "HTTP GET deleted key expected 404, got " + std::to_string(r_gone.status));
+
+            if (!head_violations.empty())
+            {
+                std::string msg = "RFC 9110 HTTP HEAD sent non-empty wire body:";
+                for (const auto & v : head_violations)
+                    msg += " [" + v + "]";
+                throw std::runtime_error(msg);
+            }
         }
 
         http_server.stopAll(/*abort_current=*/true);
     }
     std::cout << "  [PASS] live: http_handlers_readiness_dashboard_commands_and_storage\n";
 
-    dispatcher->signalShutdown();
-    dispatcher->beginTCPConnectionDrain();
-    dispatcher->shutdownBeforeConnectionsFinish();
-    dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    shutdownDispatcher(dispatcher);
 }
 
 /// 4. Live `KeeperDispatcher` with legacy `KeeperRequestDispatcherOld` (`use_new_dispatcher = false`).
@@ -872,10 +961,7 @@ inline void testLiveDispatcherOldLifecycle(const std::filesystem::path & root_di
     }
 
     dispatcher->finishSession(sid);
-    dispatcher->signalShutdown();
-    dispatcher->beginTCPConnectionDrain();
-    dispatcher->shutdownBeforeConnectionsFinish();
-    dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    shutdownDispatcher(dispatcher);
     std::cout << "  [PASS] live: dispatcher_old_lifecycle\n";
 }
 
@@ -1040,10 +1126,7 @@ inline void testLiveTCPPasswordAuthAndTLS(const std::filesystem::path & root_dir
     }
 #endif
 
-    dispatcher->signalShutdown();
-    dispatcher->beginTCPConnectionDrain();
-    dispatcher->shutdownBeforeConnectionsFinish();
-    dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    shutdownDispatcher(dispatcher);
     std::cout << "  [PASS] live: tcp_password_auth_and_tls_secure_socket\n";
 }
 
@@ -1124,21 +1207,9 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
         return -1;
     };
 
-    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            if (pred())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-        require(false, msg);
-    };
-
     /// Wait for 1 leader + 2 active followers.
     int leader_idx = -1;
-    wait_until(8000, [&]()
+    waitUntil(8000, [&]()
     {
         leader_idx = find_leader_idx();
         if (leader_idx < 0)
@@ -1154,21 +1225,15 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
 
     /// 1. Follower -> Leader forwarding via real `KeeperRequestDispatcher` (`client_req_stream`) + local follower read!
     {
-        auto zk_follower = zkutil::ZooKeeper::createFromImpl([d = nodes[follower_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_follower = makeOverDispatcherClient(nodes[follower_idx]);
         zk_follower->create("/forwarded_from_follower", "fwd-v1", zkutil::CreateMode::Persistent);
         require(zk_follower->get("/forwarded_from_follower") == "fwd-v1", "Follower read-after-write mismatch");
 
         /// Verify leader sees the write and reports 2 synced followers in 4LW & cluster members info.
-        auto zk_leader = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_leader = makeOverDispatcherClient(nodes[leader_idx]);
         require(zk_leader->get("/forwarded_from_follower") == "fwd-v1", "Leader did not observe follower-forwarded write");
 
-        wait_until(5000, [&]()
+        waitUntil(5000, [&]()
         {
             const auto info = nodes[leader_idx]->getKeeper4LWInfo();
             return info.follower_count == 2 && info.synced_follower_count == 2;
@@ -1226,13 +1291,7 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
         Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg4(new Poco::Util::XMLConfiguration(iss4));
         auto node4 = std::make_shared<DB::KeeperDispatcher>();
         SCOPE_EXIT({
-            if (node4)
-            {
-                node4->signalShutdown();
-                node4->beginTCPConnectionDrain();
-                node4->shutdownBeforeConnectionsFinish();
-                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            }
+            shutdownDispatcher(node4);
         });
         node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
 
@@ -1242,21 +1301,12 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
             js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
                << R"(","learner":false,"priority":1}]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg add_members(4) failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg add_members(4)");
         }
-        wait_until(8000, [&]() { return node4->isServerActive() && node4->isFollower(); },
+        waitUntil(8000, [&]() { return node4->isServerActive() && node4->isFollower(); },
             "Dynamically added Node 4 did not become active follower");
         {
-            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
-            {
-                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
-            });
+            auto zk4 = makeOverDispatcherClient(node4);
             require(zk4->get("/forwarded_from_follower") == "fwd-v1", "Dynamically added Node 4 missing replicated key");
         }
         require(nodes[leader_idx]->getClusterMembersInfo().size() == 4, "Expected 4 members after add_members(4)");
@@ -1266,13 +1316,7 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
             std::ostringstream js;
             js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"remove_members":[4]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg remove_members(4) failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg remove_members(4)");
         }
         require(nodes[leader_idx]->getClusterMembersInfo().size() == 3, "Expected 3 members after remove_members(4)");
     }
@@ -1285,15 +1329,9 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
         js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << old_leader_id
            << R"(]},"actions":[{"set_priority":[{"id":)" << target_leader_id << R"(,"priority":2}]},{"transfer_leadership":[)"
            << target_leader_id << R"(]}]})";
-        Poco::JSON::Parser parser;
-        auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-        auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-        std::ostringstream res_ss;
-        Poco::JSON::Stringifier::stringify(res, res_ss);
-        require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-            "rcfg transfer_leadership failed: " + res_ss.str());
+        runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg transfer_leadership");
 
-        wait_until(8000, [&]() { return find_leader_idx() == follower_idx; },
+        waitUntil(8000, [&]() { return find_leader_idx() == follower_idx; },
             "Leadership did not transfer to target follower " + std::to_string(target_leader_id));
         leader_idx = follower_idx;
     }
@@ -1304,27 +1342,20 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
         {
             if (!nodes[idx])
                 return;
-            nodes[idx]->signalShutdown();
-            nodes[idx]->beginTCPConnectionDrain();
-            nodes[idx]->shutdownBeforeConnectionsFinish();
-            nodes[idx]->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            nodes[idx].reset();
+            shutdownDispatcher(nodes[idx]);
         };
 
         const int killed_leader = leader_idx;
         stop_node(killed_leader);
 
         int new_leader = -1;
-        wait_until(8000, [&]()
+        waitUntil(8000, [&]()
         {
             new_leader = find_leader_idx();
             return new_leader >= 0 && new_leader != killed_leader;
         }, "Remaining 2/3 nodes failed to elect a new leader after failover");
 
-        auto zk_surv = zkutil::ZooKeeper::createFromImpl([d = nodes[new_leader]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_surv = makeOverDispatcherClient(nodes[new_leader]);
         zk_surv->create("/after_failover", "survived-2of3", zkutil::CreateMode::Persistent);
         require(zk_surv->get("/after_failover") == "survived-2of3", "Write on surviving 2/3 majority failed");
 
@@ -1335,9 +1366,9 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
             auto cfg1 = make_node_cfg(1, /*single_node_local_only=*/false);
             nodes[0] = std::make_shared<DB::KeeperDispatcher>();
             nodes[0]->initialize(*cfg1, /*standalone_keeper=*/true, /*start_async=*/true, macros);
-            wait_until(8000, [&]() { return nodes[0]->isServerActive(); }, "Node 1 failed to rejoin before recovery test");
+            waitUntil(8000, [&]() { return nodes[0]->isServerActive(); }, "Node 1 failed to rejoin before recovery test");
         }
-        wait_until(5000, [&]()
+        waitUntil(5000, [&]()
         {
             const uint64_t l_idx = nodes[new_leader]->getKeeperLogInfo().last_committed_log_idx;
             return nodes[0]->getKeeperLogInfo().last_committed_log_idx >= l_idx;
@@ -1361,19 +1392,13 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
         node1->forceRecovery();
         waitUntilActiveLeader(*node1, 8000);
 
-        auto zk_rec = zkutil::ZooKeeper::createFromImpl([node1]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(node1, Poco::Timespan(10, 0));
-        });
+        auto zk_rec = makeOverDispatcherClient(node1);
         require(zk_rec->get("/forwarded_from_follower") == "fwd-v1", "forceRecovery lost /forwarded_from_follower");
         require(zk_rec->get("/after_failover") == "survived-2of3", "forceRecovery lost /after_failover");
         zk_rec->create("/after_force_recovery", "recovered-ok", zkutil::CreateMode::Persistent);
         require(zk_rec->get("/after_force_recovery") == "recovered-ok", "Write after forceRecovery failed");
 
-        node1->signalShutdown();
-        node1->beginTCPConnectionDrain();
-        node1->shutdownBeforeConnectionsFinish();
-        node1->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        shutdownDispatcher(node1);
     }
     std::cout << "  [PASS] live: 3node_forwarding_rcfg_failover_and_force_recovery\n";
 }
@@ -1429,14 +1454,7 @@ inline void testLive3NodeTLSRaftCluster(const std::filesystem::path & root_dir)
     SCOPE_EXIT({
         for (auto & n : nodes)
         {
-            if (n)
-            {
-                n->signalShutdown();
-                n->beginTCPConnectionDrain();
-                n->shutdownBeforeConnectionsFinish();
-                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-                n.reset();
-            }
+            shutdownDispatcher(n);
         }
     });
     for (int i = 0; i < 3; ++i)
@@ -1495,17 +1513,11 @@ inline void testLive3NodeTLSRaftCluster(const std::filesystem::path & root_dir)
     require(leader_idx >= 0, "3-node TLS Raft cluster did not elect leader with 2 followers");
 
     const int follower_idx = (leader_idx + 1) % 3;
-    auto zk_f = zkutil::ZooKeeper::createFromImpl([d = nodes[follower_idx]]()
-    {
-        return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-    });
+    auto zk_f = makeOverDispatcherClient(nodes[follower_idx]);
     zk_f->create("/tls_raft_key", "encrypted-raft-ok", zkutil::CreateMode::Persistent);
     require(zk_f->get("/tls_raft_key") == "encrypted-raft-ok", "TLS Raft follower read mismatch");
 
-    auto zk_l = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
-    {
-        return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-    });
+    auto zk_l = makeOverDispatcherClient(nodes[leader_idx]);
     require(zk_l->get("/tls_raft_key") == "encrypted-raft-ok", "TLS Raft leader read mismatch");
 
     /// Hot-reload TLS certificates on disk (`CertificateReloader::tryLoad` + `tryLoadClient`) and verify
@@ -1514,10 +1526,7 @@ inline void testLive3NodeTLSRaftCluster(const std::filesystem::path & root_dir)
         generateSelfSignedCertPem(cert_path, key_path);
         DB::CertificateReloader::instance().tryLoad(ssl_app.config());
         DB::CertificateReloader::instance().tryLoadClient(ssl_app.config());
-        auto zk_after_reload = zkutil::ZooKeeper::createFromImpl([d = nodes[follower_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_after_reload = makeOverDispatcherClient(nodes[follower_idx]);
         zk_after_reload->create("/tls_raft_after_cert_reload", "reloaded-cert-ok", zkutil::CreateMode::Persistent);
         require(zk_after_reload->get("/tls_raft_after_cert_reload") == "reloaded-cert-ok",
             "TLS Raft cluster write after certificate reload failed");
@@ -1525,11 +1534,7 @@ inline void testLive3NodeTLSRaftCluster(const std::filesystem::path & root_dir)
 
     for (auto & n : nodes)
     {
-        n->signalShutdown();
-        n->beginTCPConnectionDrain();
-        n->shutdownBeforeConnectionsFinish();
-        n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-        n.reset();
+        shutdownDispatcher(n);
     }
 
     std::cout << "  [PASS] live: 3node_tls_encrypted_raft_peers\n";
@@ -1708,10 +1713,7 @@ inline void testLiveTCPSessionResumptionInvalidSessionAndCrossClientWatch(const 
 
     SCOPE_EXIT({
         tcp_server.stop();
-        dispatcher->signalShutdown();
-        dispatcher->beginTCPConnectionDrain();
-        dispatcher->shutdownBeforeConnectionsFinish();
-        dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        shutdownDispatcher(dispatcher);
     });
 
     auto recv_exact = [](Poco::Net::StreamSocket & sock, char * dst, size_t n) -> bool
@@ -1822,10 +1824,7 @@ inline void testLiveTCPSessionResumptionInvalidSessionAndCrossClientWatch(const 
         std::string rbody(static_cast<size_t>(rlen), '\0');
         require(recv_exact(s1, rbody.data(), rbody.size()), "Create response body missing");
 
-        auto zk_obs = zkutil::ZooKeeper::createFromImpl([dispatcher]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher, Poco::Timespan(10, 0));
-        });
+        auto zk_obs = makeOverDispatcherClient(dispatcher);
         require(zk_obs->get("/tcp_close_eph") == "alive", "Ephemeral node not visible over dispatcher");
 
         /// Send explicit `OpNum::Close` on Socket 1 -> ephemeral MUST be deleted promptly!
@@ -1932,10 +1931,7 @@ inline void testLiveClientHelpersLockNodeCacheCachingGetterAndMulti(const std::f
 
     SCOPE_EXIT({
         tcp_server.stop();
-        dispatcher->signalShutdown();
-        dispatcher->beginTCPConnectionDrain();
-        dispatcher->shutdownBeforeConnectionsFinish();
-        dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        shutdownDispatcher(dispatcher);
     });
 
     auto make_zk = [tcp_port]()
@@ -1986,6 +1982,19 @@ inline void testLiveClientHelpersLockNodeCacheCachingGetterAndMulti(const std::f
         require(ev->tryWait(3000), "NodeCache watch did not fire on remove");
         auto z3 = cache.get("/nc_node", ev);
         require(!z3.exists, "NodeCache did not observe deletion");
+
+        /// Two `ZooKeeperNodeCache` instances sharing one `ZooKeeper` session must BOTH observe updates (#135023).
+        zk2->create("/nc_shared", "s-v1", zkutil::CreateMode::Persistent);
+        zkutil::ZooKeeperNodeCache shared_c1([&]() { return zk1; });
+        zkutil::ZooKeeperNodeCache shared_c2([&]() { return zk1; });
+        auto ev_s1 = std::make_shared<Poco::Event>();
+        auto ev_s2 = std::make_shared<Poco::Event>();
+        require(shared_c1.get("/nc_shared", ev_s1).contents == "s-v1", "shared_c1 initial read failed");
+        require(shared_c2.get("/nc_shared", ev_s2).contents == "s-v1", "shared_c2 initial read failed");
+        zk2->set("/nc_shared", "s-v2");
+        require(ev_s1->tryWait(3000), "shared_c1 watch did not fire");
+        require(ev_s2->tryWait(3000) && shared_c2.get("/nc_shared", ev_s2).contents == "s-v2",
+            "Second ZooKeeperNodeCache on same session missed watch invalidation (#135023)");
     }
 
     /// 3. `zkutil::ZooKeeperCachingGetter` cache hit & `resetCache`.
@@ -2112,13 +2121,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
     SCOPE_EXIT({
         for (auto & n : nodes)
         {
-            if (n)
-            {
-                n->signalShutdown();
-                n->beginTCPConnectionDrain();
-                n->shutdownBeforeConnectionsFinish();
-                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            }
+            shutdownDispatcher(n);
         }
     });
 
@@ -2129,20 +2132,9 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
         nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
     }
 
-    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            if (pred())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-        throw std::runtime_error(msg);
-    };
 
     int leader_idx = -1;
-    wait_until(10000, [&]()
+    waitUntil(10000, [&]()
     {
         for (int i = 0; i < 3; ++i)
         {
@@ -2158,10 +2150,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
     /// Write 35 nodes + a 6 KB huge value forcing LSMT memtable flushes & sorted-run merges on disk!
     const std::string huge_val(6144, 'L');
     {
-        auto zk = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk = makeOverDispatcherClient(nodes[leader_idx]);
         zk->create("/lsmt_huge", huge_val, zkutil::CreateMode::Persistent);
         for (int i = 0; i < 35; ++i)
             zk->create("/lsmt_k" + std::to_string(i), std::string(180, static_cast<char>('a' + (i % 26))), zkutil::CreateMode::Persistent);
@@ -2174,13 +2163,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
         auto cfg4 = make_lsmt_cfg(4, false, 64, 2, raft_port4);
         auto node4 = std::make_shared<DB::KeeperDispatcher>();
         SCOPE_EXIT({
-            if (node4)
-            {
-                node4->signalShutdown();
-                node4->beginTCPConnectionDrain();
-                node4->shutdownBeforeConnectionsFinish();
-                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            }
+            shutdownDispatcher(node4);
         });
         node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
 
@@ -2189,16 +2172,10 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
             js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
                << R"(","learner":true,"priority":0}]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg add_members learner(4) failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg add_members learner(4)");
         }
 
-        wait_until(8000, [&]() { return node4->isServerActive() && node4->isObserver(); },
+        waitUntil(8000, [&]() { return node4->isServerActive() && node4->isObserver(); },
             "Dynamically added LSMT learner Node 4 did not become active observer");
         {
             const auto members = nodes[leader_idx]->getClusterMembersInfo();
@@ -2209,10 +2186,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
             require(found_observer, "Cluster members info did not report Node 4 as observer/learner");
         }
         {
-            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
-            {
-                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
-            });
+            auto zk4 = makeOverDispatcherClient(node4);
             require(zk4->get("/lsmt_huge") == huge_val, "LSMT learner Node 4 missing huge value");
         }
 
@@ -2221,13 +2195,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
             std::ostringstream js;
             js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"remove_members":[4]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg remove_members learner(4) failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg remove_members learner(4)");
         }
         require(nodes[leader_idx]->getClusterMembersInfo().size() == 3, "Expected 3 members after removing learner 4");
     }
@@ -2237,10 +2205,7 @@ inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::
         auto hot_cfg = make_lsmt_cfg(leader_idx + 1, /*quorum_reads_val=*/true, /*batch_size_val=*/32, /*read_threads_val=*/4);
         nodes[leader_idx]->updateConfiguration(*hot_cfg, macros);
 
-        auto zk = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk = makeOverDispatcherClient(nodes[leader_idx]);
         zk->create("/after_hot_reload", "quorum-ok", zkutil::CreateMode::Persistent);
         require(zk->get("/after_hot_reload") == "quorum-ok", "Quorum read after hot reload failed");
         require(zk->get("/lsmt_huge") == huge_val, "Huge quorum read after hot reload failed");
@@ -2282,10 +2247,7 @@ inline void testLiveTCPChrootIsolationAndRestartPersistence(const std::filesyste
         tcp_server.start();
         SCOPE_EXIT({
             tcp_server.stop();
-            dispatcher->signalShutdown();
-            dispatcher->beginTCPConnectionDrain();
-            dispatcher->shutdownBeforeConnectionsFinish();
-            dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            shutdownDispatcher(dispatcher);
         });
 
         zkutil::ZooKeeperArgs root_args("127.0.0.1:" + std::to_string(tcp_port));
@@ -2327,16 +2289,10 @@ inline void testLiveTCPChrootIsolationAndRestartPersistence(const std::filesyste
         dispatcher2->initialize(*config2, /*standalone_keeper=*/true, /*start_async=*/true, macros);
         waitUntilActiveLeader(*dispatcher2, 8000);
         SCOPE_EXIT({
-            dispatcher2->signalShutdown();
-            dispatcher2->beginTCPConnectionDrain();
-            dispatcher2->shutdownBeforeConnectionsFinish();
-            dispatcher2->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            shutdownDispatcher(dispatcher2);
         });
 
-        auto zk2 = zkutil::ZooKeeper::createFromImpl([dispatcher2]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher2, Poco::Timespan(10, 0));
-        });
+        auto zk2 = makeOverDispatcherClient(dispatcher2);
         require(zk2->get("/tenant_a/k1") == "v2", "Restart lost pre-snapshot /tenant_a/k1");
         require(zk2->get("/post_snap_delta") == "delta-alive", "Restart lost post-snapshot changelog delta");
         const std::string seq_next = zk2->create("/tenant_a/seq", "s1", zkutil::CreateMode::PersistentSequential);
@@ -2415,14 +2371,7 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
             tcp_servers[i]->stop();
             tcp_servers[i].reset();
         }
-        if (nodes[i])
-        {
-            nodes[i]->signalShutdown();
-            nodes[i]->beginTCPConnectionDrain();
-            nodes[i]->shutdownBeforeConnectionsFinish();
-            nodes[i]->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            nodes[i].reset();
-        }
+        shutdownDispatcher(nodes[i]);
     };
     SCOPE_EXIT({
         for (int i = 0; i < 3; ++i)
@@ -2446,17 +2395,6 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
         tcp_servers[i]->start();
     }
 
-    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            if (pred())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-        throw std::runtime_error(msg);
-    };
 
     auto find_leader = [&]() -> int
     {
@@ -2467,7 +2405,7 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
     };
 
     int leader_idx = -1;
-    wait_until(10000, [&]()
+    waitUntil(10000, [&]()
     {
         leader_idx = find_leader();
         return leader_idx >= 0;
@@ -2488,7 +2426,7 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
         zk->create("/snap_k" + std::to_string(i), "val-" + std::to_string(i), zkutil::CreateMode::Persistent);
     /// Ensure leader has compacted logs past index 1 so Node 4 MUST install a chunked snapshot!
     (void)nodes[leader_idx]->createSnapshot();
-    wait_until(5000, [&]()
+    waitUntil(5000, [&]()
     {
         return nodes[leader_idx]->getKeeperLogInfo().first_log_idx > 1;
     }, "Leader did not compact logs before Node 4 chunked InstallSnapshot join");
@@ -2499,13 +2437,7 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
         auto cfg4 = make_cfg(4, raft_port4);
         auto node4 = std::make_shared<DB::KeeperDispatcher>();
         SCOPE_EXIT({
-            if (node4)
-            {
-                node4->signalShutdown();
-                node4->beginTCPConnectionDrain();
-                node4->shutdownBeforeConnectionsFinish();
-                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            }
+            shutdownDispatcher(node4);
         });
         node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
 
@@ -2514,21 +2446,12 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
             js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
                << R"(","learner":false,"priority":1}]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg add_members(4) for chunked snapshot failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg add_members(4) for chunked snapshot");
         }
-        wait_until(10000, [&]() { return node4->isServerActive() && node4->isFollower(); },
+        waitUntil(10000, [&]() { return node4->isServerActive() && node4->isFollower(); },
             "Node 4 did not complete live chunked InstallSnapshot");
         {
-            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
-            {
-                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
-            });
+            auto zk4 = makeOverDispatcherClient(node4);
             require(zk4->get("/snap_big") == big_payload && zk4->get("/snap_k24") == "val-24",
                 "Node 4 missing snapshot-installed keys");
         }
@@ -2536,20 +2459,14 @@ inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const 
             std::ostringstream js;
             js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"remove_members":[4]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg remove_members(4) failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg remove_members(4)");
         }
     }
 
     /// Kill the leader's TCP listener + Dispatcher and verify multi-host `zkutil::ZooKeeper` + `ZooKeeperRetriesControl`
     /// fails over seamlessly to one of the 2 surviving nodes!
     stop_node(leader_idx);
-    wait_until(8000, [&]()
+    waitUntil(8000, [&]()
     {
         const int nl = find_leader();
         return nl >= 0 && nl != leader_idx;
@@ -2692,10 +2609,7 @@ inline void testLivePathACLsSnapshotOnExitDynamicLogLevelAndAZPreference(const s
     };
     require(count_snapshots() == 0, "Unexpected snapshot before shutdown despite snapshot_distance=100000");
 
-    dispatcher->signalShutdown();
-    dispatcher->beginTCPConnectionDrain();
-    dispatcher->shutdownBeforeConnectionsFinish();
-    dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    shutdownDispatcher(dispatcher);
     require(count_snapshots() >= 1, "create_snapshot_on_exit=true did not write a snapshot during clean shutdown");
 
     std::cout << "  [PASS] live: path_acls_snapshot_on_exit_dynamic_log_level_and_az_preference\n";
@@ -2753,13 +2667,7 @@ inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::f
     SCOPE_EXIT({
         for (auto & n : nodes)
         {
-            if (n)
-            {
-                n->signalShutdown();
-                n->beginTCPConnectionDrain();
-                n->shutdownBeforeConnectionsFinish();
-                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            }
+            shutdownDispatcher(n);
         }
     });
 
@@ -2770,17 +2678,6 @@ inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::f
         nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
     }
 
-    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            if (pred())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-        throw std::runtime_error(msg);
-    };
 
     auto find_leader = [&]() -> int
     {
@@ -2791,7 +2688,7 @@ inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::f
     };
 
     int leader_idx = -1;
-    wait_until(10000, [&]()
+    waitUntil(10000, [&]()
     {
         leader_idx = find_leader();
         return leader_idx >= 0;
@@ -2805,40 +2702,22 @@ inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::f
             std::ostringstream js;
             js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
                << R"(]},"actions":[{"remove_members":[)" << fol_id << R"(]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg remove follower failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg remove follower");
         }
-        auto zk_l = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_l = makeOverDispatcherClient(nodes[leader_idx]);
         zk_l->create("/while_removed", "written-while-out", zkutil::CreateMode::Persistent);
 
         {
             std::ostringstream js;
             js << R"({"actions":[{"add_members":[{"id":)" << fol_id << R"(,"endpoint":"127.0.0.1:)" << raft_ports[fol_idx]
                << R"(","learner":false,"priority":1}]}]})";
-            Poco::JSON::Parser parser;
-            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
-            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
-            std::ostringstream res_ss;
-            Poco::JSON::Stringifier::stringify(res, res_ss);
-            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
-                "rcfg re-add follower without restart failed: " + res_ss.str());
+            runRcfgCommand(*nodes[leader_idx], js.str(), "rcfg re-add follower without restart");
         }
-        wait_until(8000, [&]()
+        waitUntil(8000, [&]()
         {
             return nodes[fol_idx]->isServerActive() && nodes[fol_idx]->isFollower();
         }, "Rejoined follower did not become active without restart");
-        auto zk_f = zkutil::ZooKeeper::createFromImpl([d = nodes[fol_idx]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk_f = makeOverDispatcherClient(nodes[fol_idx]);
         require(zk_f->get("/while_removed") == "written-while-out", "Rejoined follower missed /while_removed");
     }
 
@@ -2871,16 +2750,13 @@ inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::f
             && rres.value.find("server." + std::to_string(old_leader_id) + "=") == std::string::npos,
             "Atomic leader replacement config mismatch: " + rres.value);
 
-        wait_until(10000, [&]()
+        waitUntil(10000, [&]()
         {
             const int nl = find_leader();
             return nl >= 0 && nl != old_leader_idx && nodes[3]->isServerActive();
         }, "New 3-node cluster without old leader did not stabilize");
 
-        auto zk4 = zkutil::ZooKeeper::createFromImpl([d = nodes[3]]()
-        {
-            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
-        });
+        auto zk4 = makeOverDispatcherClient(nodes[3]);
         require(zk4->get("/while_removed") == "written-while-out", "Replacement Node 4 missing prior state");
         zk4->create("/after_atomic_replace", "replaced-ok", zkutil::CreateMode::Persistent);
         require(zk4->get("/after_atomic_replace") == "replaced-ok", "Write after atomic leader replace failed");
@@ -2954,14 +2830,7 @@ inline void testLive2NodeClusterQuorumLossRecoveryAndReadDuringClose(const std::
 
     auto stop_node = [&](int i)
     {
-        if (nodes[i])
-        {
-            nodes[i]->signalShutdown();
-            nodes[i]->beginTCPConnectionDrain();
-            nodes[i]->shutdownBeforeConnectionsFinish();
-            nodes[i]->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
-            nodes[i].reset();
-        }
+        shutdownDispatcher(nodes[i]);
     };
     SCOPE_EXIT({
         tcp_server.stop();
@@ -2969,19 +2838,8 @@ inline void testLive2NodeClusterQuorumLossRecoveryAndReadDuringClose(const std::
         stop_node(1);
     });
 
-    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (std::chrono::steady_clock::now() < deadline)
-        {
-            if (pred())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-        throw std::runtime_error(msg);
-    };
 
-    wait_until(8000, [&]()
+    waitUntil(8000, [&]()
     {
         return nodes[0]->isServerActive() && nodes[1]->isServerActive()
             && (nodes[0]->isLeader() || nodes[1]->isLeader());
@@ -3019,7 +2877,7 @@ inline void testLive2NodeClusterQuorumLossRecoveryAndReadDuringClose(const std::
 
     nodes[1] = std::make_shared<DB::KeeperDispatcher>();
     nodes[1]->initialize(*cfg2, /*standalone_keeper=*/true, /*start_async=*/true, macros);
-    wait_until(8000, [&]()
+    waitUntil(8000, [&]()
     {
         return nodes[0]->isServerActive() && nodes[1]->isServerActive()
             && (nodes[0]->isLeader() || nodes[1]->isLeader());

@@ -970,6 +970,16 @@ inline void testReconfigParsingAndActions()
     require(DB::leavingToClusterUpdates(cfg, "99").empty(), "Unknown leaving server must be rejected");
     require(DB::leavingToClusterUpdates(cfg, "1,2,3").empty(), "Removing all servers must be rejected");
 
+    /// Removing the last voting member while learners remain must be rejected (#135022).
+    {
+        auto voter_learner_cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        voter_learner_cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "h1:9234", "", false, 1));
+        voter_learner_cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(2, 0, "h2:9234", "", true, 0));
+        voter_learner_cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(3, 0, "h3:9234", "", true, 0));
+        require(DB::leavingToClusterUpdates(voter_learner_cfg, "1").empty(),
+            "leavingToClusterUpdates must reject removing last voting member (#135022)");
+    }
+
     const std::string serialized = DB::serializeClusterConfig(cfg, join_add);
     require(serialized.find("server.4=h4:9234") != std::string::npos, "serializeClusterConfig missing added server");
     std::cout << "  [PASS] feature: reconfig_validation_and_config_parsing\n";
@@ -999,6 +1009,7 @@ inline void testFourLetterWordsAndStats(const std::filesystem::path & root_dir)
     require(conn_stats.getPacketsReceived() == 2, "KeeperConnectionStats packets_received mismatch");
     require(conn_stats.getPacketsSent() == 1, "KeeperConnectionStats packets_sent mismatch");
     require(conn_stats.getMaxLatency() == 45, "KeeperConnectionStats max_latency mismatch");
+    require(conn_stats.getMinLatency() == 15, "KeeperConnectionStats min_latency stuck at 0 (#135031)");
     require(conn_stats.getAvgLatency() == 30, "KeeperConnectionStats avg_latency mismatch");
     conn_stats.reset();
     require(conn_stats.getPacketsReceived() == 0 && conn_stats.getMaxLatency() == 0, "KeeperConnectionStats reset failed");
@@ -1207,6 +1218,26 @@ inline void testSessionExpiryStateManagerAndRaftParams(const std::filesystem::pa
         Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg2(new Poco::Util::XMLConfiguration(iss2));
         const auto diff = mgr.getRaftConfigurationDiff(*cfg2, *settings);
         require(diff.size() >= 3, "Expected >= 3 diff actions (add 4, remove 3, update 2), got " + std::to_string(diff.size()));
+
+        /// All-observer cluster configuration must be rejected (#135029).
+        const std::string xml_obs = R"(<clickhouse><keeper_server>
+            <server_id>1</server_id>
+            <raft_configuration>
+                <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port><can_become_leader>false</can_become_leader></server>
+            </raft_configuration>
+        </keeper_server></clickhouse>)";
+        std::istringstream iss_obs(xml_obs);
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg_obs(new Poco::Util::XMLConfiguration(iss_obs));
+        bool rejected_obs = false;
+        try
+        {
+            DB::KeeperStateManager obs_mgr(1, "keeper_server", "logs", *cfg_obs, ctx);
+        }
+        catch (const DB::Exception &)
+        {
+            rejected_obs = true;
+        }
+        require(rejected_obs, "KeeperStateManager accepted all-observer cluster configuration (#135029)");
     }
 
     /// Part C: `DB::buildRaftParams` translation from `CoordinationSettings`.
@@ -1307,7 +1338,7 @@ inline void testZooKeeperDataReaderMigration(const std::filesystem::path & root_
     }
 
     auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
-    ctx->setDigestEnabled(false);
+    ctx->setDigestEnabled(true);
     DB::KeeperMemoryStorage storage(500, "", ctx);
     auto logger = getLogger("SimFeatureZKReader");
     DB::deserializeKeeperStorageFromSnapshotsDir(storage, (dir / "snaps").string(), logger);
@@ -1320,6 +1351,9 @@ inline void testZooKeeperDataReaderMigration(const std::filesystem::path & root_
     auto it_child = storage.nodes.container.find("/zk_migrated/child");
     require(it_child != storage.nodes.container.end() && it_child->value.getData() == "child-val",
         "ZooKeeperDataReader failed to replay CreateTxn on /zk_migrated/child");
+    /// Migrated `nodes_digest` must match recalculated digest over all loaded nodes (#135020).
+    require(storage.getNodesDigest(true, false).value == storage.getNodesDigest(true, true).value,
+        "ZooKeeperDataReader migrated nodes_digest mismatch (#135020)");
     std::cout << "  [PASS] feature: zookeeper_data_reader_migration\n";
 }
 
@@ -1430,6 +1464,9 @@ inline void testKeeperClientCLICommands()
     require(run_cli("get /cli_dir/k1").find("v1") != std::string::npos, "CLI get /cli_dir/k1 failed");
     run_cli("set /cli_dir/k1 v2");
     require(run_cli("get /cli_dir/k1").find("v2") != std::string::npos, "CLI set /cli_dir/k1 failed");
+    /// Quoted empty string literal must be accepted by `parseKeeperArg` (Bug #81).
+    run_cli("set /cli_dir/k1 ''");
+    run_cli("set /cli_dir/k1 v2");
     require(run_cli("ls /cli_dir").find("k1") != std::string::npos, "CLI ls /cli_dir failed");
     require(run_cli("exists /cli_dir/k1").find("1") != std::string::npos, "CLI exists failed");
     require(run_cli("get_stat /cli_dir/k1").find("dataLength") != std::string::npos, "CLI get_stat failed");
@@ -1741,6 +1778,19 @@ inline void testPersistentAndRecursiveWatchSemantics(const std::filesystem::path
             require(readDirect(sm, 2, sw, t0, captured)->error == Coordination::Error::ZOK, "SetWatch failed");
         }
         require(!watch_events.empty(), "SetWatch with stale zxid=0 should fire missed event on /pw");
+
+        /// Verify one-shot watch firing cleans up empty session map entries (Bug #83).
+        {
+            auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g->xid = 42;
+            g->path = "/pw";
+            g->has_watch = true;
+            require(readDirect(sm, 2, g, t0, captured)->error == Coordination::Error::ZOK, "Get with watch failed");
+            mk_set("/pw", "trigger-clean", 43);
+            const auto st = sm.getStorageStats();
+            require(st.sessions_with_watches_count <= st.total_watches_count,
+                "WatchEvents::collectAndRemove leaked empty session entry (Bug #83)");
+        }
 
         watch_events.clear();
         {
@@ -2833,8 +2883,15 @@ inline void testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCou
             "ErrorCounter dumpToMapColumn row/entry count mismatch");
     }
 
-    /// 7. `DB::LoggerWrapper` valid levels (`fatal`..`trace` via `set_level` & `put_details`).
+    /// 7. `DB::LoggerWrapper` valid levels (`none`..`trace` via ctor, `set_level`, & `put_details`, Bug #86)
+    ///    and `nuraft::buffer::get_str` EOF bounds safety (`#135014`).
     {
+        auto b = nuraft::buffer::alloc(4);
+        b->pos(4);
+        (void)b->get_str();
+        require(b->pos() <= b->size(), "nuraft::buffer::get_str advanced pos past size at EOF (#135014)");
+
+        DB::LoggerWrapper lw_none("SimLoggerWrapperNone", DB::LogsLevel::none);
         DB::LoggerWrapper lw("SimLoggerWrapperTest", DB::LogsLevel::error);
         lw.set_level(static_cast<int>(DB::LogsLevel::warning));
         require(lw.get_level() == static_cast<int>(DB::LogsLevel::warning), "LoggerWrapper get_level mismatch");
@@ -3171,32 +3228,58 @@ inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
     DB::ServerUUID::setRandomForUnitTests();
     std::cout << std::unitbuf;
 
-    feature_tests_detail::testWireProtocolRoundtrip();
-    feature_tests_detail::testFeatureFlagsAndContext();
-    feature_tests_detail::testAclModesAndSystemNodes(state_dir);
-    feature_tests_detail::testTtlAndContainerGc(state_dir);
-    feature_tests_detail::testOrphanNodeStartupRecovery(state_dir);
-    feature_tests_detail::testReconfigParsingAndActions();
-    feature_tests_detail::testFourLetterWordsAndStats(state_dir);
-    feature_tests_detail::testChangelogReadAheadAndParallelStartup(state_dir);
-    feature_tests_detail::testSessionExpiryStateManagerAndRaftParams(state_dir);
-    feature_tests_detail::testZooKeeperDataReaderMigration(state_dir);
-    feature_tests_detail::testKeeperReadThreadPoolAndOverDispatcher();
-    feature_tests_detail::testKeeperClientCLICommands();
-    feature_tests_detail::testLsmtWriteThrottlingFdMetricsAndAuthConfig(state_dir);
-    feature_tests_detail::testCompactChildrenSetDifferential();
-    feature_tests_detail::testPersistentAndRecursiveWatchSemantics(state_dir);
-    feature_tests_detail::testExtendedOpsLimitsAndNeverUsedContainerGc(state_dir);
-    feature_tests_detail::testCrossVersionSnapshotMatrixAndCorruptFallback(state_dir);
-    feature_tests_detail::testCompressedChangelogTruncateCompactAndLsmtDiskReopen(state_dir);
-    feature_tests_detail::testInMemoryLogStoreSummingSMBlockCacheSnapshotableHTAndPathUtils();
-    feature_tests_detail::testListWithOptionsAndMultiRollbackMatrix(state_dir);
-    feature_tests_detail::testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCounter();
-    feature_tests_detail::testEmptyMultiFeatureFlagsXMLConfigAndZnodeTime(state_dir);
-    feature_tests_detail::testMntrDataSizeAccuracyAndLogGapRejection(state_dir);
+    size_t failed_count = 0;
+    std::string first_failure;
+    auto run_one = [&](const std::string & name, auto && fn)
+    {
+        try
+        {
+            fn();
+        }
+        catch (const std::exception & e)
+        {
+            ++failed_count;
+            if (first_failure.empty())
+                first_failure = name + ": " + e.what();
+            std::cout << "  [FAIL] feature: " << name << ": " << e.what() << '\n';
+        }
+        catch (...)
+        {
+            ++failed_count;
+            if (first_failure.empty())
+                first_failure = name + ": unknown exception";
+            std::cout << "  [FAIL] feature: " << name << ": unknown exception\n";
+        }
+    };
+
+    run_one("wire_protocol_roundtrip", [&]() { feature_tests_detail::testWireProtocolRoundtrip(); });
+    run_one("feature_flags_and_versions", [&]() { feature_tests_detail::testFeatureFlagsAndContext(); });
+    run_one("acl_modes_superdigest_and_system_nodes", [&]() { feature_tests_detail::testAclModesAndSystemNodes(state_dir); });
+    run_one("ttl_and_container_gc_semantics", [&]() { feature_tests_detail::testTtlAndContainerGc(state_dir); });
+    run_one("orphan_node_startup_recovery", [&]() { feature_tests_detail::testOrphanNodeStartupRecovery(state_dir); });
+    run_one("reconfig_validation_and_config_parsing", [&]() { feature_tests_detail::testReconfigParsingAndActions(); });
+    run_one("four_letter_word_commands_and_stats", [&]() { feature_tests_detail::testFourLetterWordsAndStats(state_dir); });
+    run_one("changelog_readahead_and_parallel_startup", [&]() { feature_tests_detail::testChangelogReadAheadAndParallelStartup(state_dir); });
+    run_one("session_expiry_state_manager_and_raft_params", [&]() { feature_tests_detail::testSessionExpiryStateManagerAndRaftParams(state_dir); });
+    run_one("zookeeper_data_reader_migration", [&]() { feature_tests_detail::testZooKeeperDataReaderMigration(state_dir); });
+    run_one("keeper_read_thread_pool_and_over_dispatcher", [&]() { feature_tests_detail::testKeeperReadThreadPoolAndOverDispatcher(); });
+    run_one("keeper_client_cli_commands", [&]() { feature_tests_detail::testKeeperClientCLICommands(); });
+    run_one("lsmt_write_throttling_fd_metrics_and_auth_config", [&]() { feature_tests_detail::testLsmtWriteThrottlingFdMetricsAndAuthConfig(state_dir); });
+    run_one("compact_children_set_differential", [&]() { feature_tests_detail::testCompactChildrenSetDifferential(); });
+    run_one("persistent_and_recursive_watches_semantics", [&]() { feature_tests_detail::testPersistentAndRecursiveWatchSemantics(state_dir); });
+    run_one("extended_ops_check_stat_limits_and_never_used_container_gc", [&]() { feature_tests_detail::testExtendedOpsLimitsAndNeverUsedContainerGc(state_dir); });
+    run_one("cross_version_snapshot_matrix_and_corrupt_fallback", [&]() { feature_tests_detail::testCrossVersionSnapshotMatrixAndCorruptFallback(state_dir); });
+    run_one("changelog_compress_truncate_compact_and_lsmt_disk_compaction", [&]() { feature_tests_detail::testCompressedChangelogTruncateCompactAndLsmtDiskReopen(state_dir); });
+    run_one("in_memory_log_store_summing_sm_block_cache_snapshotable_ht_and_path_utils", [&]() { feature_tests_detail::testInMemoryLogStoreSummingSMBlockCacheSnapshotableHTAndPathUtils(); });
+    run_one("list_with_options_and_multi_rollback_matrix", [&]() { feature_tests_detail::testListWithOptionsAndMultiRollbackMatrix(state_dir); });
+    run_one("nuraft_buffers_node_ref_cache_combine_actions_retries_shuffle_and_error_counter", [&]() { feature_tests_detail::testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCounter(); });
+    run_one("empty_multi_feature_flags_xml_config_and_znode_time", [&]() { feature_tests_detail::testEmptyMultiFeatureFlagsXMLConfigAndZnodeTime(state_dir); });
+    run_one("mntr_data_size_accuracy_and_log_gap_rejection", [&]() { feature_tests_detail::testMntrDataSizeAccuracyAndLogGapRejection(state_dir); });
 
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);
+    if (failed_count > 0)
+        throw std::runtime_error(std::to_string(failed_count) + " feature test(s) failed (first: " + first_failure + ")");
     std::cout << "PASS keeper-sim-feature-tests\n";
 }
 

@@ -1793,10 +1793,12 @@ private:
             /// 1. Real Keeper Changelog manual tasks (Write, Completion, FileOperation).
             if (node.log_store)
             {
-                for (const auto & [task, name] : {
-                    std::pair{DB::Changelog::BackgroundTask::Write, "log-write"},
-                    std::pair{DB::Changelog::BackgroundTask::Completion, "log-complete"},
-                    std::pair{DB::Changelog::BackgroundTask::FileOperation, "log-file"}})
+                static constexpr std::array<std::pair<DB::Changelog::BackgroundTask, const char *>, 3> log_tasks = {{
+                    {DB::Changelog::BackgroundTask::Write, "log-write"},
+                    {DB::Changelog::BackgroundTask::Completion, "log-complete"},
+                    {DB::Changelog::BackgroundTask::FileOperation, "log-file"},
+                }};
+                for (const auto & [task, name] : log_tasks)
                 {
                     if (node.log_store->hasPendingTask(task) && node.queued_log_tasks.emplace(task).second)
                     {

@@ -188,9 +188,9 @@ public:
 
         if (suite == "ci")
         {
-            /// Fast, deterministic, 100%-green PR CI suite designed to cover ALL Keeper functionality
-            /// in ~20-45s wall-clock across multi-core CI workers while avoiding known unfixed master bugs
-            /// (`--no-streaming --no-bounded-cache`).
+            /// Full deterministic PR CI suite covering ALL Keeper functionality — including streaming mode,
+            /// bounded log cache, strict watch oracle, torn snapshots, vote safety, and reconfig races —
+            /// with zero bug-avoidance skips so upstream fixes automatically flip failing cases to green.
             auto make_ci = [&](std::string name, uint64_t seed, int nodes, std::string profile, std::string storage, int64_t dur_ms)
             {
                 JobSpec j;
@@ -200,8 +200,7 @@ public:
                 j.profile = std::move(profile);
                 j.storage = std::move(storage);
                 j.duration_ms = dur_ms;
-                j.no_streaming = true;
-                j.no_bounded_cache = true;
+                j.watch_oracle = true;
                 return j;
             };
 
@@ -317,6 +316,44 @@ public:
                 j.member_rotation = true;
                 j.async_replication = true;
                 j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 19. Torn snapshots + broken-tail `write_at` + compressed logs with bounded log cache
+            {
+                auto j = make_ci("ci-torn-snap-writeat-3n", 119, 3, "power-loss", "mem", 13000);
+                j.torn_snapshots = true;
+                j.broken_tail_writeat = true;
+                j.compress_logs = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 20. Raft §5.4.1 snapshot election vote safety (`#134119`)
+            {
+                auto j = make_ci("ci-snap-vote-safety-3n", 120, 3, "chaos", "mem", 13000);
+                j.snapshot_vote_safety = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 21. Overlapping reconfiguration races (`reconfig_race` + `reconfig_overlap`)
+            {
+                auto j = make_ci("ci-reconfig-race-overlap-3n", 121, 3, "chaos", "mem", 13000);
+                j.reconfig_race = true;
+                j.reconfig_overlap = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 22. Parsed-batch cache retry/snapshot + remote snapshot faults + byte-bounded log cache
+            {
+                auto j = make_ci("ci-batch-cache-remote-faults-3n", 122, 3, "snapshot-storm", "mem", 13000);
+                j.batch_cache_retry = true;
+                j.batch_cache_snapshot = true;
+                j.remote_snap_faults = true;
+                j.log_size_cache = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 23. Late closed-session race + rollback torture + snapshot torture
+            {
+                auto j = make_ci("ci-late-session-rollback-3n", 123, 3, "chaos", "mem", 13000);
+                j.late_session_race = true;
+                j.rollback_torture = true;
+                j.snapshot_torture = true;
                 jobs.push_back(std::move(j));
             }
         }
@@ -814,11 +851,10 @@ public:
             if (!feat.stdout_text.empty())
                 std::cout << feat.stdout_text << std::flush;
             if (!ok)
-            {
-                std::cerr << "[FAIL] keeper-feature-tests: " << feat.stderr_text << '\n';
-                return 1;
-            }
-            std::cout << "[PASS] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s)\n" << std::flush;
+                std::cerr << "[FAIL] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s): "
+                          << firstLine(feat.stderr_text.empty() ? feat.stdout_text : feat.stderr_text) << '\n';
+            else
+                std::cout << "[PASS] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s)\n" << std::flush;
 
             /// 2c. Run all live server/multi-node/TCP/HTTP/TLS/LSMT suites in parallel isolated child processes
             /// across `max_workers` for ~4x faster PR CI runtime and zero cross-test global state bleed!
@@ -959,9 +995,7 @@ public:
                     }
                 }
                 const double live_wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - live_wall_start).count();
-                if (!all_live_ok)
-                    return 1;
-                std::cout << "[PASS] keeper-live-server-tests (" << live_passed << "/" << tasks.size()
+                std::cout << "[" << (all_live_ok ? "PASS" : "FAIL") << "] keeper-live-server-tests (" << live_passed << "/" << tasks.size()
                           << " parallel suites, " << std::fixed << std::setprecision(2) << live_wall_s << "s wall)\n" << std::flush;
             }
         }
@@ -1079,6 +1113,7 @@ public:
                 "hot_update_params",
                 "local_disk_log_active",
                 "local_disk_streaming_snapshot_active",
+                "bounded_log_cache_active",
                 "huge_lsmt_value_written",
                 "async_replication_enabled",
                 "same_path_multi_commit_submitted",
@@ -1103,7 +1138,11 @@ public:
         }
 
         const double total_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-        const bool all_ok = (passed_count == results.size()) && (det_passed == det_results.size()) && missing_coverage.empty();
+        bool all_extra_ok = true;
+        for (const auto & c : extra_checks)
+            if (!c.passed)
+                all_extra_ok = false;
+        const bool all_ok = all_extra_ok && (passed_count == results.size()) && (det_passed == det_results.size()) && missing_coverage.empty();
 
         /// 6. Write machine-readable JUnit XML report (always to `output_dir/junit.xml`, plus `--junit-xml` if specified).
         {
