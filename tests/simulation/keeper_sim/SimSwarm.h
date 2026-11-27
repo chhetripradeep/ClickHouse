@@ -998,6 +998,181 @@ public:
                 std::cout << "[" << (all_live_ok ? "PASS" : "FAIL") << "] keeper-live-server-tests (" << live_passed << "/" << tasks.size()
                           << " parallel suites, " << std::fixed << std::setprecision(2) << live_wall_s << "s wall)\n" << std::flush;
             }
+
+            /// 2d. Run all 14 deterministic NuRaft protocol-safety tests in parallel isolated child processes
+            ///     so crashes (e.g. SIGSEGV on null ctx / empty sync_log_request) are cleanly isolated and reported.
+            {
+                const auto nr_wall_start = std::chrono::steady_clock::now();
+                struct SafetyMode
+                {
+                    std::string mode;
+                    int log_level;
+                };
+                const std::vector<SafetyMode> safety_modes = {
+                    {"stale-matched-idx", 0},
+                    {"figure8", 0},
+                    {"stale-ae-resp", 0},
+                    {"stale-join-term", 0},
+                    {"retry-join-hang", 0},
+                    {"prevote-disrupts-follower", 0},
+                    {"vote-resp-split-brain", 0},
+                    {"priority-conf-corrupt", 0},
+                    {"out-of-log-null-ctx", 0},
+                    {"learner-takeover", 0},
+                    {"join-term-rewind", 0},
+                    {"log-sync-empty-oob", 6},
+                    {"leave-resp-unchecked", 0},
+                    {"log-sync-rejected-joins", 0},
+                };
+
+                struct NrChild
+                {
+                    pid_t pid = 0;
+                    size_t idx = 0;
+                    std::filesystem::path out_file;
+                    std::filesystem::path err_file;
+                    std::chrono::steady_clock::time_point started;
+                };
+                struct NrRes
+                {
+                    bool ok = false;
+                    int signal_num = 0;
+                    double elapsed_s = 0.0;
+                    std::string stdout_text;
+                    std::string stderr_text;
+                };
+                std::vector<NrRes> nr_results(safety_modes.size());
+                std::map<pid_t, NrChild> active_nr;
+                size_t next_nr = 0;
+                const size_t nr_workers = std::max<size_t>(1, max_workers);
+
+                auto read_all_file = [](const std::filesystem::path & p) -> std::string
+                {
+                    std::ifstream in(p);
+                    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                };
+
+                while (next_nr < safety_modes.size() || !active_nr.empty())
+                {
+                    while (next_nr < safety_modes.size() && active_nr.size() < nr_workers)
+                    {
+                        const size_t idx = next_nr++;
+                        const auto & sm = safety_modes[idx];
+                        const auto sdir = work_dir / ("state_nuraft_" + sm.mode);
+                        const auto out_file = work_dir / ("out_nuraft_" + sm.mode + ".log");
+                        const auto err_file = work_dir / ("err_nuraft_" + sm.mode + ".log");
+                        std::vector<std::string> argv_storage = {
+                            self_exe,
+                            "--nuraft-safety-test", sm.mode,
+                            "--seed", std::to_string(1 + seed_offset),
+                            "--nuraft-log-level", std::to_string(sm.log_level),
+                            "--state-dir", sdir.string(),
+                        };
+
+                        const pid_t pid = fork();
+                        if (pid < 0)
+                            throw std::runtime_error("SimSwarmRunner: fork() failed for nuraft safety test");
+                        if (pid == 0)
+                        {
+                            FILE * fo = fopen(out_file.c_str(), "w");
+                            FILE * fe = fopen(err_file.c_str(), "w");
+                            if (fo)
+                            {
+                                dup2(fileno(fo), STDOUT_FILENO);
+                                fclose(fo);
+                            }
+                            if (fe)
+                            {
+                                dup2(fileno(fe), STDERR_FILENO);
+                                fclose(fe);
+                            }
+                            std::vector<char *> c_argv;
+                            c_argv.reserve(argv_storage.size() + 1);
+                            for (auto & s : argv_storage)
+                                c_argv.push_back(s.data());
+                            c_argv.push_back(nullptr);
+                            execv(self_exe.c_str(), c_argv.data());
+                            _exit(127);
+                        }
+                        active_nr[pid] = NrChild{pid, idx, out_file, err_file, std::chrono::steady_clock::now()};
+                    }
+
+                    int status = 0;
+                    const pid_t done_pid = waitpid(-1, &status, 0);
+                    if (done_pid <= 0)
+                        break;
+                    auto it = active_nr.find(done_pid);
+                    if (it == active_nr.end())
+                        continue;
+                    const auto child = it->second;
+                    active_nr.erase(it);
+
+                    NrRes r;
+                    r.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - child.started).count();
+                    r.stdout_text = read_all_file(child.out_file);
+                    r.stderr_text = read_all_file(child.err_file);
+                    r.signal_num = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+                    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    r.ok = (r.signal_num == 0 && exit_code == 0
+                        && r.stdout_text.find("PASS nuraft-safety-test: " + safety_modes[child.idx].mode) != std::string::npos);
+                    nr_results[child.idx] = std::move(r);
+                }
+
+                bool all_nr_ok = true;
+                size_t nr_passed = 0;
+                for (size_t i = 0; i < safety_modes.size(); ++i)
+                {
+                    const auto & sm = safety_modes[i];
+                    const auto & r = nr_results[i];
+                    std::string err_summary;
+                    if (!r.ok)
+                    {
+                        if (r.signal_num != 0)
+                        {
+                            err_summary = "killed by signal " + std::to_string(r.signal_num);
+                        }
+                        else
+                        {
+                            const std::string & src = r.stderr_text.empty() ? r.stdout_text : r.stderr_text;
+                            std::istringstream iss(src);
+                            std::string line;
+                            std::string last_non_empty;
+                            while (std::getline(iss, line))
+                            {
+                                if (line.empty())
+                                    continue;
+                                last_non_empty = line;
+                                if (line.rfind("FAIL ", 0) == 0)
+                                    err_summary = line;
+                            }
+                            if (err_summary.empty())
+                                err_summary = last_non_empty;
+                        }
+                    }
+                    extra_checks.push_back({
+                        "nuraft_safety_" + sm.mode,
+                        r.ok,
+                        r.elapsed_s,
+                        err_summary,
+                    });
+                    if (r.ok)
+                    {
+                        ++nr_passed;
+                        std::cout << "  [PASS] nuraft_safety: " << sm.mode << " (" << std::fixed << std::setprecision(2)
+                                  << r.elapsed_s << "s)\n";
+                    }
+                    else
+                    {
+                        all_nr_ok = false;
+                        std::cerr << "  [FAIL] nuraft_safety: " << sm.mode << " (" << std::fixed << std::setprecision(2)
+                                  << r.elapsed_s << "s): " << err_summary << '\n';
+                    }
+                }
+                const double nr_wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - nr_wall_start).count();
+                std::cout << "[" << (all_nr_ok ? "PASS" : "FAIL") << "] nuraft-protocol-safety-tests (" << nr_passed << "/"
+                          << safety_modes.size() << " parallel checks, " << std::fixed << std::setprecision(2) << nr_wall_s << "s wall)\n"
+                          << std::flush;
+            }
         }
 
         /// 3. Run all campaign jobs in parallel across `max_workers` child processes.

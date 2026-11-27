@@ -9,6 +9,7 @@
 #include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ZooKeeper/KeeperFeatureFlags.h>
 #include <Common/ZooKeeper/KeeperOverDispatcher.h>
+#include <Common/ZooKeeper/KeeperSpans.h>
 #include <Common/ZooKeeper/ShuffleHost.h>
 #include <Common/ZooKeeper/SystemTablesDataTypes.h>
 #include <Common/ZooKeeper/TestKeeper.h>
@@ -17,6 +18,7 @@
 #include <Common/ZooKeeper/ZooKeeperIO.h>
 #include <Common/ZooKeeper/ZooKeeperPathUtils.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
 #include <Coordination/CompactChildrenSet.h>
 #include <Coordination/CoordinationSettings.h>
 #include <Coordination/FourLetterCommand.h>
@@ -3213,6 +3215,469 @@ inline void testMntrDataSizeAccuracyAndLogGapRejection(const std::filesystem::pa
     std::cout << "  [PASS] feature: mntr_data_size_accuracy_and_log_gap_rejection\n";
 }
 
+/// 24. Positive contracts for `chroot` root watch path stripping and header-level `Multi` error handling
+///     with `check_session_valid = true`.
+inline void testChrootRootWatchAndMultiCheckSessionError()
+{
+    /// Part 1: `chroot` root watch roundtrip (`addRootPath` + `removeRootPath` on `"/"`).
+    Coordination::ZooKeeperExistsRequest req;
+    req.path = "/";
+    req.addRootPath("/clickhouse");
+    require(req.path == "/clickhouse", "Unexpected addRootPath result on root");
+
+    Coordination::ZooKeeperWatchResponse watch_resp;
+    watch_resp.path = req.path;
+    watch_resp.removeRootPath("/clickhouse");
+    require(watch_resp.path == "/", "Expected removeRootPath on chroot root watch to yield '/'");
+
+    /// Part 2: `ZooKeeper::tryMulti(..., check_session_valid=true)` must return header-level non-ZOK
+    /// error codes cleanly without throwing `LOGICAL_ERROR` when sub-responses are default `ZOK`.
+    struct MultiHeaderErrorKeeper final : public Coordination::IKeeper
+    {
+        std::unique_ptr<Coordination::TestKeeper> inner;
+        bool inject_multi_error = false;
+        explicit MultiHeaderErrorKeeper(const zkutil::ZooKeeperArgs & a)
+            : inner(std::make_unique<Coordination::TestKeeper>(a))
+        {
+        }
+        bool isExpired() const override { return inner->isExpired(); }
+        silk::FiberEvent & getExpiredEvent() override { return inner->getExpiredEvent(); }
+        std::optional<int8_t> getConnectedNodeIdx() const override { return inner->getConnectedNodeIdx(); }
+        String getConnectedHostPort() const override { return inner->getConnectedHostPort(); }
+        int64_t getConnectionXid() const override { return inner->getConnectionXid(); }
+        int64_t getSessionID() const override { return inner->getSessionID(); }
+        int64_t getLastZXIDSeen() const override { return inner->getLastZXIDSeen(); }
+        bool isFeatureEnabled(DB::KeeperFeatureFlag f) const override { return inner->isFeatureEnabled(f); }
+        const DB::KeeperFeatureFlags * getKeeperFeatureFlags() const override { return inner->getKeeperFeatureFlags(); }
+        void create(const String & p, const String & d, bool e, bool s, const Coordination::ACLs & a, Coordination::CreateCallback cb) override { inner->create(p, d, e, s, a, std::move(cb)); }
+        void remove(const String & p, int32_t v, Coordination::RemoveCallback cb) override { inner->remove(p, v, std::move(cb)); }
+        void removeRecursive(const String & p, uint32_t l, Coordination::RemoveRecursiveCallback cb) override { inner->removeRecursive(p, l, std::move(cb)); }
+        void listRecursive(const String & p, uint32_t l, Coordination::ListRecursiveCallback cb) override { inner->listRecursive(p, l, std::move(cb)); }
+        void listWithOptions(const String & p, const Coordination::ListOptions & o, Coordination::ListWithOptionsCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->listWithOptions(p, o, std::move(cb), std::move(w)); }
+        void exists(const String & p, Coordination::ExistsCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->exists(p, std::move(cb), std::move(w)); }
+        void get(const String & p, Coordination::GetCallback cb, Coordination::WatchCallbackPtrOrEventPtr w) override { inner->get(p, std::move(cb), std::move(w)); }
+        void set(const String & p, const String & d, int32_t v, Coordination::SetCallback cb) override { inner->set(p, d, v, std::move(cb)); }
+        void list(const String & p, Coordination::ListRequestType t, Coordination::ListCallback cb, Coordination::WatchCallbackPtrOrEventPtr w, bool ws, bool wd) override { inner->list(p, t, std::move(cb), std::move(w), ws, wd); }
+        void check(const String & p, int32_t v, Coordination::CheckCallback cb) override { inner->check(p, v, std::move(cb)); }
+        void sync(const String & p, Coordination::SyncCallback cb) override { inner->sync(p, std::move(cb)); }
+        void reconfig(std::string_view j, std::string_view l, std::string_view n, int32_t v, Coordination::ReconfigCallback cb) override { inner->reconfig(j, l, n, v, std::move(cb)); }
+        void getACL(const String & p, Coordination::GetACLCallback cb) override { inner->getACL(p, std::move(cb)); }
+        void finalize(const String & r) override { inner->finalize(r); }
+        void multi(const Coordination::Requests & reqs, Coordination::MultiCallback cb) override { multi(std::span(reqs), std::move(cb)); }
+        void multi(std::span<const Coordination::RequestPtr> reqs, Coordination::MultiCallback cb) override
+        {
+            if (!inject_multi_error)
+            {
+                inner->multi(reqs, std::move(cb));
+                return;
+            }
+            Coordination::ZooKeeperMultiRequest zk_req(reqs, {});
+            auto resp = zk_req.makeResponse();
+            resp->error = Coordination::Error::ZBADARGUMENTS;
+            cb(dynamic_cast<const Coordination::MultiResponse &>(*resp));
+        }
+    };
+
+    MultiHeaderErrorKeeper * raw_keeper = nullptr;
+    auto zk = zkutil::ZooKeeper::createFromImpl([&]() -> std::unique_ptr<Coordination::IKeeper>
+    {
+        zkutil::ZooKeeperArgs args("localhost:2181");
+        auto k = std::make_unique<MultiHeaderErrorKeeper>(args);
+        raw_keeper = k.get();
+        return k;
+    });
+    raw_keeper->inject_multi_error = true;
+    Coordination::Requests ops{zkutil::makeCreateRequest("/x", "v", zkutil::CreateMode::Persistent)};
+    Coordination::Responses responses;
+    const auto code = zk->tryMulti(ops, responses, /*check_session_valid=*/true);
+    require(code == Coordination::Error::ZBADARGUMENTS,
+        "Expected ZBADARGUMENTS from header-level Multi rejection");
+
+    std::cout << "  [PASS] feature: chroot_root_watch_and_multi_check_session_error\n";
+}
+
+/// 25. Positive contracts for `Changelog` shutdown rotation with queued append and mixed
+///     uncompressed/compressed `Changelog` files under decoded `ReadAhead`.
+inline void testChangelogShutdownRotationAndMixedCompressReadAhead(const std::filesystem::path & root_dir)
+{
+    auto make_entry = [](uint64_t term, const std::string & payload)
+    {
+        auto buf = nuraft::buffer::alloc(payload.size());
+        buf->put_raw(reinterpret_cast<const nuraft::byte *>(payload.data()), payload.size());
+        buf->pos(0);
+        return nuraft::cs_new<nuraft::log_entry>(term, buf, nuraft::log_val_type::app_log);
+    };
+
+    /// Part 1: Queued append crossing `rotate_interval` flushed during `shutdownChangelog` must succeed cleanly.
+    {
+        const auto dir = root_dir / "changelog_shutdown_rot";
+        std::filesystem::create_directories(dir);
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        auto ctx = std::make_shared<DB::KeeperContext>(/*standalone=*/true, settings);
+        ctx->setLogDisk(std::make_shared<DB::DiskLocal>("feat_rot_log", dir.string() + "/"));
+
+        DB::LogFileSettings log_settings;
+        log_settings.rotate_interval = 3;
+        log_settings.force_sync = false;
+        log_settings.compress_logs = false;
+        log_settings.startup_read_max_streams = 1;
+
+        DB::FlushSettings flush_settings;
+        flush_settings.max_flush_batch_size = 1;
+        flush_settings.min_time_between_fsyncs_ms = 0;
+
+        DB::ReadAheadSettings ra_settings;
+        ra_settings.enabled = false;
+        ra_settings.commit_window_bytes = 0;
+
+        DB::KeeperLogStore store(log_settings, flush_settings, ra_settings, ctx, DB::Changelog::ExecutionMode::Manual);
+        store.init(/*last_commited_log_index=*/0, /*logs_to_keep=*/100);
+        for (int i = 1; i <= 3; ++i)
+        {
+            auto e = make_entry(1, "entry_" + std::to_string(i));
+            store.append(e);
+        }
+        store.flush();
+        while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+        {
+        }
+        auto e4 = make_entry(1, "entry_4_triggers_rotate");
+        store.append(e4);
+        store.shutdownChangelog();
+    }
+
+    /// Part 2: Mixed uncompressed (`changelog_1_3.bin`) + compressed (`changelog_4_6.bin.zstd`) files
+    /// read through `ReadAhead` (`entry_at_ext` commit reader + `log_entries_ext` peer reader).
+    {
+        const auto dir = root_dir / "changelog_mixed_compress_ra";
+        std::filesystem::create_directories(dir);
+
+        auto make_ctx = [&]()
+        {
+            auto settings = std::make_shared<DB::CoordinationSettings>();
+            auto ctx = std::make_shared<DB::KeeperContext>(/*standalone=*/true, settings);
+            ctx->setLogDisk(std::make_shared<DB::DiskLocal>("feat_mix_ra", dir.string() + "/"));
+            return ctx;
+        };
+
+        DB::FlushSettings manual_flush;
+        manual_flush.max_flush_batch_size = 1;
+        manual_flush.min_time_between_fsyncs_ms = 0;
+        DB::ReadAheadSettings manual_ra;
+        manual_ra.enabled = false;
+        manual_ra.commit_window_bytes = 0;
+
+        {
+            DB::LogFileSettings ls;
+            ls.rotate_interval = 3;
+            ls.force_sync = false;
+            ls.compress_logs = false;
+            ls.latest_logs_cache_entry_count_threshold = 2;
+            ls.startup_read_max_streams = 1;
+            DB::KeeperLogStore store(ls, manual_flush, manual_ra, make_ctx(), DB::Changelog::ExecutionMode::Manual);
+            store.init(0, 100);
+            for (int i = 1; i <= 3; ++i)
+            {
+                auto e = make_entry(1, "uncompressed_" + std::to_string(i));
+                store.append(e);
+            }
+            store.flush();
+            while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+            {
+            }
+            store.shutdownChangelog();
+        }
+        {
+            DB::LogFileSettings ls;
+            ls.rotate_interval = 3;
+            ls.force_sync = false;
+            ls.compress_logs = true;
+            ls.latest_logs_cache_entry_count_threshold = 2;
+            ls.startup_read_max_streams = 1;
+            DB::KeeperLogStore store(ls, manual_flush, manual_ra, make_ctx(), DB::Changelog::ExecutionMode::Manual);
+            store.init(0, 100);
+            for (int i = 4; i <= 6; ++i)
+            {
+                auto e = make_entry(1, "compressed_" + std::to_string(i));
+                store.append(e);
+            }
+            store.flush();
+            while (store.runTask(DB::Changelog::BackgroundTask::FileOperation))
+            {
+            }
+            store.shutdownChangelog();
+        }
+        {
+            DB::LogFileSettings ls;
+            ls.rotate_interval = 3;
+            ls.force_sync = false;
+            ls.compress_logs = true;
+            ls.latest_logs_cache_entry_count_threshold = 2;
+            ls.startup_read_max_streams = 1;
+            DB::ReadAheadSettings ra;
+            ra.enabled = true;
+            ra.commit_window_bytes = 64 * 1024;
+            DB::KeeperLogStore store(ls, DB::FlushSettings{}, ra, make_ctx(), DB::Changelog::ExecutionMode::Threaded);
+            store.init(0, 100);
+            SCOPE_EXIT({ store.shutdownChangelog(); });
+
+            auto commit_e = store.entry_at_ext(2, /*for_commit=*/true);
+            require(commit_e != nullptr, "entry_at_ext(2, for_commit=true) returned nullptr on mixed compressed changelog");
+            auto peer_entries = store.log_entries_ext(2, 4, 0, /*peer_id=*/2);
+            require(peer_entries != nullptr && peer_entries->size() == 2,
+                "log_entries_ext(2, 4, peer_id=2) failed on mixed compressed changelog");
+        }
+    }
+
+    std::cout << "  [PASS] feature: changelog_shutdown_rotation_and_mixed_compress_readahead\n";
+}
+
+/// 26. Positive contracts for `KeeperReadThreadPool` hot thread-count growth on a small batch
+///     and repeated `ZooKeeper::waitForDisappear` calls on the same path (`#135030`).
+inline void testKeeperReadPoolHotGrowAndWaitForDisappear()
+{
+    /// Part 1: Growing `parallel_read_threads` on a small batch (< `parallel_read_min_batch`)
+    /// must never allow a subsequent `execute` call to return while a worker is still running.
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        DB::KeeperReadThreadPool pool;
+        DB::CoordinationSettings s1;
+        s1[DB::CoordinationSetting::parallel_read_threads] = 2;
+        s1[DB::CoordinationSetting::parallel_read_min_batch] = 10;
+        s1[DB::CoordinationSetting::parallel_read_chunk_size] = 4;
+
+        pool.execute(16, s1, [](size_t, size_t) {});
+
+        DB::CoordinationSettings s2 = s1;
+        s2[DB::CoordinationSetting::parallel_read_threads] = 6;
+        pool.execute(1, s2, [](size_t, size_t) {});
+
+        auto execute_returned = std::make_shared<std::atomic<bool>>(false);
+        auto active_workers = std::make_shared<std::atomic<int>>(0);
+        auto saw_uaf = std::make_shared<std::atomic<bool>>(false);
+
+        pool.execute(24, s2, [execute_returned, active_workers, saw_uaf](size_t begin, size_t)
+        {
+            active_workers->fetch_add(1, std::memory_order_acq_rel);
+            if (begin == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            if (execute_returned->load(std::memory_order_acquire))
+                saw_uaf->store(true, std::memory_order_release);
+            active_workers->fetch_sub(1, std::memory_order_acq_rel);
+        });
+        execute_returned->store(true, std::memory_order_release);
+        const bool premature = (active_workers->load(std::memory_order_acquire) > 0);
+        while (active_workers->load(std::memory_order_acquire) > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        pool.shutdown();
+
+        require(!premature && !saw_uaf->load(std::memory_order_acquire),
+            "KeeperReadThreadPool::execute returned while worker lambda was still executing after hot grow");
+    }
+
+    /// Part 2: Repeated `ZooKeeper::waitForDisappear` on the same path & session must wake promptly
+    /// on `Event::DELETED` instead of colliding with Call 1's stale watch ID (`#135030`).
+    {
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+
+        zk->create("/wait_lock", "owner1", zkutil::CreateMode::Persistent);
+        std::thread del1([&]()
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            zk->remove("/wait_lock");
+        });
+        const bool res1 = zk->waitForDisappear("/wait_lock", {});
+        del1.join();
+        require(res1, "First waitForDisappear call failed");
+
+        zk->create("/wait_lock", "owner2", zkutil::CreateMode::Persistent);
+        std::atomic<bool> stop_cond{false};
+        std::thread churn2([&]()
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            zk->remove("/wait_lock");
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            zk->create("/wait_lock", "owner3", zkutil::CreateMode::Persistent);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            stop_cond.store(true);
+        });
+        const auto t2_start = std::chrono::steady_clock::now();
+        const bool res2 = zk->waitForDisappear("/wait_lock", [&]() { return stop_cond.load(); });
+        const auto t2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t2_start).count();
+        churn2.join();
+        require(res2 && t2_ms < 500,
+            "Second ZooKeeper::waitForDisappear missed DELETED watch and stalled "
+            + std::to_string(t2_ms) + "ms (#135030)");
+    }
+
+    std::cout << "  [PASS] feature: keeper_read_pool_hot_grow_and_wait_for_disappear\n";
+}
+
+/// 27. Positive contracts for `TestKeeperSetRequest` stat updates and `ZooKeeperOpentelemetrySpans`.
+inline void testTestKeeperSetStatAndKeeperSpansLifecycle()
+{
+    /// Part 1: Exercise all `KeeperSpan::Operation` lifecycle paths (with and without TracingContext).
+    {
+        DB::OpenTelemetry::TracingContext ctx;
+        ctx.trace_id = DB::UUID{DB::UInt128{0x1111222233334444ULL, 0x5555666677778888ULL}};
+        ctx.span_id = 0x123456789abcdef0ULL;
+        ctx.trace_flags = DB::OpenTelemetry::TRACE_FLAG_SAMPLED;
+
+        DB::ZooKeeperOpentelemetrySpans spans_traced;
+        DB::ZooKeeperOpentelemetrySpans spans_untraced;
+        for (size_t op = 0; op < static_cast<size_t>(DB::KeeperSpan::Count); ++op)
+        {
+            const auto kind = static_cast<DB::KeeperSpan::Operation>(op);
+            const UInt64 t0 = DB::ZooKeeperOpentelemetrySpans::now();
+            spans_traced.maybeInitialize(kind, &ctx, t0);
+            spans_traced.maybeFinalize(
+                kind,
+                []() { return std::vector<DB::OpenTelemetry::SpanAttribute>{{"keeper.sim", "true"}}; },
+                DB::OpenTelemetry::SpanStatus::OK,
+                {},
+                t0 + 250);
+
+            spans_untraced.maybeInitialize(kind, nullptr, t0);
+            spans_untraced.maybeFinalize(
+                kind,
+                []() { return std::vector<DB::OpenTelemetry::SpanAttribute>{}; },
+                DB::OpenTelemetry::SpanStatus::OK,
+                {},
+                t0 + 100);
+        }
+    }
+
+    /// Part 2: `TestKeeperSetRequest` must update `stat.dataLength` and must NOT increment parent `cversion`.
+    {
+        auto zk = zkutil::ZooKeeper::createFromImpl([]() -> std::unique_ptr<Coordination::IKeeper>
+        {
+            zkutil::ZooKeeperArgs args("localhost:2181");
+            return std::make_unique<Coordination::TestKeeper>(args);
+        });
+        zk->create("/stat_node", "hi", zkutil::CreateMode::Persistent);
+        Coordination::Stat root_before{};
+        zk->exists("/", &root_before);
+        Coordination::Stat stat_after{};
+        zk->set("/stat_node", "much_longer_payload_value", -1, &stat_after);
+        Coordination::Stat root_after{};
+        zk->exists("/", &root_after);
+        require(stat_after.dataLength == 25,
+            "TestKeeper::set left stale stat.dataLength=" + std::to_string(stat_after.dataLength));
+        require(root_after.cversion == root_before.cversion,
+            "TestKeeper::set erroneously incremented parent cversion");
+    }
+
+    std::cout << "  [PASS] feature: testkeeper_set_stat_and_keeper_spans_lifecycle\n";
+}
+
+/// 28. Positive contracts for `KeeperStateManager` multi-instance `-OLD` isolation and corrupted state fallback (`#135029`).
+inline void testStateManagerMultiInstanceOldPathAndCorruptRecovery(const std::filesystem::path & root_dir)
+{
+    const auto dir = root_dir / "state_mgr_multi_old";
+    std::filesystem::create_directories(dir / "logs_a");
+    std::filesystem::create_directories(dir / "logs_b");
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> cfg(new Poco::Util::MapConfiguration());
+    cfg->setInt("keeper_server.raft_configuration.server.id", 1);
+    cfg->setString("keeper_server.raft_configuration.server.hostname", "127.0.0.1");
+    cfg->setInt("keeper_server.raft_configuration.server.port", 19234);
+    cfg->setBool("keeper_server.raft_configuration.server.can_become_leader", true);
+    cfg->setBool("keeper_server.hostname_checks_enabled", false);
+
+    auto settings = std::make_shared<DB::CoordinationSettings>();
+    auto state_disk = std::make_shared<DB::DiskLocal>("feat_state_disk", dir.string() + "/");
+    auto ctx_a = std::make_shared<DB::KeeperContext>(true, settings);
+    ctx_a->setStateFileDisk(state_disk);
+    ctx_a->setLogDisk(std::make_shared<DB::DiskLocal>("feat_logs_a", (dir / "logs_a").string() + "/"));
+
+    auto ctx_b = std::make_shared<DB::KeeperContext>(true, settings);
+    ctx_b->setStateFileDisk(state_disk);
+    ctx_b->setLogDisk(std::make_shared<DB::DiskLocal>("feat_logs_b", (dir / "logs_b").string() + "/"));
+
+    DB::KeeperStateManager mgr_a(1, "keeper_server", "state_a", *cfg, ctx_a);
+    DB::KeeperStateManager mgr_b(1, "keeper_server", "state_b", *cfg, ctx_b);
+    mgr_a.loadLogStore(0, 100);
+    mgr_b.loadLogStore(0, 100);
+    SCOPE_EXIT({
+        mgr_a.flushAndShutDownLogStore();
+        mgr_b.flushAndShutDownLogStore();
+    });
+
+    nuraft::srv_state s1;
+    s1.set_term(5);
+    s1.set_voted_for(1);
+    mgr_a.save_state(s1);
+    state_disk->copyFile("state_a", *state_disk, "state_a-OLD", DB::ReadSettings{});
+
+    /// Corrupt primary `state_a`: `read_state` must recover term=5 from intact `state_a-OLD`.
+    {
+        auto wb = state_disk->writeFile("state_a", DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteMode::Rewrite, DB::WriteSettings{});
+        const std::string garbage = "CORRUPTED_STATE_FILE_BYTES_1234567890";
+        wb->write(garbage.data(), garbage.size());
+        wb->finalize();
+    }
+    auto recovered = mgr_a.read_state();
+    require(recovered && recovered->get_term() == 5,
+        "KeeperStateManager::read_state failed to recover from state_a-OLD (#135029)");
+
+    /// Separate instance `mgr_b` saving `"state_b"` must NOT touch or delete `mgr_a`'s `"state_a-OLD"`.
+    state_disk->copyFile("state_a", *state_disk, "state_a-OLD", DB::ReadSettings{});
+    mgr_b.save_state(s1);
+    nuraft::srv_state s2;
+    s2.set_term(99);
+    s2.set_voted_for(1);
+    mgr_b.save_state(s2);
+    require(state_disk->existsFile("state_a-OLD"),
+        "KeeperStateManager(\"state_b\") deleted \"state_a-OLD\" via shared static path (#135029)");
+
+    std::cout << "  [PASS] feature: state_manager_multi_instance_old_path_and_corrupt_recovery\n";
+}
+
+/// 29. Positive contracts for `ZooKeeperWithFaultInjection` null-keeper async promise handling
+///     and `ZooKeeperArgs` `secure://` host parsing.
+inline void testFaultInjectionNullKeeperPromiseAndSecureArgs()
+{
+    /// Part 1: `ZooKeeperArgs` with `secure://127.0.0.1:9281` parses cleanly.
+    {
+        zkutil::ZooKeeperArgs args("secure://127.0.0.1:9281");
+        require(args.hosts.size() == 1 && args.hosts[0] == "secure://127.0.0.1:9281",
+            "ZooKeeperArgs did not preserve secure:// host");
+    }
+
+    /// Part 2: `ZooKeeperWithFaultInjection` with null `keeper` and `fault_injection_probability = 1.0`
+    /// must return a faulted future cleanly without throwing `std::future_error` (double `set_exception`).
+    {
+        auto faulty = std::make_shared<DB::ZooKeeperWithFaultInjection>(
+            /*keeper_=*/nullptr,
+            /*fault_injection_probability=*/1.0,
+            /*fault_injection_seed=*/42,
+            "feature_test",
+            nullptr);
+        auto fut = faulty->asyncTryGet("/test");
+        bool got_zk_err = false;
+        try
+        {
+            (void)fut.get();
+        }
+        catch (const Coordination::Exception &)
+        {
+            got_zk_err = true;
+        }
+        catch (const DB::Exception &)
+        {
+            got_zk_err = true;
+        }
+        require(got_zk_err, "ZooKeeperWithFaultInjection(nullptr) future did not report fault exception");
+    }
+
+    std::cout << "  [PASS] feature: fault_injection_null_keeper_promise_and_secure_args\n";
+}
+
 }
 
 inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
@@ -3275,6 +3740,12 @@ inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
     run_one("nuraft_buffers_node_ref_cache_combine_actions_retries_shuffle_and_error_counter", [&]() { feature_tests_detail::testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCounter(); });
     run_one("empty_multi_feature_flags_xml_config_and_znode_time", [&]() { feature_tests_detail::testEmptyMultiFeatureFlagsXMLConfigAndZnodeTime(state_dir); });
     run_one("mntr_data_size_accuracy_and_log_gap_rejection", [&]() { feature_tests_detail::testMntrDataSizeAccuracyAndLogGapRejection(state_dir); });
+    run_one("chroot_root_watch_and_multi_check_session_error", [&]() { feature_tests_detail::testChrootRootWatchAndMultiCheckSessionError(); });
+    run_one("changelog_shutdown_rotation_and_mixed_compress_readahead", [&]() { feature_tests_detail::testChangelogShutdownRotationAndMixedCompressReadAhead(state_dir); });
+    run_one("keeper_read_pool_hot_grow_and_wait_for_disappear", [&]() { feature_tests_detail::testKeeperReadPoolHotGrowAndWaitForDisappear(); });
+    run_one("testkeeper_set_stat_and_keeper_spans_lifecycle", [&]() { feature_tests_detail::testTestKeeperSetStatAndKeeperSpansLifecycle(); });
+    run_one("state_manager_multi_instance_old_path_and_corrupt_recovery", [&]() { feature_tests_detail::testStateManagerMultiInstanceOldPathAndCorruptRecovery(state_dir); });
+    run_one("fault_injection_null_keeper_promise_and_secure_args", [&]() { feature_tests_detail::testFaultInjectionNullKeeperPromiseAndSecureArgs(); });
 
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);

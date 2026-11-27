@@ -110,10 +110,15 @@ void runNestedMultiStackOverflowRepro(size_t depth)
     std::cerr << "Returned without crashing (requests=" << req.requests.size() << ")\n";
 }
 
-void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & state_dir, uint64_t seed, int nuraft_log_level)
+void runNuRaftLiveRepro(
+    const std::string & mode,
+    const std::filesystem::path & state_dir,
+    uint64_t seed,
+    int nuraft_log_level,
+    bool assert_safe = false)
 {
     using namespace keeper_sim;
-    require(!state_dir.empty(), "--state-dir is required for --repro-*");
+    require(!state_dir.empty(), "--state-dir is required for --repro-* / --nuraft-safety-test");
     if (std::filesystem::exists(state_dir))
         std::filesystem::remove_all(state_dir);
 
@@ -299,6 +304,13 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << " f_b.last=" << (nodes.at(f_b).log_store->next_slot() - 1)
                   << " p2.term_at(k)=" << nodes.at(p2).log_store->term_at(k)
                   << " l2.term_at(k)=" << nodes.at(l2).log_store->term_at(k) << "\n";
+        if (assert_safe)
+        {
+            require(!illegally_committed,
+                "stale-matched-idx: leader illegally committed k=" + std::to_string(k) + " via stale peer matched_idx");
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(illegally_committed, "l1 did not commit k:t1 via stale matched_idx");
         require(nodes.at(f_b).log_store->next_slot() - 1 == base_idx, "f_b should NOT have k:t1");
 
@@ -388,13 +400,21 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         cut_pair(l1, p2);
         cut_pair(l1, f_b);
 
-        /// Wait until f_a has k:t1 (NOT k+1:t3!) and l1 commits k:t1!
-        require(engine.runUntilCondition(5000, [&]()
+        /// Wait until f_a has k:t1 (NOT k+1:t3!) and check whether l1 illegally commits k:t1!
+        const bool figure8_committed = engine.runUntilCondition(5000, [&]()
         {
             if (nodes.at(f_a).log_store->next_slot() > k)
                 cut_pair(l1, f_a);
             return nodes.at(l1).machine->last_commit_index() >= k;
-        }), "l1 did not commit old-term k:t1 before k+1:t3 reached quorum");
+        });
+        if (assert_safe)
+        {
+            require(!figure8_committed,
+                "figure8: leader illegally committed old-term k=" + std::to_string(k) + " before current-term quorum");
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
+        require(figure8_committed, "l1 did not commit old-term k:t1 before k+1:t3 reached quorum");
 
         std::cerr << "[" << mode << "] FIGURE-8 VIOLATION: l1 (term=" << t3 << ") committed k=" << k
                   << " (term=" << nodes.at(l1).log_store->term_at(k) << ") while"
@@ -473,6 +493,13 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << " term=" << nodes.at(l1).server->get_term()
                   << " target_commit=" << nodes.at(l1).server->get_target_committed_log_idx()
                   << " applied=" << nodes.at(l1).machine->last_commit_index() << "\n";
+        if (assert_safe)
+        {
+            require(!follower_committed,
+                "stale-ae-resp: stepped-down follower illegally committed k=" + std::to_string(k) + " from stale append_entries_response");
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(follower_committed, "Follower l1 did not commit via stale append_entries_response");
     }
     else if (mode == "stale-join-term")
@@ -527,6 +554,13 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         /// SimOracle's continuous term-monotonicity check will immediately catch term regression t2 -> t1!
         engine.runUntilMs(simTimeMs() + 4000);
         std::cerr << "[" << mode << "] N4 final term=" << nodes.at(4).server->get_term() << "\n";
+        if (assert_safe)
+        {
+            require(nodes.at(4).server->get_term() >= t2,
+                "stale-join-term: N4 term regressed below t2=" + std::to_string(t2));
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
     }
     else if (mode == "retry-join-hang")
     {
@@ -551,6 +585,12 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         std::cerr << "[" << mode << "] After 8000ms on healed link: N4 in config=" << joined
                   << " N4.term=" << nodes.at(4).server->get_term()
                   << " N4.applied=" << nodes.at(4).machine->last_commit_index() << "\n";
+        if (assert_safe)
+        {
+            require(joined, "retry-join-hang: N4 never joined within 8000ms after transient drop healed");
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(!joined, "N4 unexpectedly joined after transient error");
     }
     else if (mode == "prevote-disrupts-follower")
@@ -620,6 +660,14 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << ": N" << prevote_winner << ".term=" << new_term
                   << " l1.term=" << nodes.at(l1).server->get_term()
                   << " l1.is_leader=" << nodes.at(l1).server->is_leader() << "\n";
+        if (assert_safe)
+        {
+            require(new_term == t1 && nodes.at(l1).server->is_leader(),
+                "prevote-disrupts-follower: delayed pre_vote_response bumped term "
+                + std::to_string(t1) + " -> " + std::to_string(new_term));
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(new_term > t1, "Healthy follower did not disrupt leader upon delayed pre_vote_response");
     }
     else if (mode == "vote-resp-split-brain")
@@ -740,6 +788,14 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         std::cerr << "[" << mode << "] REPRODUCED TWO LEADERS IN SAME TERM " << target_term << "! "
                   << "N" << n_real << ".is_leader=" << real_is_leader << "(term=" << real_term << ") "
                   << "AND N" << n_cand << ".is_leader=" << cand_is_leader << "(term=" << cand_term << ")\n";
+        if (assert_safe)
+        {
+            require(!(real_is_leader && cand_is_leader && real_term == cand_term),
+                "vote-resp-split-brain: duplicate request_vote_response elected two leaders in term "
+                + std::to_string(target_term));
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(real_is_leader && cand_is_leader && real_term == cand_term,
             "Failed to elect two concurrent leaders in the same Raft term");
     }
@@ -772,6 +828,31 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         /// Call set_priority_v2 while remove_srv conf entry at conf1_idx is STILL UNCOMMITTED!
         const bool prio_ok = nodes.at(l1).server->set_priority_v2(f1, 10);
         const uint64_t conf2_idx = conf1_idx + 1;
+        if (assert_safe)
+        {
+            require(!prio_ok && nodes.at(l1).log_store->next_slot() == conf1_idx + 1,
+                "priority-conf-corrupt: set_priority_v2 appended concurrent uncommitted conf entry (Raft §6)");
+            nuraft::req_msg req(
+                nodes.at(l1).server->get_term(),
+                nuraft::msg_type::priority_change_request_v2,
+                f1,
+                l1,
+                nodes.at(l1).log_store->term_at(conf1_idx),
+                conf1_idx,
+                nodes.at(l1).machine->last_commit_index());
+            auto pbuf = nuraft::buffer::alloc(sizeof(int32_t) * 2);
+            nuraft::buffer_serializer bs(pbuf);
+            bs.put_i32(999);
+            bs.put_i32(42);
+            req.log_entries().push_back(nuraft::cs_new<nuraft::log_entry>(
+                nodes.at(l1).server->get_term(), pbuf, nuraft::log_val_type::custom));
+            const uint64_t slot_before_unknown = nodes.at(l1).log_store->next_slot();
+            auto resp = net.process_req(nodes.at(l1).server.get(), req);
+            require(resp && !resp->get_accepted() && nodes.at(l1).log_store->next_slot() == slot_before_unknown,
+                "priority-conf-corrupt: unknown server 999 appended bogus conf entry");
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(prio_ok && nodes.at(l1).log_store->next_slot() == conf2_idx + 1,
             "Expected set_priority_v2 to append 2nd concurrent uncommitted conf entry");
 
@@ -840,6 +921,11 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         std::cerr << "[" << mode << "] Sending out_of_log_range_warning with ctx_=nullptr to N" << f1 << " (expecting SIGSEGV)...\n";
         auto resp = net.process_req(nodes.at(f1).server.get(), req);
         (void)resp;
+        if (assert_safe)
+        {
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         throw std::runtime_error("Expected SIGSEGV in handle_out_of_log_msg did not happen");
     }
     else if (mode == "learner-takeover")
@@ -880,6 +966,14 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << nodes.at(4).server->get_config()->get_server(4)->is_learner()
                   << ") ran initiate_vote(true): term bumped " << learner_term_before
                   << " -> " << learner_term_after << "\n";
+        if (assert_safe)
+        {
+            require(learner_term_after == learner_term_before,
+                "learner-takeover: non-voting learner bumped term "
+                + std::to_string(learner_term_before) + " -> " + std::to_string(learner_term_after));
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(learner_term_after == learner_term_before + 1,
             "Learner did not increment term on leadership_takeover_request");
     }
@@ -920,6 +1014,14 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << ": stale join_cluster_request(term=" << t1 << ") rewound term "
                   << term_before << " -> " << term_after
                   << " (accepted=" << (resp && resp->get_accepted()) << ")\n";
+        if (assert_safe)
+        {
+            require(term_after >= term_before,
+                "join-term-rewind: stale join_cluster_request rewound term "
+                + std::to_string(term_before) + " -> " + std::to_string(term_after));
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(resp && resp->get_accepted() && term_after < term_before,
             "Expected join_cluster_request from stale term to rewind term");
     }
@@ -940,6 +1042,11 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
                   << " with nuraft_log_level=" << nuraft_log_level << " (expecting SIGSEGV)...\n";
         auto resp = net.process_req(nodes.at(f1).server.get(), empty_sync);
         (void)resp;
+        if (assert_safe)
+        {
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         throw std::runtime_error("Expected SIGSEGV in handle_log_sync_req did not happen");
     }
     else if (mode == "leave-resp-unchecked" || mode == "log-sync-rejected-joins")
@@ -981,6 +1088,32 @@ void runNuRaftLiveRepro(const std::string & mode, const std::filesystem::path & 
         require(cluster.addDynamicNode(l1, /*as_learner=*/false), "addDynamicNode failed");
         require(engine.runUntilCondition(2000, [&]() { return injected; }), "Hook was not triggered");
         const uint64_t next_after = nodes.at(l1).log_store->next_slot();
+        if (assert_safe)
+        {
+            net.on_deliver_response_hook = nullptr;
+            if (next_after > next_before)
+            {
+                auto last_le = nodes.at(l1).log_store->entry_at(next_after - 1);
+                if (last_le && last_le->get_val_type() == nuraft::log_val_type::conf)
+                {
+                    last_le->get_buf().pos(0);
+                    auto new_conf = nuraft::cluster_config::deserialize(last_le->get_buf());
+                    if (mode == "leave-resp-unchecked")
+                    {
+                        require(new_conf->get_server(f1) != nullptr,
+                            "leave-resp-unchecked: unchecked leave_cluster_response removed healthy peer N"
+                            + std::to_string(f1));
+                    }
+                    else
+                    {
+                        require(new_conf->get_server(4) == nullptr,
+                            "log-sync-rejected-joins: rejected sync_log_response still added joiner N4");
+                    }
+                }
+            }
+            std::cout << "PASS nuraft-safety-test: " << mode << '\n';
+            return;
+        }
         require(next_after > next_before, "Expected leader to append a conf entry");
 
         auto last_le = nodes.at(l1).log_store->entry_at(next_after - 1);
@@ -2485,6 +2618,7 @@ int main(int argc, char ** argv)
         uint16_t live_port_base = 0;
         size_t repro_nested_multi_depth = 0;
         std::string repro_nuraft_mode;
+        std::string nuraft_safety_mode;
         std::string repro_keeper_mode;
         bool strict_raft_commit = false;
         bool unsafe_quorum_control = false;
@@ -2511,13 +2645,14 @@ int main(int argc, char ** argv)
                 std::cout
                     << "ClickHouse Keeper Deterministic Simulation & Integration Test Runner\n\n"
                     << "Main modes:\n"
-                    << "  --ci                          Run full PR-CI suite (controls + 23 feature tests + 13 parallel live suites + 18 distributed DST scenarios + determinism replays + 58/58 coverage gate)\n"
+                    << "  --ci                          Run full PR-CI suite (controls + 29 feature tests + 15 parallel live suites + 14 parallel NuRaft protocol-safety tests + 23 distributed DST scenarios + determinism replays + 59/59 coverage gate)\n"
                     << "  --swarm --suite <name>        Run parallel swarm suite (ci, quick, full, hunt..hunt17)\n"
-                    << "  --feature-tests               Run all 23 deterministic Keeper subsystem feature tests\n"
+                    << "  --feature-tests               Run all 29 deterministic Keeper subsystem feature tests\n"
                     << "  --live-server-tests           Run all live KeeperDispatcher/TCP/HTTP/TLS/multi-node suites\n"
                     << "  --live-suite <name>           Filter --live-server-tests to one suite (see --list-live-suites)\n"
                     << "  --list-live-suites            Print all available --live-suite names and exit\n"
                     << "  --live-port-base <port>       Base loopback port for --live-server-tests\n"
+                    << "  --nuraft-safety-test <mode>   Run one positive NuRaft protocol-safety check\n"
                     << "  --instrumentation-control     Verify virtual clock and zero-thread isolation controls\n"
                     << "  --unsafe-quorum-control       Negative control verifying RaftSafetyOracle catches split-brain\n\n"
                     << "Common options:\n"
@@ -2680,6 +2815,8 @@ int main(int argc, char ** argv)
                 repro_nested_multi_depth = std::stoull(argv[++i]);
             else if (opt == "--repro-nuraft" && i + 1 < argc)
                 repro_nuraft_mode = argv[++i];
+            else if (opt == "--nuraft-safety-test" && i + 1 < argc)
+                nuraft_safety_mode = argv[++i];
             else if (opt == "--repro-keeper" && i + 1 < argc)
                 repro_keeper_mode = argv[++i];
             else if (opt == "--buggify")
@@ -2749,7 +2886,13 @@ int main(int argc, char ** argv)
 
         if (!repro_nuraft_mode.empty())
         {
-            runNuRaftLiveRepro(repro_nuraft_mode, state_dir, seed, nuraft_log_level);
+            runNuRaftLiveRepro(repro_nuraft_mode, state_dir, seed, nuraft_log_level, /*assert_safe=*/false);
+            return 0;
+        }
+
+        if (!nuraft_safety_mode.empty())
+        {
+            runNuRaftLiveRepro(nuraft_safety_mode, state_dir, seed, nuraft_log_level, /*assert_safe=*/true);
             return 0;
         }
 
