@@ -1597,4 +1597,4 @@ private:
     Stats stats;
 };
 
-} // namespace keeper_sim
+}

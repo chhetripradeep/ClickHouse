@@ -584,4 +584,4 @@ private:
     uint64_t next_id = 0;
 };
 
-} // namespace keeper_sim
+}

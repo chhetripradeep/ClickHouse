@@ -1819,4 +1819,4 @@ private:
     int64_t aml_last_yield_ms = 0;
 };
 
-} // namespace keeper_sim
+}

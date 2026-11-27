@@ -4,15 +4,23 @@
 
 #include <Common/AsynchronousMetrics.h>
 #include <Common/OpenTelemetryTraceContext.h>
+#include <Common/ZooKeeper/ErrorCounter.h>
 #include <Common/ZooKeeper/KeeperClientCLI/KeeperClient.h>
+#include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ZooKeeper/KeeperFeatureFlags.h>
 #include <Common/ZooKeeper/KeeperOverDispatcher.h>
+#include <Common/ZooKeeper/ShuffleHost.h>
+#include <Common/ZooKeeper/SystemTablesDataTypes.h>
 #include <Common/ZooKeeper/TestKeeper.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperIO.h>
+#include <Common/ZooKeeper/ZooKeeperPathUtils.h>
+#include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <Coordination/CompactChildrenSet.h>
 #include <Coordination/CoordinationSettings.h>
 #include <Coordination/FourLetterCommand.h>
+#include <Coordination/InMemoryLogStore.h>
 #include <Coordination/KeeperAsynchronousMetrics.h>
 #include <Coordination/KeeperConnectionStats.h>
 #include <Coordination/KeeperConstants.h>
@@ -27,12 +35,22 @@
 #include <Coordination/KeeperStateManager.h>
 #include <Coordination/KeeperStorage.h>
 #include <Coordination/KeeperStorageImpl.h>
+#include <Coordination/LoggerWrapper.h>
 #include <Coordination/RaftServerConfig.h>
+#include <Coordination/ReadBufferFromNuraftBuffer.h>
 #include <Coordination/SessionExpiryQueue.h>
+#include <Coordination/SnapshotableHashTable.h>
+#include <Coordination/Storage/BlockCache.h>
 #include <Coordination/Storage/Memtable.h>
+#include <Coordination/Storage/Node.h>
+#include <Coordination/Storage/NodeRefCache.h>
 #include <Coordination/Storage/SortedRun.h>
 #include <Coordination/Storage/StorageState.h>
+#include <Coordination/SummingStateMachine.h>
+#include <Coordination/WriteBufferFromNuraftBuffer.h>
 #include <Coordination/ZooKeeperDataReader.h>
+#include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Common/SharedMutex.h>
 #include <Core/ServerUUID.h>
 #include <Disks/DiskLocal.h>
@@ -40,6 +58,7 @@
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromString.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <Server/CloudPlacementInfo.h>
 
 #include <atomic>
 #include <cstdint>
@@ -69,6 +88,16 @@ namespace DB::CoordinationSetting
     extern const CoordinationSettingsUInt64 write_throttling_min_delay_us;
     extern const CoordinationSettingsUInt64 write_throttling_max_delay_us;
     extern const CoordinationSettingsFloat write_throttling_factor;
+    extern const CoordinationSettingsBool compress_snapshots_with_zstd_format;
+    extern const CoordinationSettingsUInt64 snapshots_to_keep;
+    extern const CoordinationSettingsUInt64 committed_memtable_size;
+    extern const CoordinationSettingsUInt64 block_cache_size;
+    extern const CoordinationSettingsUInt64 sorted_file_uncompressed_size;
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
 }
 
 namespace keeper_sim
@@ -1507,7 +1536,1627 @@ inline void testLsmtWriteThrottlingFdMetricsAndAuthConfig(const std::filesystem:
     std::cout << "  [PASS] feature: lsmt_write_throttling_fd_metrics_and_auth_config\n";
 }
 
-} // namespace feature_tests_detail
+/// 14. Differential test of `CompactChildrenSet` against `std::unordered_set<std::string>`
+/// across all 3 tagged-pointer states (Empty -> Single -> Set -> 300-child fanout -> demote -> Empty + copy/move).
+inline void testCompactChildrenSetDifferential()
+{
+    std::vector<std::string> arena;
+    arena.reserve(350);
+    for (int i = 0; i < 350; ++i)
+        arena.push_back("child_" + std::to_string(i));
+
+    DB::CompactChildrenSet cset;
+    std::unordered_set<std::string> ref;
+
+    auto verify_eq = [&]()
+    {
+        require(cset.size() == ref.size(), "CompactChildrenSet size mismatch");
+        require(cset.empty() == ref.empty(), "CompactChildrenSet empty mismatch");
+        size_t seen = 0;
+        for (std::string_view sv : cset)
+        {
+            require(ref.contains(std::string(sv)), "CompactChildrenSet unexpected element: " + std::string(sv));
+            ++seen;
+        }
+        require(seen == ref.size(), "CompactChildrenSet iterator count mismatch");
+        for (const auto & k : ref)
+            require(cset.contains(k), "CompactChildrenSet missing element: " + k);
+    };
+
+    verify_eq();
+    /// Empty -> Single
+    cset.insert(arena[0]);
+    ref.insert(arena[0]);
+    verify_eq();
+    /// Duplicate insert in Single state
+    cset.insert(arena[0]);
+    verify_eq();
+    /// Single -> Set (2 elements) -> 300 elements
+    for (int i = 1; i < 300; ++i)
+    {
+        cset.insert(arena[i]);
+        ref.insert(arena[i]);
+    }
+    verify_eq();
+    /// Copy constructor & move constructor in Set state
+    DB::CompactChildrenSet copied(cset);
+    require(copied.size() == 300 && copied.contains(arena[150]), "CompactChildrenSet copy mismatch");
+    DB::CompactChildrenSet moved(std::move(copied));
+    require(moved.size() == 300 && moved.contains(arena[299]), "CompactChildrenSet move mismatch");
+
+    /// Erase down from 300 -> 1 (demote Set -> Single) -> 0 (Single -> Empty)
+    for (int i = 0; i < 299; ++i)
+    {
+        cset.erase(arena[i]);
+        ref.erase(arena[i]);
+    }
+    verify_eq();
+    cset.erase(arena[299]);
+    ref.erase(arena[299]);
+    verify_eq();
+
+    /// Re-grow after empty
+    cset.insert(arena[301]);
+    ref.insert(arena[301]);
+    cset.insert(arena[302]);
+    ref.insert(arena[302]);
+    verify_eq();
+    std::cout << "  [PASS] feature: compact_children_set_differential\n";
+}
+
+/// 15. Persistent (`PERSISTENT`) & Persistent-Recursive (`PERSISTENT_RECURSIVE`) watch semantics,
+/// `CheckWatch`, `RemoveWatch`, `SetWatch`, and `SetWatch2` on BOTH `Mem` and `LSMT-Mem`!
+inline void testPersistentAndRecursiveWatchSemantics(const std::filesystem::path & root_dir)
+{
+    for (const bool use_lsmt : {false, true})
+    {
+        const auto dir = root_dir / (use_lsmt ? "pwatch_lsmt" : "pwatch_mem");
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("PWSnapDisk", (dir / "snapshots").string() + "/");
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = use_lsmt;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = true;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        DB::SnapshotsQueue sq(4);
+
+        std::optional<DB::KeeperResponseForSession> captured;
+        std::vector<std::pair<int64_t, Coordination::WatchResponse>> watch_events;
+        auto on_resp = [&](DB::KeeperResponseForSession r)
+        {
+            if (r.response && r.response->xid == Coordination::WATCH_XID)
+            {
+                if (auto * wr = dynamic_cast<Coordination::WatchResponse *>(r.response.get()))
+                    watch_events.emplace_back(r.session_id, *wr);
+            }
+            else
+            {
+                captured = std::move(r);
+            }
+        };
+
+        DB::KeeperStateMachine sm(on_resp, sq, ctx, nullptr);
+        sm.init();
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000040000LL;
+
+        for (int s = 1; s <= 2; ++s)
+        {
+            auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+            sreq->xid = s;
+            sreq->session_timeout_ms = 60000;
+            require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+        }
+
+        auto mk_create = [&](const std::string & p, const std::string & d, int64_t xid)
+        {
+            auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            c->xid = xid;
+            c->path = p;
+            c->data = d;
+            c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            require(applyDirect(sm, idx, 2, c, t0, captured)->error == Coordination::Error::ZOK, "Create failed: " + p);
+        };
+        auto mk_set = [&](const std::string & p, const std::string & d, int64_t xid)
+        {
+            auto s = std::make_shared<Coordination::ZooKeeperSetRequest>();
+            s->xid = xid;
+            s->path = p;
+            s->data = d;
+            s->version = -1;
+            require(applyDirect(sm, idx, 2, s, t0, captured)->error == Coordination::Error::ZOK, "Set failed: " + p);
+        };
+
+        mk_create("/pw", "root", 10);
+        mk_create("/pw/a", "a0", 11);
+
+        /// 1. Install `PERSISTENT` watch on `/pw` for session 1 -> MUST fire repeatedly!
+        {
+            auto aw = std::make_shared<Coordination::ZooKeeperAddWatchRequest>();
+            aw->xid = 20;
+            aw->path = "/pw";
+            aw->mode = Coordination::AddWatchRequest::AddWatchMode::PERSISTENT;
+            require(readDirect(sm, 1, aw, t0, captured)->error == Coordination::Error::ZOK, "AddWatch PERSISTENT failed");
+        }
+        watch_events.clear();
+        mk_set("/pw", "root1", 21);
+        mk_set("/pw", "root2", 22);
+        size_t pw_hits = 0;
+        for (const auto & [sid, we] : watch_events)
+            if (sid == 1 && we.path == "/pw" && we.type == Coordination::Event::CHANGED)
+                ++pw_hits;
+        require(pw_hits == 2, "PERSISTENT watch must fire repeatedly on both Set ops, got " + std::to_string(pw_hits));
+
+        /// 2. `CheckWatch` returns ZOK while installed, then `RemoveWatch` removes it -> `CheckWatch` returns ZNOWATCHER!
+        {
+            auto cw = std::make_shared<Coordination::ZooKeeperCheckWatchRequest>();
+            cw->xid = 23;
+            cw->path = "/pw";
+            cw->type = Coordination::CheckWatchRequest::CheckWatchType::PERSISTENT;
+            require(readDirect(sm, 1, cw, t0, captured)->error == Coordination::Error::ZOK, "CheckWatch expected ZOK");
+
+            auto rw = std::make_shared<Coordination::ZooKeeperRemoveWatchRequest>();
+            rw->xid = 24;
+            rw->path = "/pw";
+            rw->type = Coordination::RemoveWatchRequest::WatchType::PERSISTENT;
+            require(readDirect(sm, 1, rw, t0, captured)->error == Coordination::Error::ZOK, "RemoveWatch expected ZOK");
+
+            auto cw2 = std::make_shared<Coordination::ZooKeeperCheckWatchRequest>();
+            cw2->xid = 25;
+            cw2->path = "/pw";
+            cw2->type = Coordination::CheckWatchRequest::CheckWatchType::PERSISTENT;
+            require(readDirect(sm, 1, cw2, t0, captured)->error == Coordination::Error::ZNOWATCHER, "CheckWatch after remove expected ZNOWATCHER");
+        }
+        watch_events.clear();
+        mk_set("/pw", "root3", 26);
+        require(watch_events.empty(), "Removed PERSISTENT watch must not fire");
+
+        /// 3. `PERSISTENT_RECURSIVE` watch on `/pw` fires on deep descendant `/pw/a/b/c`!
+        {
+            auto aw = std::make_shared<Coordination::ZooKeeperAddWatchRequest>();
+            aw->xid = 30;
+            aw->path = "/pw";
+            aw->mode = Coordination::AddWatchRequest::AddWatchMode::PERSISTENT_RECURSIVE;
+            require(readDirect(sm, 1, aw, t0, captured)->error == Coordination::Error::ZOK, "AddWatch PERSISTENT_RECURSIVE failed");
+        }
+        watch_events.clear();
+        mk_create("/pw/a/b", "b0", 31);
+        mk_create("/pw/a/b/c", "c0", 32);
+        mk_set("/pw/a/b/c", "c1", 33);
+        size_t deep_hits = 0;
+        for (const auto & [sid, we] : watch_events)
+            if (sid == 1 && (we.path == "/pw/a/b" || we.path == "/pw/a/b/c"))
+                ++deep_hits;
+        require(deep_hits >= 3, "PERSISTENT_RECURSIVE watch missed deep descendant events, got " + std::to_string(deep_hits));
+
+        /// 4. `SetWatch` & `SetWatch2` with stale `zxid = 0` immediately fire missed `CHANGED` event on `/pw`!
+        watch_events.clear();
+        {
+            auto sw = std::make_shared<Coordination::ZooKeeperSetWatchesRequest>();
+            sw->xid = 40;
+            sw->zxid = 0;
+            sw->data_watches = {"/pw"};
+            require(readDirect(sm, 2, sw, t0, captured)->error == Coordination::Error::ZOK, "SetWatch failed");
+        }
+        require(!watch_events.empty(), "SetWatch with stale zxid=0 should fire missed event on /pw");
+
+        watch_events.clear();
+        {
+            auto sw2 = std::make_shared<Coordination::ZooKeeperSetWatches2Request>();
+            sw2->xid = 41;
+            sw2->zxid = 0;
+            sw2->data_watches = {"/pw/a/b/c"};
+            sw2->persistent_watches = {"/pw/a"};
+            require(readDirect(sm, 2, sw2, t0, captured)->error == Coordination::Error::ZOK, "SetWatch2 failed");
+        }
+        require(!watch_events.empty(), "SetWatch2 with stale zxid=0 should fire missed event");
+
+        sm.shutdownStorage();
+    }
+    std::cout << "  [PASS] feature: persistent_and_recursive_watches_semantics\n";
+}
+
+/// 16. Extended Keeper operations (`Create2`, `CheckNotExists`, `CheckStat` all fields,
+/// `ListRecursive` limit, `RemoveRecursive` limit enforcement, `FilteredListWithStatsAndData`,
+/// and `Container GC` `max_never_used_interval_ms > 0`).
+inline void testExtendedOpsLimitsAndNeverUsedContainerGc(const std::filesystem::path & root_dir)
+{
+    const auto dir = root_dir / "ext_ops";
+    std::filesystem::create_directories(dir / "snapshots");
+    auto snap_disk = std::make_shared<DB::DiskLocal>("ExtSnapDisk", (dir / "snapshots").string() + "/");
+    auto settings = std::make_shared<DB::CoordinationSettings>();
+    (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+    auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+    ctx->setSnapshotDisk(snap_disk);
+    DB::SnapshotsQueue sq(4);
+
+    std::optional<DB::KeeperResponseForSession> captured;
+    DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+    sm.init();
+    uint64_t idx = 0;
+    const int64_t t0 = 1700000050000LL;
+
+    auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+    sreq->xid = 1;
+    sreq->session_timeout_ms = 60000;
+    require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+
+    /// 1. `Create2` (`include_stats = true`) returns populated `Stat`.
+    Coordination::Stat root_stat{};
+    {
+        auto c2 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c2->xid = 10;
+        c2->path = "/ext";
+        c2->data = "hello";
+        c2->include_stats = true;
+        c2->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        auto r = applyDirect(sm, idx, 1, c2, t0, captured);
+        auto * cr = dynamic_cast<Coordination::ZooKeeperCreate2Response *>(r.get());
+        require(cr && cr->error == Coordination::Error::ZOK && cr->zstat.dataLength == 5 && cr->zstat.version == 0,
+            "Create2 stat mismatch");
+        root_stat = cr->zstat;
+    }
+    /// 2. `CheckNotExists` (fails with ZNODEEXISTS on `/ext`, succeeds with ZOK on `/ext/absent`).
+    {
+        auto cne1 = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+        cne1->xid = 11;
+        cne1->path = "/ext";
+        cne1->not_exists = true;
+        cne1->version = -1;
+        require(applyDirect(sm, idx, 1, cne1, t0, captured)->error == Coordination::Error::ZNODEEXISTS,
+            "CheckNotExists on existing node expected ZNODEEXISTS");
+
+        auto cne2 = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+        cne2->xid = 12;
+        cne2->path = "/ext/absent";
+        cne2->not_exists = true;
+        cne2->version = -1;
+        require(applyDirect(sm, idx, 1, cne2, t0, captured)->error == Coordination::Error::ZOK,
+            "CheckNotExists on absent node expected ZOK");
+    }
+    /// 3. `CheckStat` exact match vs mismatch.
+    {
+        auto cs = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+        cs->xid = 13;
+        cs->path = "/ext";
+        cs->stat_to_check = root_stat;
+        require(applyDirect(sm, idx, 1, cs, t0, captured)->error == Coordination::Error::ZOK, "CheckStat exact match expected ZOK");
+
+        cs->xid = 14;
+        cs->stat_to_check->dataLength = 999;
+        require(applyDirect(sm, idx, 1, cs, t0, captured)->error == Coordination::Error::ZBADVERSION,
+            "CheckStat dataLength mismatch expected ZBADVERSION");
+    }
+    /// 4. Populate persistent + ephemeral subtree and test `FilteredListWithStatsAndData` + `ListRecursive` limit + `RemoveRecursive` limit!
+    for (int i = 0; i < 4; ++i)
+    {
+        auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c->xid = 20 + i;
+        c->path = "/ext/p" + std::to_string(i);
+        c->data = "pv" + std::to_string(i);
+        c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c, t0, captured)->error == Coordination::Error::ZOK, "Create persistent child failed");
+    }
+    {
+        auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c->xid = 25;
+        c->path = "/ext/e0";
+        c->data = "ev0";
+        c->is_ephemeral = true;
+        c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c, t0, captured)->error == Coordination::Error::ZOK, "Create ephemeral child failed");
+    }
+    /// `FilteredListWithStatsAndData` EPHEMERAL_ONLY vs PERSISTENT_ONLY
+    {
+        auto fl = std::make_shared<Coordination::ZooKeeperListRequest>();
+        fl->xid = 30;
+        fl->path = "/ext";
+        fl->list_request_type = Coordination::ListRequestType::EPHEMERAL_ONLY;
+        fl->with_stat = true;
+        fl->with_data = true;
+        auto r = readDirect(sm, 1, fl, t0, captured);
+        auto * lr = dynamic_cast<Coordination::ZooKeeperListResponse *>(r.get());
+        require(lr && lr->error == Coordination::Error::ZOK && lr->names.size() == 1
+            && lr->names[0] == "e0" && lr->data.size() == 1 && lr->data[0] == "ev0"
+            && lr->stats.size() == 1 && lr->stats[0].ephemeralOwner == 1,
+            "FilteredListWithStatsAndData EPHEMERAL_ONLY mismatch");
+    }
+    /// `ListRecursive` with `children_nodes_limit = 2` returns bounded subset
+    {
+        auto lr_req = std::make_shared<Coordination::ZooKeeperListRecursiveRequest>();
+        lr_req->xid = 31;
+        lr_req->path = "/ext";
+        lr_req->children_nodes_limit = 2;
+        auto r = readDirect(sm, 1, lr_req, t0, captured);
+        auto * lr = dynamic_cast<Coordination::ZooKeeperListRecursiveResponse *>(r.get());
+        require(lr && lr->error == Coordination::Error::ZOK && lr->children.size() == 2,
+            "ListRecursive limit=2 mismatch");
+    }
+    /// `RemoveRecursive` with `remove_nodes_limit = 2` (subtree has 6 nodes) MUST fail without deleting `/ext`!
+    {
+        auto rr_small = std::make_shared<Coordination::ZooKeeperRemoveRecursiveRequest>();
+        rr_small->xid = 32;
+        rr_small->path = "/ext";
+        rr_small->remove_nodes_limit = 2;
+        auto r = applyDirect(sm, idx, 1, rr_small, t0, captured);
+        require(r && r->error != Coordination::Error::ZOK, "RemoveRecursive limit=2 should fail on 6-node subtree");
+
+        auto rr_ok = std::make_shared<Coordination::ZooKeeperRemoveRecursiveRequest>();
+        rr_ok->xid = 33;
+        rr_ok->path = "/ext";
+        rr_ok->remove_nodes_limit = 16;
+        require(applyDirect(sm, idx, 1, rr_ok, t0, captured)->error == Coordination::Error::ZOK,
+            "RemoveRecursive limit=16 should delete subtree");
+    }
+    /// 5. Never-used Container GC (`collectContainerCandidates`): kept before grace period, eligible after grace period!
+    {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        auto cc = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        cc->xid = 40;
+        cc->path = "/never_used_container";
+        cc->is_container = true;
+        cc->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, cc, now_ms - 5000, captured)->error == Coordination::Error::ZOK, "Create container failed");
+
+        auto has_path = [](const std::vector<std::pair<std::string, Int32>> & candidates, const std::string & p)
+        {
+            return std::any_of(candidates.begin(), candidates.end(), [&](const auto & item) { return item.first == p; });
+        };
+
+        auto early = sm.getStorageUnsafe().collectContainerCandidates(16, /*max_never_used_interval_ms=*/60000);
+        require(!has_path(early, "/never_used_container"),
+            "Never-used container should NOT be GC'd before max_never_used_interval_ms");
+
+        auto mature = sm.getStorageUnsafe().collectContainerCandidates(16, /*max_never_used_interval_ms=*/1000);
+        require(has_path(mature, "/never_used_container"),
+            "Never-used container MUST be eligible for GC after max_never_used_interval_ms");
+    }
+
+    sm.shutdownStorage();
+    std::cout << "  [PASS] feature: extended_ops_check_stat_limits_and_never_used_container_gc\n";
+}
+
+/// 17. Cross-version snapshot matrix (V5, V6, V7, V8, V9 x Zstd/uncompressed loaded into Mem & LSMT-Mem)
+/// + corrupted latest snapshot fallback to previous valid snapshot!
+inline void testCrossVersionSnapshotMatrixAndCorruptFallback(const std::filesystem::path & root_dir)
+{
+    const std::array<uint64_t, 5> versions = {5, 6, 7, 8, 9};
+    for (const uint64_t ver : versions)
+    {
+        const bool compress = (ver % 2 == 1);
+        const auto dir = root_dir / ("snap_v" + std::to_string(ver));
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("VSnapDisk", (dir / "snapshots").string() + "/");
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::write_snapshot_version] = ver;
+        (*settings)[DB::CoordinationSetting::compress_snapshots_with_zstd_format] = compress;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        ctx->setDigestEnabled(true);
+        DB::SnapshotsQueue sq(4);
+        std::optional<DB::KeeperResponseForSession> captured;
+        DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+        sm.init();
+
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000060000LL;
+        auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+        sreq->xid = 1;
+        sreq->session_timeout_ms = 60000;
+        require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+
+        auto auth = std::make_shared<Coordination::ZooKeeperAuthRequest>();
+        auth->xid = 2;
+        auth->scheme = "digest";
+        auth->data = "u1:pw1";
+        require(applyDirect(sm, idx, 1, auth, t0, captured)->error == Coordination::Error::ZOK, "Auth failed");
+
+        auto c1 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c1->xid = 3;
+        c1->path = "/pers";
+        c1->data = "data_v" + std::to_string(ver);
+        c1->acls = {{Coordination::ACL::All, "auth", ""}};
+        require(applyDirect(sm, idx, 1, c1, t0, captured)->error == Coordination::Error::ZOK, "Create /pers failed");
+
+        auto c2 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c2->xid = 4;
+        c2->path = "/eph";
+        c2->data = "eph_val";
+        c2->is_ephemeral = true;
+        c2->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c2, t0, captured)->error == Coordination::Error::ZOK, "Create /eph failed");
+
+        const uint64_t expected_digest = sm.getStorageUnsafe().getNodesDigest(true, true).value;
+        auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "1", "", false, 1));
+        nuraft::snapshot snp(idx, 1, cfg);
+        nuraft::async_result<bool>::handler_type done = [](bool &, nuraft::ptr<std::exception> &) {};
+        sm.create_snapshot(snp, done);
+        DB::CreateSnapshotTask task;
+        require(sq.tryPop(task), "Snapshot task not queued for version " + std::to_string(ver));
+        task.create_snapshot(std::move(task.snapshot), /*execute_only_cleanup=*/false);
+        sm.shutdownStorage();
+
+        /// Reload the V{ver} snapshot into BOTH Mem and LSMT-Mem and verify identical digest + payloads!
+        for (const bool load_lsmt : {false, true})
+        {
+            auto lsettings = std::make_shared<DB::CoordinationSettings>();
+            (*lsettings)[DB::CoordinationSetting::use_lsmt_storage] = load_lsmt;
+            (*lsettings)[DB::CoordinationSetting::storage_memory_only] = true;
+            (*lsettings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+            auto lctx = std::make_shared<DB::KeeperContext>(true, lsettings);
+            lctx->setSnapshotDisk(snap_disk);
+            lctx->setDigestEnabled(true);
+            DB::SnapshotsQueue lsq(4);
+            DB::KeeperStateMachine lsm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, lsq, lctx, nullptr);
+            lsm.init();
+            require(lsm.last_commit_index() == idx, "Reloaded snapshot last_commit_index mismatch");
+            require(lsm.getStorageUnsafe().getNodesDigest(true, true).value == expected_digest,
+                "Cross-version snapshot digest mismatch for V" + std::to_string(ver));
+
+            auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g->xid = 99;
+            g->path = "/eph";
+            auto gr_ptr = readDirect(lsm, 1, g, t0, captured);
+            auto * gr = dynamic_cast<Coordination::ZooKeeperGetResponse *>(gr_ptr.get());
+            require(gr && gr->error == Coordination::Error::ZOK && gr->data == "eph_val",
+                "Reloaded snapshot /eph payload mismatch for V" + std::to_string(ver));
+            lsm.shutdownStorage();
+        }
+    }
+
+    /// Corrupted latest snapshot fallback when `snapshots_to_keep = 3`!
+    {
+        const auto dir = root_dir / "snap_corrupt_fallback";
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("CorruptSnapDisk", (dir / "snapshots").string() + "/");
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::snapshots_to_keep] = 3;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        ctx->setDigestEnabled(true);
+        DB::SnapshotsQueue sq(4);
+        std::optional<DB::KeeperResponseForSession> captured;
+        DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+        sm.init();
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000070000LL;
+        auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "1", "", false, 1));
+
+        auto take_snap = [&]()
+        {
+            nuraft::snapshot snp(idx, 1, cfg);
+            nuraft::async_result<bool>::handler_type done = [](bool &, nuraft::ptr<std::exception> &) {};
+            sm.create_snapshot(snp, done);
+            DB::CreateSnapshotTask task;
+            require(sq.tryPop(task), "Expected snapshot task");
+            return task.create_snapshot(std::move(task.snapshot), false);
+        };
+
+        auto c1 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c1->xid = 1;
+        c1->path = "/good_snap1";
+        c1->data = "snap1";
+        c1->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c1, t0, captured)->error == Coordination::Error::ZOK, "Create /good_snap1 failed");
+        const uint64_t snap1_idx = idx;
+        (void)take_snap();
+
+        auto c2 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c2->xid = 2;
+        c2->path = "/corrupt_snap2";
+        c2->data = "snap2";
+        c2->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c2, t0, captured)->error == Coordination::Error::ZOK, "Create /corrupt_snap2 failed");
+        const auto snap2_info = take_snap();
+        sm.shutdownStorage();
+
+        /// Corrupt the latest snapshot file on disk (overwrite with garbage bytes)!
+        const auto bad_path = dir / "snapshots" / snap2_info->path;
+        {
+            DB::WriteBufferFromFile wb(bad_path.string());
+            wb.write("CORRUPT_TRUNCATED_GARBAGE", 25);
+            wb.finalize();
+        }
+
+        /// Re-init MUST fail closed with `CORRUPTED_DATA` rather than silently discarding latest state!
+        {
+            DB::SnapshotsQueue sq_fail(4);
+            DB::KeeperStateMachine sm_fail([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq_fail, ctx, nullptr);
+            bool threw_corrupt = false;
+            try
+            {
+                sm_fail.init();
+            }
+            catch (const DB::Exception & e)
+            {
+                threw_corrupt = (e.code() == DB::ErrorCodes::CORRUPTED_DATA);
+            }
+            require(threw_corrupt, "Corrupted latest snapshot MUST fail closed with CORRUPTED_DATA");
+            sm_fail.shutdownStorage();
+        }
+
+        /// After operator removes the corrupted latest snapshot, `snapshots_to_keep = 3` enables clean recovery to `snap1_idx`!
+        std::filesystem::remove(bad_path);
+        DB::SnapshotsQueue sq2(4);
+        DB::KeeperStateMachine sm2([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq2, ctx, nullptr);
+        sm2.init();
+        require(sm2.last_commit_index() == snap1_idx,
+            "Recovery after removing corrupted snapshot did not load snap1_idx=" + std::to_string(snap1_idx)
+            + " (got " + std::to_string(sm2.last_commit_index()) + ")");
+        auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+        g->xid = 3;
+        g->path = "/good_snap1";
+        auto gr_ptr = readDirect(sm2, 1, g, t0, captured);
+        auto * gr = dynamic_cast<Coordination::ZooKeeperGetResponse *>(gr_ptr.get());
+        require(gr && gr->error == Coordination::Error::ZOK && gr->data == "snap1", "Recovered snapshot missing /good_snap1");
+        sm2.shutdownStorage();
+    }
+    std::cout << "  [PASS] feature: cross_version_snapshot_matrix_and_corrupt_fallback\n";
+}
+
+/// 18. Compressed `Changelog` (`compress_logs = true`) + `compact` + cross-file `write_at` truncation
+/// + torn trailing record recovery, AND on-disk `KeeperLSMTNodesStorage` flush/merge/tombstone/reopen!
+inline void testCompressedChangelogTruncateCompactAndLsmtDiskReopen(const std::filesystem::path & root_dir)
+{
+    /// Part A: Zstd-compressed `Changelog` rotation, compaction, cross-file `write_at` truncation, and torn tail recovery.
+    {
+        const auto dir = root_dir / "changelog_zstd_ops";
+        std::filesystem::create_directories(dir / "logs");
+        auto log_disk = std::make_shared<DB::DiskLocal>("ZstdLogDisk", (dir / "logs").string() + "/");
+        auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+        ctx->setLogDisk(log_disk);
+
+        auto make_entry = [](uint64_t term, const std::string & s)
+        {
+            auto buf = nuraft::buffer::alloc(s.size());
+            memcpy(buf->data_begin(), s.data(), s.size());
+            return nuraft::cs_new<nuraft::log_entry>(term, buf, nuraft::app_log);
+        };
+
+        {
+            auto ls = nuraft::cs_new<DB::KeeperLogStore>(
+                DB::LogFileSettings{.force_sync = true, .compress_logs = true, .rotate_interval = 5},
+                DB::FlushSettings{.max_flush_batch_size = 4, .min_time_between_fsyncs_ms = 0},
+                DB::ReadAheadSettings{},
+                ctx,
+                DB::Changelog::ExecutionMode::Threaded);
+            ls->init(0, 1000);
+            for (uint64_t i = 1; i <= 30; ++i)
+            {
+                auto e = make_entry(1, "zstd-val-" + std::to_string(i));
+                require(ls->append(e) == i, "Zstd changelog append mismatch");
+            }
+            require(ls->flush(), "Zstd changelog flush failed");
+            ls->end_of_append_batch(1, 30);
+
+            /// Compact entries up to 10 (removes old rotated files) and truncate via `write_at(22, ...)`.
+            require(ls->compact(10), "Zstd changelog compact(10) failed");
+            auto replacement = make_entry(2, "zstd-rewritten-22");
+            ls->write_at(22, replacement);
+            require(ls->flush(), "Zstd changelog flush after write_at failed");
+            ls->end_of_append_batch(22, 1);
+            ls->shutdownChangelog();
+        }
+
+        /// Reopen and verify exact compacted + truncated range [11..22]!
+        {
+            auto ls = nuraft::cs_new<DB::KeeperLogStore>(
+                DB::LogFileSettings{.force_sync = true, .compress_logs = true, .rotate_interval = 5},
+                DB::FlushSettings{.max_flush_batch_size = 4, .min_time_between_fsyncs_ms = 0},
+                DB::ReadAheadSettings{},
+                ctx,
+                DB::Changelog::ExecutionMode::Threaded);
+            ls->init(10, 1000);
+            require(ls->start_index() == 11 && ls->next_slot() == 23,
+                "Zstd changelog reopen bounds mismatch: start=" + std::to_string(ls->start_index())
+                + " next=" + std::to_string(ls->next_slot()));
+            auto e22 = ls->entry_at(22);
+            require(e22 && e22->get_term() == 2, "Truncated entry 22 term mismatch");
+            const std::string v22(reinterpret_cast<const char *>(e22->get_buf().data_begin()), e22->get_buf().size());
+            require(v22 == "zstd-rewritten-22", "Truncated entry 22 payload mismatch: " + v22);
+            ls->shutdownChangelog();
+        }
+    }
+
+    /// Part B: Real on-disk `KeeperLSMTNodesStorage` flush -> merge -> huge values -> tombstones -> reopen!
+    {
+        const auto dir = root_dir / "lsmt_disk_durability";
+        std::filesystem::create_directories(dir / "snapshots");
+        std::filesystem::create_directories(dir / "data");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("LsmtDurSnapDisk", (dir / "snapshots").string() + "/");
+        auto data_disk = std::make_shared<DB::DiskLocal>("LsmtDurDataDisk", (dir / "data").string() + "/");
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = true;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = false;
+        (*settings)[DB::CoordinationSetting::committed_memtable_size] = 4096;
+        (*settings)[DB::CoordinationSetting::block_cache_size] = 4096;
+        (*settings)[DB::CoordinationSetting::sorted_file_uncompressed_size] = 4096;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        ctx->setDataDisk(data_disk);
+        ctx->setDigestEnabled(true);
+
+        uint64_t saved_idx = 0;
+        uint64_t saved_digest = 0;
+        const std::string huge_payload(6144, 'H');
+        {
+            DB::SnapshotsQueue sq(4);
+            std::optional<DB::KeeperResponseForSession> captured;
+            DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+            sm.init();
+            uint64_t idx = 0;
+            const int64_t t0 = 1700000080000LL;
+
+            for (int i = 0; i < 30; ++i)
+            {
+                auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+                c->xid = 10 + i;
+                c->path = "/k" + std::to_string(i);
+                c->data = (i == 0) ? huge_payload : ("val_" + std::to_string(i) + "_" + std::string(128, 'x'));
+                c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+                require(applyDirect(sm, idx, 1, c, t0, captured)->error == Coordination::Error::ZOK, "LSMT create failed");
+            }
+            /// Overwrite & delete (tombstones) across multiple memtables/flushes.
+            for (int i = 1; i <= 10; ++i)
+            {
+                auto rm = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+                rm->xid = 100 + i;
+                rm->path = "/k" + std::to_string(i);
+                rm->version = -1;
+                require(applyDirect(sm, idx, 1, rm, t0, captured)->error == Coordination::Error::ZOK, "LSMT remove failed");
+            }
+            saved_idx = idx;
+            saved_digest = sm.getStorageUnsafe().getNodesDigest(true, true).value;
+
+            /// Persist snapshot so reopen reloads from on-disk snapshot + LSMT storage!
+            auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+            cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "1", "", false, 1));
+            nuraft::snapshot snp(idx, 1, cfg);
+            nuraft::async_result<bool>::handler_type done = [](bool &, nuraft::ptr<std::exception> &) {};
+            sm.create_snapshot(snp, done);
+            DB::CreateSnapshotTask task;
+            require(sq.tryPop(task), "LSMT snapshot task missing");
+            task.create_snapshot(std::move(task.snapshot), false);
+            sm.shutdownStorage();
+        }
+
+        /// Reopen fresh on-disk LSMT state machine and verify digest, huge value, surviving keys, and deleted tombstones!
+        {
+            DB::SnapshotsQueue sq(4);
+            std::optional<DB::KeeperResponseForSession> captured;
+            DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+            sm.init();
+            require(sm.last_commit_index() == saved_idx, "LSMT reopen commit idx mismatch");
+            require(sm.getStorageUnsafe().getNodesDigest(true, true).value == saved_digest, "LSMT reopen digest mismatch");
+
+            auto g0 = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g0->xid = 1;
+            g0->path = "/k0";
+            auto r0 = readDirect(sm, 1, g0, 1700000080000LL, captured);
+            auto * gr0 = dynamic_cast<Coordination::ZooKeeperGetResponse *>(r0.get());
+            require(gr0 && gr0->error == Coordination::Error::ZOK && gr0->data == huge_payload, "LSMT reopen huge value mismatch");
+
+            auto g5 = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g5->xid = 2;
+            g5->path = "/k5";
+            require(readDirect(sm, 1, g5, 1700000080000LL, captured)->error == Coordination::Error::ZNONODE,
+                "LSMT reopen resurrected deleted tombstone /k5");
+            sm.shutdownStorage();
+        }
+    }
+    std::cout << "  [PASS] feature: changelog_compress_truncate_compact_and_lsmt_disk_compaction\n";
+}
+
+/// 19. `InMemoryLogStore`, `SummingStateMachine`, LSMT `BlockCache`, MVCC `SnapshotableHashTable`,
+/// and `ZooKeeperPathUtils` normalization/extraction!
+inline void testInMemoryLogStoreSummingSMBlockCacheSnapshotableHTAndPathUtils()
+{
+    /// 1. `DB::InMemoryLogStore` append, write_at truncation, pack/apply_pack, compact, is_conf.
+    {
+        DB::InMemoryLogStore ls;
+        require(ls.start_index() == 1 && ls.next_slot() == 1, "InMemoryLogStore initial bounds mismatch");
+
+        auto make_entry = [](uint64_t term, const std::string & s, nuraft::log_val_type vt = nuraft::app_log)
+        {
+            auto buf = nuraft::buffer::alloc(s.size());
+            memcpy(buf->data_begin(), s.data(), s.size());
+            return nuraft::cs_new<nuraft::log_entry>(term, buf, vt);
+        };
+
+        for (uint64_t i = 1; i <= 6; ++i)
+        {
+            auto e = make_entry(i <= 3 ? 1 : 2, "im-" + std::to_string(i), i == 3 ? nuraft::conf : nuraft::app_log);
+            require(ls.append(e) == i, "InMemoryLogStore append index mismatch");
+        }
+        require(ls.next_slot() == 7 && ls.term_at(4) == 2 && ls.is_conf(3) && !ls.is_conf(4),
+            "InMemoryLogStore term_at/is_conf mismatch");
+
+        auto range = ls.log_entries(2, 5);
+        require(range && range->size() == 3, "InMemoryLogStore log_entries range mismatch");
+
+        auto repl = make_entry(3, "im-5-rewritten");
+        ls.write_at(5, repl);
+        require(ls.next_slot() == 6 && ls.term_at(5) == 3 && ls.last_entry()->get_term() == 3,
+            "InMemoryLogStore write_at truncation mismatch");
+
+        auto packed = ls.pack(2, 3);
+        DB::InMemoryLogStore ls2;
+        ls2.apply_pack(2, *packed);
+        require(ls2.next_slot() == 5 && ls2.term_at(4) == 2 && ls2.is_conf(3),
+            "InMemoryLogStore pack/apply_pack mismatch");
+
+        require(ls.compact(3) && ls.start_index() == 4 && ls.next_slot() == 6,
+            "InMemoryLogStore compact mismatch");
+    }
+
+    /// 2. `DB::SummingStateMachine` commit + logical snapshot transfer & apply.
+    {
+        auto make_i64_buf = [](int64_t v)
+        {
+            auto b = nuraft::buffer::alloc(sizeof(int64_t));
+            memcpy(b->data_begin(), &v, sizeof(int64_t));
+            return b;
+        };
+        DB::SummingStateMachine sm1;
+        auto b1 = make_i64_buf(10);
+        auto b2 = make_i64_buf(25);
+        auto b3 = make_i64_buf(-5);
+        sm1.commit(1, *b1);
+        sm1.commit(2, *b2);
+        sm1.commit(3, *b3);
+        require(sm1.getValue() == 30 && sm1.last_commit_index() == 3, "SummingStateMachine commit sum mismatch");
+
+        auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        nuraft::snapshot snp(3, 1, cfg);
+        bool snap_cb_ok = false;
+        nuraft::async_result<bool>::handler_type cb = [&](bool & ok, nuraft::ptr<std::exception> &) { snap_cb_ok = ok; };
+        sm1.create_snapshot(snp, cb);
+        require(snap_cb_ok && sm1.last_snapshot() && sm1.last_snapshot()->get_last_log_idx() == 3,
+            "SummingStateMachine create_snapshot failed");
+
+        DB::SummingStateMachine sm2;
+        uint64_t obj_id = 0;
+        void * user_ctx = nullptr;
+        bool is_last = false;
+        while (!is_last)
+        {
+            nuraft::ptr<nuraft::buffer> data_out;
+            require(sm1.read_logical_snp_obj(snp, user_ctx, obj_id, data_out, is_last) == 0,
+                "SummingStateMachine read_logical_snp_obj failed");
+            sm2.save_logical_snp_obj(snp, obj_id, *data_out, obj_id == 0, is_last);
+        }
+        require(sm2.apply_snapshot(snp) && sm2.getValue() == 30,
+            "SummingStateMachine apply_snapshot value mismatch");
+    }
+
+    /// 3. LSMT `BlockCache`: `insertProbationary`, `get`, `getBlockOrLoadGroup`, eviction, and `remove`.
+    {
+        using Coordination::Storage::BlockCache;
+        using Coordination::Storage::BlockCacheKey;
+        using Coordination::Storage::BlockData;
+        using Coordination::Storage::BlockPtr;
+
+        BlockCache cache(/*max_size_in_bytes=*/512);
+        BlockPtr b0 = BlockData::create(64);
+        cache.insertProbationary(BlockCacheKey{1, 0}, b0);
+        require(cache.get(BlockCacheKey{1, 0}).ptr == b0.ptr, "BlockCache probationary get mismatch");
+
+        int load_calls = 0;
+        BlockPtr b1 = cache.getBlockOrLoadGroup(BlockCacheKey{1, 1}, 1, [&]()
+        {
+            ++load_calls;
+            return std::vector<BlockPtr>{BlockData::create(64), BlockData::create(64)};
+        });
+        require(load_calls == 1 && b1.ptr != nullptr, "BlockCache getBlockOrLoadGroup load failed");
+        require(cache.get(BlockCacheKey{1, 2}).ptr != nullptr, "BlockCache group sibling not cached");
+
+        cache.remove(BlockCacheKey{1, 1});
+        require(cache.get(BlockCacheKey{1, 1}).ptr == nullptr, "BlockCache remove did not evict key");
+
+        /// Pressure eviction beyond 512 bytes must not crash and must keep newly inserted blocks accessible.
+        for (uint32_t i = 0; i < 32; ++i)
+            cache.insertProbationary(BlockCacheKey{2, i}, BlockData::create(64));
+        require(cache.get(BlockCacheKey{2, 31}).ptr != nullptr, "BlockCache latest inserted block missing");
+    }
+
+    /// 4. Lock-free MVCC `SnapshotableHashTable` with overlapping `ReadView`s + CoW + stale node reclamation.
+    {
+        struct MVCCVal
+        {
+            std::string data;
+            size_t sizeInBytes() const { return data.size(); }
+            MVCCVal copyFromSnapshotNode() const { return *this; }
+        };
+
+        DB::SnapshotableHashTable<MVCCVal> ht;
+        std::unordered_map<std::string, std::string> expected_v0;
+        for (int i = 0; i < 20; ++i)
+        {
+            std::string k = "/k" + std::to_string(i);
+            std::string v = "v0_" + std::to_string(i);
+            ht.insertOrReplace(k, MVCCVal{v});
+            expected_v0[k] = v;
+        }
+
+        auto view0 = ht.issueReadView();
+        std::unordered_map<std::string, std::string> expected_v1 = expected_v0;
+        for (int i = 0; i < 10; ++i)
+        {
+            std::string k = "/k" + std::to_string(i);
+            ht.updateValue(k, [&](MVCCVal & val) { val.data = "v1_" + std::to_string(i); });
+            expected_v1[k] = "v1_" + std::to_string(i);
+        }
+        for (int i = 10; i < 15; ++i)
+        {
+            std::string k = "/k" + std::to_string(i);
+            require(ht.erase(k), "SnapshotableHashTable erase failed");
+            expected_v1.erase(k);
+        }
+        ht.insertOrReplace("/k_new", MVCCVal{"fresh"});
+        expected_v1["/k_new"] = "fresh";
+
+        auto view1 = ht.issueReadView();
+        ht.erase("/k0");
+        ht.updateValue("/k1", [](MVCCVal & val) { val.data = "v2_1"; });
+
+        auto check_view = [](const auto & view, const std::unordered_map<std::string, std::string> & exp)
+        {
+            std::unordered_map<std::string, std::string> got;
+            for (const auto & elem : *view)
+                got.emplace(std::string(elem.key), elem.value.data);
+            require(got == exp, "SnapshotableHashTable MVCC ReadView snapshot mismatch");
+        };
+        check_view(view0, expected_v0);
+        check_view(view1, expected_v1);
+        require(ht.listSize() > ht.size(), "Expected stale CoW nodes while views are pinned");
+
+        ht.retireReadView(std::move(view0));
+        ht.retireReadView(std::move(view1));
+        require(ht.listSize() == ht.size(), "SnapshotableHashTable did not reclaim stale nodes after retiring views");
+    }
+
+    /// 5. `zkutil::ZooKeeperPathUtils` normalization & auxiliary keeper name extraction.
+    {
+        require(zkutil::extractZooKeeperName("/clickhouse/tables") == zkutil::DEFAULT_ZOOKEEPER_NAME,
+            "Default keeper name mismatch");
+        require(zkutil::extractZooKeeperName("aux1:/clickhouse/tables") == "aux1",
+            "Auxiliary keeper name mismatch");
+        require(zkutil::extractZooKeeperPath("aux1:/clickhouse/tables/", true) == "/clickhouse/tables",
+            "extractZooKeeperPath mismatch");
+        require(zkutil::extractZooKeeperPathAndCollapseTrailingSlashes("aux1:/a/b///", true) == "/a/b",
+            "extractZooKeeperPathAndCollapseTrailingSlashes mismatch");
+        require(zkutil::normalizeZooKeeperPath("/a/b/", true) == "/a/b",
+            "normalizeZooKeeperPath mismatch");
+        require(zkutil::normalizeZooKeeperPath("/", true).empty(),
+            "normalizeZooKeeperPath root strips trailing slash");
+        require(zkutil::normalizeZooKeeperPath("rel/path/", false) == "/rel/path",
+            "normalizeZooKeeperPath relative prepend mismatch");
+    }
+
+    std::cout << "  [PASS] feature: in_memory_log_store_summing_sm_block_cache_snapshotable_ht_and_path_utils\n";
+}
+
+/// 20. Exhaustive `ListWithOptions` (`ALL`/`PERSISTENT_ONLY`/`EPHEMERAL_ONLY`, `with_stat`, `with_data`,
+/// `recursive`, `max_results`, `truncated`, `shuffle`) + `Multi` atomic commit & rollback matrix on Mem & LSMT-Mem!
+inline void testListWithOptionsAndMultiRollbackMatrix(const std::filesystem::path & root_dir)
+{
+    for (const bool use_lsmt : {false, true})
+    {
+        const auto dir = root_dir / (use_lsmt ? "lwo_multi_lsmt" : "lwo_multi_mem");
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("LWOSnap", (dir / "snapshots").string() + "/");
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = use_lsmt;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = true;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        ctx->setDigestEnabled(true);
+        DB::SnapshotsQueue sq(4);
+        std::optional<DB::KeeperResponseForSession> captured;
+        DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+        sm.init();
+
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000090000LL;
+        auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+        sreq->xid = 1;
+        sreq->session_timeout_ms = 60000;
+        require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+
+        auto create_node = [&](const std::string & path, const std::string & data, bool eph)
+        {
+            auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            c->xid = static_cast<int64_t>(idx + 10);
+            c->path = path;
+            c->data = data;
+            c->is_ephemeral = eph;
+            c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            require(applyDirect(sm, idx, 1, c, t0, captured)->error == Coordination::Error::ZOK, "Create failed: " + path);
+        };
+
+        create_node("/lwo", "root", false);
+        create_node("/lwo/p0", "pv0", false);
+        create_node("/lwo/p0/sub0", "sv0", false);
+        create_node("/lwo/p1", "pv1", false);
+        create_node("/lwo/p2", "pv2", false);
+        create_node("/lwo/e0", "ev0", true);
+        create_node("/lwo/e1", "ev1", true);
+
+        auto run_lwo = [&](Coordination::ListOptions opts)
+        {
+            auto req = std::make_shared<Coordination::ZooKeeperListWithOptionsRequest>();
+            req->xid = 500;
+            req->path = "/lwo";
+            req->options = opts;
+            auto r = readDirect(sm, 1, req, t0, captured);
+            auto * lr = dynamic_cast<Coordination::ZooKeeperListWithOptionsResponse *>(r.get());
+            require(lr && lr->error == Coordination::Error::ZOK, "ListWithOptions failed");
+            return *lr;
+        };
+
+        /// 1. `ALL` + `with_stat` + `with_data`
+        {
+            Coordination::ListOptions opts;
+            opts.filter = Coordination::ListRequestType::ALL;
+            opts.with_stat = true;
+            opts.with_data = true;
+            auto lr = run_lwo(opts);
+            require(lr.names.size() == 5 && lr.stats.size() == 5 && lr.data.size() == 5 && !lr.truncated,
+                "ListWithOptions ALL+stat+data mismatch");
+        }
+        /// 2. `PERSISTENT_ONLY`
+        {
+            Coordination::ListOptions opts;
+            opts.filter = Coordination::ListRequestType::PERSISTENT_ONLY;
+            auto lr = run_lwo(opts);
+            require(lr.names.size() == 3 && !lr.truncated, "ListWithOptions PERSISTENT_ONLY count mismatch");
+        }
+        /// 3. `EPHEMERAL_ONLY` + `with_stat`
+        {
+            Coordination::ListOptions opts;
+            opts.filter = Coordination::ListRequestType::EPHEMERAL_ONLY;
+            opts.with_stat = true;
+            auto lr = run_lwo(opts);
+            require(lr.names.size() == 2 && lr.stats.size() == 2
+                && lr.stats[0].ephemeralOwner == 1 && lr.stats[1].ephemeralOwner == 1,
+                "ListWithOptions EPHEMERAL_ONLY mismatch");
+        }
+        /// 4. `recursive = true` -> includes nested `p0/sub0` (6 entries!)
+        {
+            Coordination::ListOptions opts;
+            opts.recursive = true;
+            auto lr = run_lwo(opts);
+            require(lr.names.size() == 6 && !lr.truncated, "ListWithOptions recursive count mismatch");
+        }
+        /// 5. `max_results = 2` -> `truncated == true`!
+        {
+            Coordination::ListOptions opts;
+            opts.max_results = 2;
+            auto lr = run_lwo(opts);
+            require(lr.names.size() == 2 && lr.truncated, "ListWithOptions max_results truncation mismatch");
+        }
+        /// 6. `shuffle = true` -> exact set equality!
+        {
+            Coordination::ListOptions opts;
+            opts.shuffle = true;
+            auto lr = run_lwo(opts);
+            std::vector<std::string> sorted = lr.names;
+            std::sort(sorted.begin(), sorted.end());
+            const std::vector<std::string> expected = {"e0", "e1", "p0", "p1", "p2"};
+            require(sorted == expected, "ListWithOptions shuffle set mismatch");
+        }
+
+        /// 7. `Multi` atomic commit with mixed Keeper ops (`CreateIfNotExists`, `Create`, `Set`, `Check`, `CheckNotExists`, `TryRemove`)!
+        create_node("/mb", "base", false);
+        {
+            auto multi = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+            multi->xid = 600;
+            auto c1 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            c1->path = "/mb/a";
+            c1->data = "v1";
+            c1->not_exists = true;
+            c1->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            auto c2 = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            c2->path = "/mb/b";
+            c2->data = "b1";
+            c2->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            auto s1 = std::make_shared<Coordination::ZooKeeperSetRequest>();
+            s1->path = "/mb/a";
+            s1->data = "v2";
+            auto chk1 = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+            chk1->path = "/mb/a";
+            chk1->version = 1;
+            auto cne = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+            cne->path = "/mb/absent";
+            cne->not_exists = true;
+            auto tr = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+            tr->path = "/mb/absent";
+            tr->try_remove = true;
+            multi->requests = {c1, c2, s1, chk1, cne, tr};
+
+            auto r = applyDirect(sm, idx, 1, multi, t0, captured);
+            require(r && r->error == Coordination::Error::ZOK, "Multi commit batch failed");
+        }
+
+        /// 8. `Multi` atomic ROLLBACK: verify exact `KeeperDigest` and zero leaked nodes/ephemerals!
+        const uint64_t digest_before_rollback = sm.getStorageUnsafe().getNodesDigest(true, true).value;
+        {
+            auto multi = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+            multi->xid = 601;
+            auto cp = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            cp->path = "/mb/rb_p";
+            cp->data = "dirty_p";
+            cp->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            auto ce = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+            ce->path = "/mb/rb_e";
+            ce->data = "dirty_e";
+            ce->is_ephemeral = true;
+            ce->acls = {{Coordination::ACL::All, "world", "anyone"}};
+            auto sb = std::make_shared<Coordination::ZooKeeperSetRequest>();
+            sb->path = "/mb/a";
+            sb->data = "corrupted";
+            auto rm = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+            rm->path = "/mb/b";
+            auto bad_chk = std::make_shared<Coordination::ZooKeeperCheckRequest>();
+            bad_chk->path = "/mb/a";
+            bad_chk->version = 999; // forces ZBADVERSION rollback!
+            multi->requests = {cp, ce, sb, rm, bad_chk};
+
+            auto r = applyDirect(sm, idx, 1, multi, t0, captured);
+            auto * mr = dynamic_cast<Coordination::ZooKeeperMultiResponse *>(r.get());
+            require(mr && mr->responses.size() == 5 && mr->responses[4]->error == Coordination::Error::ZBADVERSION,
+                "Multi rollback expected sub-op[4] error ZBADVERSION");
+            require(sm.getStorageUnsafe().getNodesDigest(true, true).value == digest_before_rollback,
+                "Multi rollback mutated KeeperDigest!");
+
+            auto g_a = std::make_shared<Coordination::ZooKeeperGetRequest>();
+            g_a->xid = 602;
+            g_a->path = "/mb/a";
+            auto ra = readDirect(sm, 1, g_a, t0, captured);
+            auto * ga = dynamic_cast<Coordination::ZooKeeperGetResponse *>(ra.get());
+            require(ga && ga->error == Coordination::Error::ZOK && ga->data == "v2", "Multi rollback corrupted /mb/a");
+
+            auto g_e = std::make_shared<Coordination::ZooKeeperExistsRequest>();
+            g_e->xid = 603;
+            g_e->path = "/mb/rb_e";
+            require(readDirect(sm, 1, g_e, t0, captured)->error == Coordination::Error::ZNONODE,
+                "Multi rollback leaked ephemeral /mb/rb_e");
+        }
+
+        sm.shutdownStorage();
+    }
+    std::cout << "  [PASS] feature: list_with_options_and_multi_rollback_matrix (Mem + LSMT-Mem)\n";
+}
+
+/// 21. `WriteBufferFromNuraftBuffer`/`ReadBufferFromNuraftBuffer`, LSMT `NodeRefCache` & `combineActions`,
+/// `ZooKeeperRetriesControl`, `ShuffleHost`, `ErrorCounter` + `SystemTablesDataTypes`, and `LoggerWrapper`!
+inline void testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCounter()
+{
+    /// 1. `WriteBufferFromNuraftBuffer` & `ReadBufferFromNuraftBuffer` across empty, small, and 100 KB payloads.
+    for (const size_t len : {size_t(0), size_t(17), size_t(100000)})
+    {
+        std::string payload(len, '\0');
+        for (size_t i = 0; i < len; ++i)
+            payload[i] = static_cast<char>('A' + (i % 26));
+
+        DB::WriteBufferFromNuraftBuffer wb;
+        if (len > 0)
+            wb.write(payload.data(), payload.size());
+        wb.finalize();
+        auto nbuf = wb.getBuffer();
+        require(nbuf && nbuf->size() == len, "WriteBufferFromNuraftBuffer size mismatch");
+
+        DB::ReadBufferFromNuraftBuffer rb(nbuf);
+        std::string out(len, '\0');
+        if (len > 0)
+            rb.readStrict(out.data(), out.size());
+        require(out == payload && rb.eof(), "ReadBufferFromNuraftBuffer round-trip mismatch");
+    }
+
+    /// 2. LSMT `NodeRefCache`: insert, live `BlockWeakPtrWithSpinlock` hit, weak expiration, and erase.
+    {
+        using Coordination::Storage::BlockData;
+        using Coordination::Storage::BlockPtr;
+        using Coordination::Storage::NodePath;
+        using Coordination::Storage::NodeRef;
+        using Coordination::Storage::NodeRefCache;
+
+        NodeRefCache cache;
+        const auto h = NodePath("/nrc/node1").calculateHash();
+        auto & entry = cache.getOrInsertEntry(h);
+        entry.file_seqno = 7;
+        entry.node_offset = 12;
+
+        {
+            BlockPtr strong = BlockData::create(64);
+            {
+                std::lock_guard guard(entry.block);
+                entry.block.set(strong);
+            }
+            NodeRef out_ref;
+            const NodeRefCache::Entry * out_entry = nullptr;
+            require(cache.tryGet(h, out_ref, &out_entry) && out_ref.block.ptr == strong.ptr
+                && out_ref.offset == 12 && out_entry && out_entry->file_seqno == 7,
+                "NodeRefCache live tryGet failed");
+        }
+        /// After `strong` goes out of scope, weak pointer expires while entry metadata stays intact!
+        {
+            NodeRef out_ref;
+            const NodeRefCache::Entry * out_entry = nullptr;
+            require(!cache.tryGet(h, out_ref, &out_entry) && out_entry && out_entry->file_seqno == 7,
+                "NodeRefCache expired weak_ptr should miss tryGet while returning entry");
+        }
+        require(cache.size() == 1, "NodeRefCache size mismatch");
+        cache.eraseEntry(h, entry);
+        require(cache.size() == 0 && cache.findEntry(h) == nullptr, "NodeRefCache eraseEntry failed");
+    }
+
+    /// 3. LSMT `combineActions`: exhaustive strict & loose transition table + invalid transition throwing `LOGICAL_ERROR`.
+    {
+        using Coordination::Storage::combineActions;
+        using Coordination::Storage::NodeAction;
+        require(combineActions(std::nullopt, NodeAction::Create, true) == NodeAction::Create, "nullopt+Create");
+        require(combineActions(NodeAction::Create, NodeAction::Update, true) == NodeAction::Create, "Create+Update");
+        require(combineActions(NodeAction::Create, NodeAction::Remove, true) == std::nullopt, "Create+Remove");
+        require(combineActions(NodeAction::Update, NodeAction::Update, true) == NodeAction::Update, "Update+Update");
+        require(combineActions(NodeAction::Update, NodeAction::Remove, true) == NodeAction::Remove, "Update+Remove");
+        require(combineActions(NodeAction::Remove, NodeAction::Create, true) == NodeAction::Update, "Remove+Create");
+        require(combineActions(NodeAction::Create, NodeAction::Create, false) == NodeAction::Create, "loose Create+Create");
+        bool threw_strict = false;
+        try
+        {
+            (void)combineActions(NodeAction::Create, NodeAction::Create, true);
+        }
+        catch (const DB::Exception &)
+        {
+            threw_strict = true;
+        }
+        require(threw_strict, "Strict combineActions(Create, Create) must throw");
+    }
+
+    /// 4. `DB::ZooKeeperRetriesControl`: hardware error retries, immediate stop on user error, and retry exhaustion callback!
+    {
+        /// 4a. Succeeds on attempt 3 after 2 transient `ZCONNECTIONLOSS` hardware errors.
+        int attempts = 0;
+        DB::ZooKeeperRetriesInfo info(/*max_retries_=*/5, /*initial_backoff_ms_=*/1, /*max_backoff_ms_=*/4, nullptr);
+        DB::ZooKeeperRetriesControl ctrl("sim_retry_ok", nullptr, info);
+        ctrl.retryLoop([&]()
+        {
+            ++attempts;
+            if (attempts < 3)
+                throw zkutil::KeeperException(Coordination::Error::ZCONNECTIONLOSS);
+        });
+        require(attempts == 3, "ZooKeeperRetriesControl expected 3 attempts to succeed");
+
+        /// 4b. Non-hardware user error (`ZNONODE`) is NOT retried and propagates immediately!
+        int user_err_attempts = 0;
+        DB::ZooKeeperRetriesControl ctrl_user("sim_retry_user_err", nullptr, info);
+        bool caught_nonode = false;
+        try
+        {
+            ctrl_user.retryLoop([&]()
+            {
+                ++user_err_attempts;
+                throw zkutil::KeeperException(Coordination::Error::ZNONODE);
+            });
+        }
+        catch (const zkutil::KeeperException & e)
+        {
+            caught_nonode = (e.code == Coordination::Error::ZNONODE);
+        }
+        require(caught_nonode && user_err_attempts == 1, "ZooKeeperRetriesControl retried non-hardware ZNONODE!");
+
+        /// 4c. Exhausts `max_retries = 2` and invokes `actionAfterLastFailedRetry` once.
+        int exhaust_attempts = 0;
+        int after_last_calls = 0;
+        DB::ZooKeeperRetriesInfo small_info(/*max_retries_=*/2, /*initial_backoff_ms_=*/1, /*max_backoff_ms_=*/2, nullptr);
+        DB::ZooKeeperRetriesControl ctrl_ex("sim_retry_exhaust", nullptr, small_info);
+        ctrl_ex.actionAfterLastFailedRetry([&]() { ++after_last_calls; });
+        bool caught_exhaust = false;
+        try
+        {
+            ctrl_ex.retryLoop([&]()
+            {
+                ++exhaust_attempts;
+                throw zkutil::KeeperException(Coordination::Error::ZOPERATIONTIMEOUT);
+            });
+        }
+        catch (const zkutil::KeeperException & e)
+        {
+            caught_exhaust = (e.code == Coordination::Error::ZOPERATIONTIMEOUT);
+        }
+        require(caught_exhaust && exhaust_attempts == 3 && after_last_calls == 1,
+            "ZooKeeperRetriesControl exhaustion mismatch");
+    }
+
+    /// 5. `zkutil::ShuffleHost::compare` ordering (AZ -> Priority -> random).
+    {
+        zkutil::ShuffleHosts hosts;
+        zkutil::ShuffleHost h_other;
+        h_other.host = "other:9181";
+        h_other.az_info = zkutil::ShuffleHost::OTHER;
+        h_other.priority = Priority{1};
+        h_other.random = 1;
+
+        zkutil::ShuffleHost h_same_lo;
+        h_same_lo.host = "same-lo:9181";
+        h_same_lo.az_info = zkutil::ShuffleHost::SAME;
+        h_same_lo.priority = Priority{2};
+        h_same_lo.random = 100;
+
+        zkutil::ShuffleHost h_same_hi;
+        h_same_hi.host = "same-hi:9181";
+        h_same_hi.az_info = zkutil::ShuffleHost::SAME;
+        h_same_hi.priority = Priority{1};
+        h_same_hi.random = 200;
+
+        hosts = {h_other, h_same_lo, h_same_hi};
+        std::sort(hosts.begin(), hosts.end(), zkutil::ShuffleHost::compare);
+        require(hosts[0].host == "same-hi:9181" && hosts[1].host == "same-lo:9181" && hosts[2].host == "other:9181",
+            "ShuffleHost::compare ordering mismatch");
+    }
+
+    /// 6. `Coordination::ErrorCounter` + `Coordination::SystemTablesDataTypes` (`errorCodeEnum`, `operationEnum`, `watchEventTypeEnum`, `watchStateEnum`).
+    {
+        auto err_enum = Coordination::SystemTablesDataTypes::errorCodeEnum();
+        auto op_enum = Coordination::SystemTablesDataTypes::operationEnum();
+        auto ev_enum = Coordination::SystemTablesDataTypes::watchEventTypeEnum();
+        auto st_enum = Coordination::SystemTablesDataTypes::watchStateEnum();
+        require(err_enum && op_enum && ev_enum && st_enum, "SystemTablesDataTypes returned null enum");
+
+        Coordination::ErrorCounter ec;
+        ec.increment(Coordination::Error::ZOK);
+        ec.increment(Coordination::Error::ZOK);
+        ec.increment(Coordination::Error::ZNONODE);
+        ec.increment(Coordination::Error::ZBADVERSION);
+
+        auto map_type = std::make_shared<DB::DataTypeMap>(err_enum, std::make_shared<DB::DataTypeUInt32>());
+        auto col = map_type->createColumn();
+        auto & map_col = assert_cast<DB::ColumnMap &>(*col);
+        ec.dumpToMapColumn(&map_col);
+        require(map_col.size() == 1 && map_col.getNestedData().size() == 3,
+            "ErrorCounter dumpToMapColumn row/entry count mismatch");
+    }
+
+    /// 7. `DB::LoggerWrapper` valid levels (`fatal`..`trace` via `set_level` & `put_details`).
+    {
+        DB::LoggerWrapper lw("SimLoggerWrapperTest", DB::LogsLevel::error);
+        lw.set_level(static_cast<int>(DB::LogsLevel::warning));
+        require(lw.get_level() == static_cast<int>(DB::LogsLevel::warning), "LoggerWrapper get_level mismatch");
+        lw.put_details(static_cast<int>(DB::LogsLevel::debug), __FILE__, __func__, __LINE__, "sim-debug-msg");
+    }
+
+    std::cout << "  [PASS] feature: nuraft_buffers_node_ref_cache_combine_actions_retries_shuffle_and_error_counter\n";
+}
+
+/// 22. Empty `Multi`/`MultiRead`, `<feature_flags>` XML config parsing & validation,
+/// `remove_orphaned_nodes_on_startup` + LSMT rejection, and Znode `ctime`/`mtime` persistence across snapshot reopen!
+inline void testEmptyMultiFeatureFlagsXMLConfigAndZnodeTime(const std::filesystem::path & root_dir)
+{
+    /// 1. Empty `OpNum::Multi` and empty `OpNum::MultiRead` (0 subrequests) on both `Mem` and `LSMT-Mem`!
+    for (const bool use_lsmt : {false, true})
+    {
+        const auto dir = root_dir / (use_lsmt ? "empty_multi_lsmt" : "empty_multi_mem");
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("EMSnap", (dir / "snapshots").string() + "/");
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = use_lsmt;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = true;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        ctx->setDigestEnabled(true);
+        DB::SnapshotsQueue sq(4);
+        std::optional<DB::KeeperResponseForSession> captured;
+        DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+        sm.init();
+
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000100000LL;
+        auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+        sreq->xid = 1;
+        sreq->session_timeout_ms = 60000;
+        require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+
+        auto empty_multi = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+        empty_multi->xid = 2;
+        auto r_mw = applyDirect(sm, idx, 1, empty_multi, t0, captured);
+        auto * mrw = dynamic_cast<Coordination::ZooKeeperMultiWriteResponse *>(r_mw.get());
+        require(mrw && mrw->error == Coordination::Error::ZOK && mrw->responses.empty(),
+            "Empty MultiWrite expected ZOK with 0 responses");
+
+        auto empty_mread = std::make_shared<Coordination::ZooKeeperMultiRequest>();
+        empty_mread->xid = 3;
+        empty_mread->operation_type = Coordination::ZooKeeperMultiRequest::OperationType::Read;
+        auto r_mr = readDirect(sm, 1, empty_mread, t0, captured);
+        auto * mrr = dynamic_cast<Coordination::ZooKeeperMultiReadResponse *>(r_mr.get());
+        require(mrr && mrr->error == Coordination::Error::ZOK && mrr->responses.empty(),
+            "Empty MultiRead expected ZOK with 0 responses");
+
+        /// 2. Znode `ctime` & `mtime` monotonicity across `Create` -> `Set` -> snapshot -> reopen!
+        const int64_t t_create = t0 + 1000;
+        const int64_t t_set = t0 + 5000;
+        auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c->xid = 4;
+        c->path = "/timed";
+        c->data = "v0";
+        c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c, t_create, captured)->error == Coordination::Error::ZOK, "Create /timed failed");
+
+        auto s = std::make_shared<Coordination::ZooKeeperSetRequest>();
+        s->xid = 5;
+        s->path = "/timed";
+        s->data = "v1";
+        auto r_set = applyDirect(sm, idx, 1, s, t_set, captured);
+        auto * sr = dynamic_cast<Coordination::ZooKeeperSetResponse *>(r_set.get());
+        require(sr && sr->error == Coordination::Error::ZOK && sr->stat.ctime == t_create && sr->stat.mtime == t_set,
+            "Znode ctime/mtime after Set mismatch");
+
+        auto cfg = nuraft::cs_new<nuraft::cluster_config>(1, 0);
+        cfg->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(1, 0, "1", "", false, 1));
+        nuraft::snapshot snp(idx, 1, cfg);
+        nuraft::async_result<bool>::handler_type done = [](bool &, nuraft::ptr<std::exception> &) {};
+        sm.create_snapshot(snp, done);
+        DB::CreateSnapshotTask task;
+        require(sq.tryPop(task), "Expected snapshot task for Znode time test");
+        (void)task.create_snapshot(std::move(task.snapshot), false);
+        sm.shutdownStorage();
+
+        DB::SnapshotsQueue sq2(4);
+        DB::KeeperStateMachine sm2([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq2, ctx, nullptr);
+        sm2.init();
+        auto g = std::make_shared<Coordination::ZooKeeperGetRequest>();
+        g->xid = 6;
+        g->path = "/timed";
+        auto r_get = readDirect(sm2, 1, g, t_set + 100, captured);
+        auto * gr = dynamic_cast<Coordination::ZooKeeperGetResponse *>(r_get.get());
+        require(gr && gr->error == Coordination::Error::ZOK && gr->data == "v1"
+            && gr->stat.ctime == t_create && gr->stat.mtime == t_set,
+            "Znode ctime/mtime lost across snapshot reopen");
+        sm2.shutdownStorage();
+    }
+
+    /// 3. `KeeperContext::initialize` `<feature_flags>` XML config parsing & validation!
+    {
+        const auto dir = root_dir / "ff_xml_cfg";
+        std::filesystem::create_directories(dir / "logs");
+        std::filesystem::create_directories(dir / "snapshots");
+
+        /// 3a. Disabling `multi_read` downgrades `/keeper/api_version` to `ZOOKEEPER_COMPATIBLE`,
+        ///     while enabling `create_ttl` & `create_container` enables those ops!
+        {
+            std::ostringstream xml;
+            xml << "<clickhouse><keeper_server>\n"
+                << "  <server_id>1</server_id>\n"
+                << "  <log_storage_path>" << (dir / "logs").string() << "</log_storage_path>\n"
+                << "  <snapshot_storage_path>" << (dir / "snapshots").string() << "</snapshot_storage_path>\n"
+                << "  <feature_flags>\n"
+                << "    <multi_read>0</multi_read>\n"
+                << "    <create_ttl>1</create_ttl>\n"
+                << "    <create_container>1</create_container>\n"
+                << "  </feature_flags>\n"
+                << "</keeper_server></clickhouse>\n";
+            std::istringstream iss(xml.str());
+            Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+            DB::PlacementInfo::PlacementInfo::instance().initialize(*cfg);
+            auto settings = std::make_shared<DB::CoordinationSettings>();
+            (*settings)[DB::CoordinationSetting::write_snapshot_version] = 9;
+            auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+            ctx->initialize(*cfg, nullptr);
+            require(!ctx->getFeatureFlags().isEnabled(DB::KeeperFeatureFlag::MULTI_READ),
+                "XML multi_read=0 did not disable MULTI_READ");
+            require(ctx->getFeatureFlags().isEnabled(DB::KeeperFeatureFlag::CREATE_TTL)
+                && ctx->getFeatureFlags().isEnabled(DB::KeeperFeatureFlag::CREATE_CONTAINER),
+                "XML create_ttl=1 / create_container=1 did not enable flags");
+            const auto & sys = ctx->getSystemNodesWithData();
+            require(sys.at(std::string(DB::keeper_api_version_path)) == "0",
+                "Disabling MULTI_READ did not downgrade /keeper/api_version to 0");
+        }
+
+        /// 3b. Unknown feature flag in `<feature_flags>` MUST throw `BAD_ARGUMENTS`!
+        {
+            std::ostringstream xml;
+            xml << "<clickhouse><keeper_server>\n"
+                << "  <server_id>1</server_id>\n"
+                << "  <log_storage_path>" << (dir / "logs").string() << "</log_storage_path>\n"
+                << "  <snapshot_storage_path>" << (dir / "snapshots").string() << "</snapshot_storage_path>\n"
+                << "  <feature_flags><bogus_unknown_flag>1</bogus_unknown_flag></feature_flags>\n"
+                << "</keeper_server></clickhouse>\n";
+            std::istringstream iss(xml.str());
+            Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+            auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+            bool threw = false;
+            try
+            {
+                ctx->initialize(*cfg, nullptr);
+            }
+            catch (const DB::Exception &)
+            {
+                threw = true;
+            }
+            require(threw, "Invalid feature_flags XML entry did not throw");
+        }
+
+        /// 3c. `remove_orphaned_nodes_on_startup = true` combined with `use_lsmt_storage = true` MUST throw!
+        {
+            std::ostringstream xml;
+            xml << "<clickhouse><keeper_server>\n"
+                << "  <server_id>1</server_id>\n"
+                << "  <remove_orphaned_nodes_on_startup>true</remove_orphaned_nodes_on_startup>\n"
+                << "  <log_storage_path>" << (dir / "logs").string() << "</log_storage_path>\n"
+                << "  <snapshot_storage_path>" << (dir / "snapshots").string() << "</snapshot_storage_path>\n"
+                << "</keeper_server></clickhouse>\n";
+            std::istringstream iss(xml.str());
+            Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+            DB::PlacementInfo::PlacementInfo::instance().initialize(*cfg);
+            auto settings = std::make_shared<DB::CoordinationSettings>();
+            (*settings)[DB::CoordinationSetting::use_lsmt_storage] = true;
+            auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+            bool threw = false;
+            try
+            {
+                ctx->initialize(*cfg, nullptr);
+            }
+            catch (const DB::Exception &)
+            {
+                threw = true;
+            }
+            require(threw, "remove_orphaned_nodes_on_startup + use_lsmt_storage must throw");
+        }
+    }
+
+    std::cout << "  [PASS] feature: empty_multi_feature_flags_xml_config_and_znode_time\n";
+}
+
+/// 23. `zk_approximate_data_size` accounting accuracy (`test_keeper_mntr_data_size`) across `Create`/`Set`/`Remove`
+/// on both `Mem` and `LSMT-Mem`, AND `Changelog` missing middle-file log-gap detection on startup (`test_keeper_log_gap_before_committed`)!
+inline void testMntrDataSizeAccuracyAndLogGapRejection(const std::filesystem::path & root_dir)
+{
+    /// 1. `approximate_data_size` increases on `Create` + `Set` and returns to exact baseline on `Remove`!
+    for (const bool use_lsmt : {false, true})
+    {
+        const auto dir = root_dir / (use_lsmt ? "mntr_size_lsmt" : "mntr_size_mem");
+        std::filesystem::create_directories(dir / "snapshots");
+        auto snap_disk = std::make_shared<DB::DiskLocal>("SizeSnap", (dir / "snapshots").string() + "/");
+
+        auto settings = std::make_shared<DB::CoordinationSettings>();
+        (*settings)[DB::CoordinationSetting::use_lsmt_storage] = use_lsmt;
+        (*settings)[DB::CoordinationSetting::storage_memory_only] = true;
+        (*settings)[DB::CoordinationSetting::parallel_read_threads] = 0;
+
+        auto ctx = std::make_shared<DB::KeeperContext>(true, settings);
+        ctx->setSnapshotDisk(snap_disk);
+        DB::SnapshotsQueue sq(4);
+        std::optional<DB::KeeperResponseForSession> captured;
+        DB::KeeperStateMachine sm([&captured](DB::KeeperResponseForSession r) { captured = std::move(r); }, sq, ctx, nullptr);
+        sm.init();
+
+        uint64_t idx = 0;
+        const int64_t t0 = 1700000120000LL;
+        auto sreq = std::make_shared<Coordination::ZooKeeperSessionIDRequest>();
+        sreq->xid = 1;
+        sreq->session_timeout_ms = 60000;
+        require(applyDirect(sm, idx, -1, sreq, t0, captured)->error == Coordination::Error::ZOK, "SessionID failed");
+
+        const uint64_t base_size = sm.getStorageStats().approximate_data_size;
+        const uint64_t base_nodes = sm.getStorageStats().nodes_count;
+
+        auto c = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        c->xid = 2;
+        c->path = "/sized";
+        c->data = std::string(1024, 'A');
+        c->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        require(applyDirect(sm, idx, 1, c, t0, captured)->error == Coordination::Error::ZOK, "Create /sized failed");
+        const auto stats_create = sm.getStorageStats();
+        require(stats_create.nodes_count == base_nodes + 1, "nodes_count did not increment on Create");
+        if (!use_lsmt)
+            require(stats_create.approximate_data_size >= base_size + 1024,
+                "Mem approximate_data_size did not grow by >= 1024 on Create");
+
+        auto s = std::make_shared<Coordination::ZooKeeperSetRequest>();
+        s->xid = 3;
+        s->path = "/sized";
+        s->data = std::string(40000, 'B');
+        require(applyDirect(sm, idx, 1, s, t0, captured)->error == Coordination::Error::ZOK, "Set /sized failed");
+        const auto stats_set = sm.getStorageStats();
+        require(stats_set.nodes_count == base_nodes + 1 && stats_set.approximate_data_size > base_size + 30000,
+            "approximate_data_size did not grow on 40 KB Set");
+
+        auto rm = std::make_shared<Coordination::ZooKeeperRemoveRequest>();
+        rm->xid = 4;
+        rm->path = "/sized";
+        require(applyDirect(sm, idx, 1, rm, t0, captured)->error == Coordination::Error::ZOK, "Remove /sized failed");
+        const auto stats_rm = sm.getStorageStats();
+        require(stats_rm.nodes_count == base_nodes, "nodes_count did not return to baseline after Remove");
+        if (!use_lsmt)
+            require(stats_rm.approximate_data_size <= base_size + 64,
+                "Mem approximate_data_size did not return near baseline after Remove");
+        sm.shutdownStorage();
+    }
+
+    /// 2. Missing middle changelog file before committed index MUST throw on `KeeperLogStore::init`!
+    {
+        const auto dir = root_dir / "log_gap_check";
+        std::filesystem::create_directories(dir / "logs");
+        auto log_disk = std::make_shared<DB::DiskLocal>("GapLogDisk", (dir / "logs").string() + "/");
+        auto ctx = std::make_shared<DB::KeeperContext>(true, std::make_shared<DB::CoordinationSettings>());
+        ctx->setLogDisk(log_disk);
+
+        auto make_entry = [](uint64_t term, const std::string & s)
+        {
+            auto buf = nuraft::buffer::alloc(s.size());
+            memcpy(buf->data_begin(), s.data(), s.size());
+            return nuraft::cs_new<nuraft::log_entry>(term, buf, nuraft::app_log);
+        };
+
+        {
+            auto ls = nuraft::cs_new<DB::KeeperLogStore>(
+                DB::LogFileSettings{.force_sync = true, .compress_logs = false, .rotate_interval = 3},
+                DB::FlushSettings{.max_flush_batch_size = 2, .min_time_between_fsyncs_ms = 0},
+                DB::ReadAheadSettings{},
+                ctx,
+                DB::Changelog::ExecutionMode::Threaded);
+            ls->init(0, 100);
+            for (uint64_t i = 1; i <= 9; ++i)
+            {
+                auto e = make_entry(1, "gap-" + std::to_string(i));
+                require(ls->append(e) == i, "Gap log append mismatch");
+            }
+            require(ls->flush(), "Gap log flush failed");
+            ls->end_of_append_batch(1, 9);
+        }
+
+        /// Delete the middle rotated changelog file (`changelog_4_6.bin`) to create an internal log gap `[1..3] .. [7..9]`.
+        bool removed_middle = false;
+        for (const auto & e : std::filesystem::directory_iterator(dir / "logs"))
+        {
+            if (e.path().filename().string().find("changelog_4_") == 0)
+            {
+                std::filesystem::remove(e.path());
+                removed_middle = true;
+            }
+        }
+        require(removed_middle, "Expected middle changelog_4_* file to delete");
+
+        auto ls2 = nuraft::cs_new<DB::KeeperLogStore>(
+            DB::LogFileSettings{.force_sync = true, .compress_logs = false, .rotate_interval = 3},
+            DB::FlushSettings{},
+            DB::ReadAheadSettings{},
+            ctx,
+            DB::Changelog::ExecutionMode::Threaded);
+        bool threw_gap = false;
+        try
+        {
+            ls2->init(0, 100);
+        }
+        catch (const DB::Exception &)
+        {
+            threw_gap = true;
+        }
+        require(threw_gap, "KeeperLogStore::init failed to reject missing middle changelog file (log gap)!");
+    }
+
+    std::cout << "  [PASS] feature: mntr_data_size_accuracy_and_log_gap_rejection\n";
+}
+
+}
 
 inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
 {
@@ -1535,10 +3184,20 @@ inline void runKeeperFeatureTests(const std::filesystem::path & state_dir)
     feature_tests_detail::testKeeperReadThreadPoolAndOverDispatcher();
     feature_tests_detail::testKeeperClientCLICommands();
     feature_tests_detail::testLsmtWriteThrottlingFdMetricsAndAuthConfig(state_dir);
+    feature_tests_detail::testCompactChildrenSetDifferential();
+    feature_tests_detail::testPersistentAndRecursiveWatchSemantics(state_dir);
+    feature_tests_detail::testExtendedOpsLimitsAndNeverUsedContainerGc(state_dir);
+    feature_tests_detail::testCrossVersionSnapshotMatrixAndCorruptFallback(state_dir);
+    feature_tests_detail::testCompressedChangelogTruncateCompactAndLsmtDiskReopen(state_dir);
+    feature_tests_detail::testInMemoryLogStoreSummingSMBlockCacheSnapshotableHTAndPathUtils();
+    feature_tests_detail::testListWithOptionsAndMultiRollbackMatrix(state_dir);
+    feature_tests_detail::testNuraftBuffersNodeRefCacheCombineActionsRetriesShuffleAndErrorCounter();
+    feature_tests_detail::testEmptyMultiFeatureFlagsXMLConfigAndZnodeTime(state_dir);
+    feature_tests_detail::testMntrDataSizeAccuracyAndLogGapRejection(state_dir);
 
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);
     std::cout << "PASS keeper-sim-feature-tests\n";
 }
 
-} // namespace keeper_sim
+}

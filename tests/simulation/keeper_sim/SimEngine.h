@@ -275,4 +275,4 @@ private:
     std::ofstream trace_stream;
 };
 
-} // namespace keeper_sim
+}

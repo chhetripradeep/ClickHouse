@@ -2409,7 +2409,7 @@ void runInstrumentationControl()
     std::cout << "PASS keeper-sim-instrumentation-control\n";
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv)
 {
@@ -2481,6 +2481,8 @@ int main(int argc, char ** argv)
         bool enable_superdigest = false;
         bool feature_tests = false;
         bool live_server_tests = false;
+        std::string live_suite;
+        uint16_t live_port_base = 0;
         size_t repro_nested_multi_depth = 0;
         std::string repro_nuraft_mode;
         std::string repro_keeper_mode;
@@ -2504,7 +2506,43 @@ int main(int argc, char ** argv)
         for (int i = 1; i < argc; ++i)
         {
             const std::string opt = argv[i];
-            if (opt == "--ci")
+            if (opt == "--help" || opt == "-h")
+            {
+                std::cout
+                    << "ClickHouse Keeper Deterministic Simulation & Integration Test Runner\n\n"
+                    << "Main modes:\n"
+                    << "  --ci                          Run full PR-CI suite (controls + 23 feature tests + 13 parallel live suites + 18 distributed DST scenarios + determinism replays + 58/58 coverage gate)\n"
+                    << "  --swarm --suite <name>        Run parallel swarm suite (ci, quick, full, hunt..hunt17)\n"
+                    << "  --feature-tests               Run all 23 deterministic Keeper subsystem feature tests\n"
+                    << "  --live-server-tests           Run all live KeeperDispatcher/TCP/HTTP/TLS/multi-node suites\n"
+                    << "  --live-suite <name>           Filter --live-server-tests to one suite (see --list-live-suites)\n"
+                    << "  --list-live-suites            Print all available --live-suite names and exit\n"
+                    << "  --live-port-base <port>       Base loopback port for --live-server-tests\n"
+                    << "  --instrumentation-control     Verify virtual clock and zero-thread isolation controls\n"
+                    << "  --unsafe-quorum-control       Negative control verifying RaftSafetyOracle catches split-brain\n\n"
+                    << "Common options:\n"
+                    << "  --workers <N>                 Parallel worker processes (0 = auto-detect, max 16)\n"
+                    << "  --seed <N>                    Single-seed simulation RNG seed\n"
+                    << "  --seed-offset <N>             Deterministic seed offset for --ci / --swarm\n"
+                    << "  --nodes <N>                   Cluster size (3 or 5)\n"
+                    << "  --profile <name>              Fault profile (balanced, chaos, power-loss, partition-storm, snapshot-storm, ...)\n"
+                    << "  --duration-ms <N>             Virtual simulation duration in milliseconds\n"
+                    << "  --state-dir <path>            Working directory for simulated node state\n"
+                    << "  --output <path>               Output directory for --ci / --swarm reports\n"
+                    << "  --junit-xml <path>            Output path for JUnit XML test report\n"
+                    << "  --lsmt | --lsmt-disk | --mixed-storage  Select Keeper storage engine\n"
+                    << "  --no-streaming --no-bounded-cache       Guard against known unfixed master bugs\n"
+                    << "  --trace-file <path>           Write deterministic event trace log\n"
+                    << "  --json-summary                Print machine-readable JSON summary\n";
+                return 0;
+            }
+            else if (opt == "--list-live-suites")
+            {
+                for (const auto & name : keeper_sim::getKeeperLiveServerSuiteNames())
+                    std::cout << name << '\n';
+                return 0;
+            }
+            else if (opt == "--ci")
             {
                 swarm_mode = true;
                 swarm_suite = "ci";
@@ -2525,6 +2563,10 @@ int main(int argc, char ** argv)
                 feature_tests = true;
             else if (opt == "--live-server-tests")
                 live_server_tests = true;
+            else if (opt == "--live-suite" && i + 1 < argc)
+                live_suite = argv[++i];
+            else if (opt == "--live-port-base" && i + 1 < argc)
+                live_port_base = static_cast<uint16_t>(std::stoul(argv[++i]));
             else if (opt == "--seed" && i + 1 < argc)
                 seed = std::stoull(argv[++i]);
             else if (opt == "--nodes" && i + 1 < argc)
@@ -2695,7 +2737,7 @@ int main(int argc, char ** argv)
         {
             if (state_dir.empty())
                 state_dir = std::filesystem::path("tmp") / "keeper_sim_live_server_tests";
-            keeper_sim::runKeeperLiveServerTests(state_dir);
+            keeper_sim::runKeeperLiveServerTests(state_dir, live_suite, live_port_base);
             return 0;
         }
 

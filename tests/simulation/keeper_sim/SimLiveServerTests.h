@@ -16,9 +16,15 @@
 #include <Common/ZooKeeper/KeeperOverDispatcher.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperArgs.h>
+#include <Common/ZooKeeper/ZooKeeperCachingGetter.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperConstants.h>
 #include <Common/ZooKeeper/ZooKeeperIO.h>
+#include <Common/ZooKeeper/ZooKeeperLock.h>
+#include <Common/ZooKeeper/ZooKeeperNodeCache.h>
+#include <Common/ZooKeeper/ZooKeeperPathUtils.h>
+#include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <IO/ReadBufferFromString.h>
 #include <Coordination/CoordinationSettings.h>
 #include <Coordination/FourLetterCommand.h>
 #include <Coordination/KeeperAsynchronousMetrics.h>
@@ -40,6 +46,8 @@
 #    include <Poco/Net/Context.h>
 #    include <Poco/Net/SSLManager.h>
 #    include <Poco/Net/SecureServerSocket.h>
+#    include <Server/CertificateReloader.h>
+#    include <base/scope_guard.h>
 #    include <openssl/evp.h>
 #    include <openssl/pem.h>
 #    include <openssl/x509.h>
@@ -59,7 +67,18 @@
 #include <Poco/Net/TCPServerParams.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/ThreadPool.h>
+#include <Poco/Util/Application.h>
+#include <Poco/Util/MapConfiguration.h>
 #include <Poco/Util/XMLConfiguration.h>
+
+#if USE_AWS_S3
+#    include <Coordination/KeeperSnapshotManagerS3.h>
+#    include <Disks/DiskLocal.h>
+#    include <IO/WriteBufferFromFile.h>
+#    include <Server/HTTP/HTTPRequestHandler.h>
+#    include <Server/HTTP/HTTPServerRequest.h>
+#    include <Server/HTTP/HTTPServerResponse.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -79,8 +98,30 @@ namespace keeper_sim
 namespace live_server_detail
 {
 
+inline std::atomic<uint16_t> g_live_port_cursor{0};
+
 inline uint16_t pickFreeLoopbackPort()
 {
+    uint16_t cursor = g_live_port_cursor.load(std::memory_order_relaxed);
+    if (cursor != 0)
+    {
+        for (int tries = 0; tries < 256; ++tries)
+        {
+            const uint16_t cand = g_live_port_cursor.fetch_add(1, std::memory_order_relaxed);
+            if (cand < 1024)
+                continue;
+            try
+            {
+                Poco::Net::ServerSocket probe;
+                probe.bind(Poco::Net::SocketAddress("127.0.0.1", cand), /*reuseAddress=*/false);
+                probe.close();
+                return cand;
+            }
+            catch (...)
+            {
+            }
+        }
+    }
     Poco::Net::ServerSocket probe(Poco::Net::SocketAddress("127.0.0.1", 0));
     const uint16_t port = probe.address().port();
     probe.close();
@@ -411,19 +452,30 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
     }
     std::cout << "  [PASS] live: dispatcher_new_reconfig_and_introspection\n";
 
-    /// ---- Part B: ALL non-jemalloc 4LW commands via real FourLetterCommandFactory + `rcfg` ----
+    /// ---- Part B: 4LW allow-list enforcement (`ruok,isro` only) -> then ALL 28+ 4LW commands + `rcfg` ----
     {
+        /// First verify restricted allow-list enforcement before widening to `*`.
+        dispatcher->getKeeperConfiguration()->four_letter_word_allow_list = "ruok,isro";
         DB::FourLetterCommandFactory::registerCommands(*dispatcher);
         auto & factory = DB::FourLetterCommandFactory::instance();
+        require(factory.isEnabled(DB::IFourLetterCommand::toCode("ruok")), "ruok should be enabled in restricted allow-list");
+        require(factory.isEnabled(DB::IFourLetterCommand::toCode("isro")), "isro should be enabled in restricted allow-list");
+        require(!factory.isEnabled(DB::IFourLetterCommand::toCode("csnp")), "csnp should be disabled in restricted allow-list");
+
+        /// Now widen allow-list to `*` to exercise every registered 4LW command.
+        dispatcher->getKeeperConfiguration()->four_letter_word_allow_list = "*";
         factory.initializeAllowList(*dispatcher);
 
-        const std::vector<std::string> cmds = {
+        std::vector<std::string> cmds = {
             "ruok", "mntr", "srvr", "stat", "conf", "cons",
             "wchs", "wchc", "wchp", "dump", "envi", "dirs",
             "isro", "apiv", "csnp", "lgif", "rclc", "clrs",
             "ftfl", "bpon", "bpof", "pfev", "lgrq", "lgrq",
             "srst", "crst", "rqld", "ydld",
         };
+#if USE_JEMALLOC
+        cmds.push_back("jmst");
+#endif
         for (const auto & name : cmds)
         {
             const int32_t code = DB::IFourLetterCommand::toCode(name);
@@ -534,7 +586,7 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
             require(gets.size() == 2 && gets[0].data == "hello-plain-3" && gets[1].data == "m1", "TCP plain multiRead failed");
         }
 
-        /// 3. Real `zkutil::ZooKeeper` TCP client — LZ4 COMPRESSION + 64-BIT XIDs!
+        /// 3. Real `zkutil::ZooKeeper` TCP client — LZ4 COMPRESSION + 64-BIT XIDs + OPENTELEMETRY TRACING!
         {
             zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port));
             args.connection_timeout_ms = 5000;
@@ -542,16 +594,38 @@ inline void testLiveDispatcherTcpHttpAnd4LW(const std::filesystem::path & root_d
             args.operation_timeout_ms = 5000;
             args.use_compression = true;
             args.use_xid_64 = true;
+            args.pass_opentelemetry_tracing_context = true;
             auto zk = zkutil::ZooKeeper::create(args, nullptr, nullptr);
 
             const std::string big_val(2048, 'Z');
             zk->create("/tcp_lz4", big_val, zkutil::CreateMode::Persistent);
-            require(zk->get("/tcp_lz4") == big_val, "TCP LZ4+XID64 get mismatch");
+            require(zk->get("/tcp_lz4") == big_val, "TCP LZ4+XID64+Tracing get mismatch");
             zk->set("/tcp_lz4", "lz4-updated");
-            require(zk->get("/tcp_lz4") == "lz4-updated", "TCP LZ4+XID64 set mismatch");
+            require(zk->get("/tcp_lz4") == "lz4-updated", "TCP LZ4+XID64+Tracing set mismatch");
             auto children = zk->getChildren("/");
-            require(!children.empty(), "TCP LZ4+XID64 list failed");
+            require(!children.empty(), "TCP LZ4+XID64+Tracing list failed");
             zk->remove("/tcp_lz4");
+        }
+
+        /// 3b. Client with `last_zxid_seen` ahead of server MUST be refused (`SESSION_REFUSED`)!
+        {
+            zkutil::ZooKeeperArgs future_args("127.0.0.1:" + std::to_string(tcp_port));
+            future_args.connection_timeout_ms = 2000;
+            future_args.session_timeout_ms = 5000;
+            future_args.operation_timeout_ms = 2000;
+            future_args.num_connection_retries = 0;
+            future_args.last_zxid_seen = 999999999LL;
+            bool refused = false;
+            try
+            {
+                auto zk = zkutil::ZooKeeper::create(future_args, nullptr, nullptr);
+                (void)zk->exists("/");
+            }
+            catch (const std::exception &)
+            {
+                refused = true;
+            }
+            require(refused, "KeeperTCPHandler accepted client with future last_zxid_seen!");
         }
 
         /// 4. Oversized request (> max_request_size = 65536) is cleanly rejected without crashing KeeperTCPHandler.
@@ -1116,7 +1190,94 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
             "Leader async metrics missing KeeperFollowers/KeeperSyncedFollowers/KeeperIsLeader");
     }
 
-    /// 2. Live `rcfg` `set_priority` + `transfer_leadership` to `follower_idx` (`server_id = follower_idx + 1`).
+    /// 2. Live `rcfg` dynamic 4th-node join (`add_members`) -> catch-up -> removal (`remove_members`)!
+    {
+        const uint16_t raft_port4 = pickFreeLoopbackPort();
+        const uint16_t tcp_port4 = pickFreeLoopbackPort();
+        const auto ndir4 = base_dir / "node_4";
+        std::filesystem::create_directories(ndir4 / "logs");
+        std::filesystem::create_directories(ndir4 / "snapshots");
+
+        std::ostringstream xml4;
+        xml4 << "<clickhouse><keeper_server>\n"
+             << "  <tcp_port>" << tcp_port4 << "</tcp_port>\n"
+             << "  <server_id>4</server_id>\n"
+             << "  <enable_ipv6>false</enable_ipv6>\n"
+             << "  <enable_reconfiguration>true</enable_reconfiguration>\n"
+             << "  <log_storage_path>" << (ndir4 / "logs").string() << "</log_storage_path>\n"
+             << "  <snapshot_storage_path>" << (ndir4 / "snapshots").string() << "</snapshot_storage_path>\n"
+             << "  <coordination_settings>\n"
+             << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+             << "    <startup_timeout>5000</startup_timeout>\n"
+             << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+             << "    <raft_logs_level>error</raft_logs_level>\n"
+             << "    <heart_beat_interval_ms>50</heart_beat_interval_ms>\n"
+             << "    <election_timeout_lower_bound_ms>150</election_timeout_lower_bound_ms>\n"
+             << "    <election_timeout_upper_bound_ms>300</election_timeout_upper_bound_ms>\n"
+             << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+             << "  </coordination_settings>\n"
+             << "  <raft_configuration>\n"
+             << "    <server><id>1</id><hostname>127.0.0.1</hostname><port>" << raft_ports[0] << "</port></server>\n"
+             << "    <server><id>2</id><hostname>127.0.0.1</hostname><port>" << raft_ports[1] << "</port></server>\n"
+             << "    <server><id>3</id><hostname>127.0.0.1</hostname><port>" << raft_ports[2] << "</port></server>\n"
+             << "    <server><id>4</id><hostname>127.0.0.1</hostname><port>" << raft_port4 << "</port><start_as_follower>true</start_as_follower></server>\n"
+             << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss4(xml4.str());
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg4(new Poco::Util::XMLConfiguration(iss4));
+        auto node4 = std::make_shared<DB::KeeperDispatcher>();
+        SCOPE_EXIT({
+            if (node4)
+            {
+                node4->signalShutdown();
+                node4->beginTCPConnectionDrain();
+                node4->shutdownBeforeConnectionsFinish();
+                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            }
+        });
+        node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+
+        /// Add Node 4 to the live 3-node cluster via `rcfg` `add_members`!
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
+               << R"(","learner":false,"priority":1}]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg add_members(4) failed: " + res_ss.str());
+        }
+        wait_until(8000, [&]() { return node4->isServerActive() && node4->isFollower(); },
+            "Dynamically added Node 4 did not become active follower");
+        {
+            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
+            {
+                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
+            });
+            require(zk4->get("/forwarded_from_follower") == "fwd-v1", "Dynamically added Node 4 missing replicated key");
+        }
+        require(nodes[leader_idx]->getClusterMembersInfo().size() == 4, "Expected 4 members after add_members(4)");
+
+        /// Remove Node 4 back out via `rcfg` `remove_members`!
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"remove_members":[4]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg remove_members(4) failed: " + res_ss.str());
+        }
+        require(nodes[leader_idx]->getClusterMembersInfo().size() == 3, "Expected 3 members after remove_members(4)");
+    }
+
+    /// 2b. Live `rcfg` `set_priority` + `transfer_leadership` to `follower_idx` (`server_id = follower_idx + 1`).
     {
         const int old_leader_id = leader_idx + 1;
         const int target_leader_id = follower_idx + 1;
@@ -1217,11 +1378,1702 @@ inline void testLive3NodeClusterForwardingFailoverAndForceRecovery(const std::fi
     std::cout << "  [PASS] live: 3node_forwarding_rcfg_failover_and_force_recovery\n";
 }
 
-} // namespace live_server_detail
+#if USE_SSL
+/// 7. Real 3-node TLS-encrypted Peer-to-Peer Raft Cluster (`raft_configuration.secure = true`)!
+/// Sets up a scoped `Poco::Util::Application` providing `openSSL.server.*` and `openSSL.client.*`
+/// configs (as read by `KeeperServer::setSSLParams`), starts 3 loopback TLS Raft nodes,
+/// verifies quorum election + follower->leader replication over encrypted Raft RPCs!
+inline void testLive3NodeTLSRaftCluster(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_3node_tls_raft";
+    std::filesystem::create_directories(base_dir);
+    const auto cert_path = base_dir / "raft_cert.pem";
+    const auto key_path = base_dir / "raft_key.pem";
+    generateSelfSignedCertPem(cert_path, key_path);
 
-inline void runKeeperLiveServerTests(const std::filesystem::path & state_dir)
+    /// Scoped `Poco::Util::Application` so `Poco::Util::Application::instance().config()` serves
+    /// the ephemeral TLS cert/key to `KeeperServer::setSSLParams`.
+    struct ScopedSSLApp final : public Poco::Util::Application
+    {
+        ScopedSSLApp(const std::string & cert, const std::string & key)
+        {
+            Poco::AutoPtr<Poco::Util::MapConfiguration> ssl_cfg(new Poco::Util::MapConfiguration());
+            ssl_cfg->setString("openSSL.server.certificateFile", cert);
+            ssl_cfg->setString("openSSL.server.privateKeyFile", key);
+            ssl_cfg->setString("openSSL.server.verificationMode", "none");
+            ssl_cfg->setBool("openSSL.server.loadDefaultCAFile", false);
+            ssl_cfg->setString("openSSL.client.certificateFile", cert);
+            ssl_cfg->setString("openSSL.client.privateKeyFile", key);
+            ssl_cfg->setString("openSSL.client.verificationMode", "none");
+            ssl_cfg->setBool("openSSL.client.loadDefaultCAFile", false);
+            config().add(ssl_cfg, -100);
+        }
+    };
+    ScopedSSLApp ssl_app(cert_path.string(), key_path.string());
+    DB::CertificateReloader::instance().tryLoad(ssl_app.config());
+    DB::CertificateReloader::instance().tryLoadClient(ssl_app.config());
+
+    const std::array<uint16_t, 3> raft_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+    const std::array<uint16_t, 3> tcp_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+
+    auto macros = std::make_shared<const DB::Macros>();
+    std::array<std::shared_ptr<DB::KeeperDispatcher>, 3> nodes;
+    SCOPE_EXIT({
+        for (auto & n : nodes)
+        {
+            if (n)
+            {
+                n->signalShutdown();
+                n->beginTCPConnectionDrain();
+                n->shutdownBeforeConnectionsFinish();
+                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+                n.reset();
+            }
+        }
+    });
+    for (int i = 0; i < 3; ++i)
+    {
+        const int id = i + 1;
+        const auto ndir = base_dir / ("node_" + std::to_string(id));
+        std::filesystem::create_directories(ndir / "logs");
+        std::filesystem::create_directories(ndir / "snapshots");
+
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << tcp_ports[i] << "</tcp_port>\n"
+            << "  <server_id>" << id << "</server_id>\n"
+            << "  <enable_ipv6>false</enable_ipv6>\n"
+            << "  <log_storage_path>" << (ndir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (ndir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+            << "    <startup_timeout>5000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <raft_logs_level>error</raft_logs_level>\n"
+            << "    <heart_beat_interval_ms>60</heart_beat_interval_ms>\n"
+            << "    <election_timeout_lower_bound_ms>180</election_timeout_lower_bound_ms>\n"
+            << "    <election_timeout_upper_bound_ms>360</election_timeout_upper_bound_ms>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n"
+            << "    <secure>true</secure>\n";
+        for (int s = 1; s <= 3; ++s)
+            xml << "    <server><id>" << s << "</id><hostname>127.0.0.1</hostname><port>" << raft_ports[s - 1] << "</port></server>\n";
+        xml << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+
+        std::istringstream iss(xml.str());
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+        nodes[i] = std::make_shared<DB::KeeperDispatcher>();
+        nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    }
+
+    int leader_idx = -1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        leader_idx = -1;
+        int followers = 0;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (nodes[i]->isServerActive() && nodes[i]->isLeader())
+                leader_idx = i;
+            else if (nodes[i]->isServerActive() && nodes[i]->isFollower())
+                ++followers;
+        }
+        if (leader_idx >= 0 && followers == 2)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    require(leader_idx >= 0, "3-node TLS Raft cluster did not elect leader with 2 followers");
+
+    const int follower_idx = (leader_idx + 1) % 3;
+    auto zk_f = zkutil::ZooKeeper::createFromImpl([d = nodes[follower_idx]]()
+    {
+        return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+    });
+    zk_f->create("/tls_raft_key", "encrypted-raft-ok", zkutil::CreateMode::Persistent);
+    require(zk_f->get("/tls_raft_key") == "encrypted-raft-ok", "TLS Raft follower read mismatch");
+
+    auto zk_l = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
+    {
+        return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+    });
+    require(zk_l->get("/tls_raft_key") == "encrypted-raft-ok", "TLS Raft leader read mismatch");
+
+    /// Hot-reload TLS certificates on disk (`CertificateReloader::tryLoad` + `tryLoadClient`) and verify
+    /// continued TLS Raft replication (`test_keeper_raft_cert_reload`)!
+    {
+        generateSelfSignedCertPem(cert_path, key_path);
+        DB::CertificateReloader::instance().tryLoad(ssl_app.config());
+        DB::CertificateReloader::instance().tryLoadClient(ssl_app.config());
+        auto zk_after_reload = zkutil::ZooKeeper::createFromImpl([d = nodes[follower_idx]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        zk_after_reload->create("/tls_raft_after_cert_reload", "reloaded-cert-ok", zkutil::CreateMode::Persistent);
+        require(zk_after_reload->get("/tls_raft_after_cert_reload") == "reloaded-cert-ok",
+            "TLS Raft cluster write after certificate reload failed");
+    }
+
+    for (auto & n : nodes)
+    {
+        n->signalShutdown();
+        n->beginTCPConnectionDrain();
+        n->shutdownBeforeConnectionsFinish();
+        n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        n.reset();
+    }
+
+    std::cout << "  [PASS] live: 3node_tls_encrypted_raft_peers\n";
+}
+#endif
+
+#if USE_AWS_S3
+/// 8. `KeeperSnapshotManagerS3` end-to-end upload + `.LOCK` coordination against an in-process loopback mock S3 HTTP server!
+inline void testLiveS3SnapshotUploader(const std::filesystem::path & root_dir)
+{
+    struct MockS3Store
+    {
+        std::mutex mu;
+        std::unordered_map<std::string, std::string> objects;
+    };
+    auto store = std::make_shared<MockS3Store>();
+
+    struct MockS3Handler final : public DB::HTTPRequestHandler
+    {
+        std::shared_ptr<MockS3Store> store;
+        explicit MockS3Handler(std::shared_ptr<MockS3Store> s) : store(std::move(s)) {}
+        void handleRequest(DB::HTTPServerRequest & req, DB::HTTPServerResponse & resp, const ProfileEvents::Event &) override
+        {
+            const std::string key = req.getURI();
+            const std::string & method = req.getMethod();
+            if (method == Poco::Net::HTTPRequest::HTTP_PUT)
+            {
+                std::ostringstream body;
+                auto & in = req.getStream();
+                char buf[4096];
+                while (!in.eof())
+                {
+                    const size_t n = in.read(buf, sizeof(buf));
+                    if (n == 0)
+                        break;
+                    body.write(buf, static_cast<std::streamsize>(n));
+                }
+                {
+                    std::lock_guard lk(store->mu);
+                    store->objects[key] = body.str();
+                }
+                resp.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+                resp.set("ETag", "\"sim-etag\"");
+                resp.send();
+            }
+            else if (method == Poco::Net::HTTPRequest::HTTP_HEAD)
+            {
+                std::lock_guard lk(store->mu);
+                if (auto it = store->objects.find(key); it != store->objects.end())
+                {
+                    resp.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+                    resp.setContentLength(it->second.size());
+                }
+                else
+                {
+                    resp.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                }
+                resp.send();
+            }
+            else if (method == Poco::Net::HTTPRequest::HTTP_GET)
+            {
+                std::lock_guard lk(store->mu);
+                if (auto it = store->objects.find(key); it != store->objects.end())
+                {
+                    resp.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+                    resp.setContentLength(it->second.size());
+                    *resp.send() << it->second;
+                }
+                else
+                {
+                    resp.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                    resp.send();
+                }
+            }
+            else if (method == Poco::Net::HTTPRequest::HTTP_DELETE)
+            {
+                {
+                    std::lock_guard lk(store->mu);
+                    store->objects.erase(key);
+                }
+                resp.setStatus(Poco::Net::HTTPResponse::HTTP_NO_CONTENT);
+                resp.send();
+            }
+            else
+            {
+                resp.setStatus(Poco::Net::HTTPResponse::HTTP_METHOD_NOT_ALLOWED);
+                resp.send();
+            }
+        }
+    };
+
+    struct MockS3Factory final : public DB::HTTPRequestHandlerFactory
+    {
+        std::shared_ptr<MockS3Store> store;
+        explicit MockS3Factory(std::shared_ptr<MockS3Store> s) : store(std::move(s)) {}
+        std::unique_ptr<DB::HTTPRequestHandler> createRequestHandler(const DB::HTTPServerRequest &) override
+        {
+            return std::make_unique<MockS3Handler>(store);
+        }
+    };
+
+    Poco::Net::ServerSocket s3_socket(Poco::Net::SocketAddress("127.0.0.1", 0));
+    const uint16_t s3_port = s3_socket.address().port();
+    Poco::ThreadPool s3_pool(2, 4);
+    auto http_ctx = std::make_shared<SimHTTPContext>();
+    Poco::Net::HTTPServerParams::Ptr params = new Poco::Net::HTTPServerParams();
+    params->setMaxThreads(4);
+    DB::HTTPServer s3_server(http_ctx, std::make_shared<MockS3Factory>(store), s3_pool, s3_socket, params);
+    s3_server.start();
+
+    const auto s3_dir = root_dir / "live_s3_snap";
+    std::filesystem::create_directories(s3_dir);
+    auto snap_disk = std::make_shared<DB::DiskLocal>("SimS3SnapDisk", s3_dir.string() + "/");
+    const std::string snap_name = "snapshot_42.bin.zstd";
+    {
+        DB::WriteBufferFromFile wb((s3_dir / snap_name).string());
+        wb.write("SIM_S3_SNAPSHOT_PAYLOAD", 23);
+        wb.finalize();
+    }
+
+    std::ostringstream xml;
+    xml << "<clickhouse><keeper_server><s3_snapshot>\n"
+        << "  <endpoint>http://127.0.0.1:" << s3_port << "/keeper-bucket/</endpoint>\n"
+        << "  <no_sign_request>true</no_sign_request>\n"
+        << "</s3_snapshot></keeper_server></clickhouse>\n";
+    std::istringstream iss(xml.str());
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration(iss));
+    auto macros = std::make_shared<const DB::Macros>();
+
+    DB::KeeperSnapshotManagerS3 uploader;
+    uploader.startup(*cfg, macros);
+    auto file_info = std::make_shared<DB::SnapshotFileInfo>(snap_name, snap_disk);
+    uploader.uploadSnapshot(file_info, /*async_upload=*/false);
+    uploader.shutdown();
+    s3_server.stopAll(/*abort_current=*/true);
+
+    std::lock_guard lk(store->mu);
+    const std::string expected_key = "/keeper-bucket/" + snap_name;
+    require(store->objects.contains(expected_key) && store->objects.at(expected_key) == "SIM_S3_SNAPSHOT_PAYLOAD",
+        "KeeperSnapshotManagerS3 did not upload snapshot payload to mock S3");
+    require(!store->objects.contains("/keeper-bucket/." + snap_name + "_LOCK"),
+        "KeeperSnapshotManagerS3 leaked .LOCK object on mock S3");
+    std::cout << "  [PASS] live: s3_snapshot_uploader_mock_s3\n";
+}
+#endif
+
+/// 9. Live TCP session resumption, invalid/expired session rejection, read-only handshake,
+/// and cross-client asynchronous watch push over real `KeeperTCPHandler`!
+inline void testLiveTCPSessionResumptionInvalidSessionAndCrossClientWatch(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_tcp_session_resume";
+    std::filesystem::create_directories(base_dir / "logs");
+    std::filesystem::create_directories(base_dir / "snapshots");
+
+    Poco::Net::ServerSocket tcp_socket(Poco::Net::SocketAddress("127.0.0.1", 0));
+    const uint16_t tcp_port = tcp_socket.address().port();
+    const uint16_t raft_port = pickFreeLoopbackPort();
+    auto config = makeLiveKeeperConfig(base_dir, tcp_port, raft_port, /*use_new_dispatcher=*/true);
+    auto macros = std::make_shared<const DB::Macros>();
+
+    auto dispatcher = std::make_shared<DB::KeeperDispatcher>();
+    dispatcher->initialize(*config, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    waitUntilActiveLeader(*dispatcher, 8000);
+
+    Poco::ThreadPool server_pool(2, 16);
+    auto tcp_factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+        [config]() -> const Poco::Util::AbstractConfiguration & { return *config; },
+        dispatcher,
+        /*receive_timeout_seconds=*/5,
+        /*send_timeout_seconds=*/5,
+        /*secure=*/false));
+    Poco::Net::TCPServerParams::Ptr tcp_params = new Poco::Net::TCPServerParams();
+    tcp_params->setMaxThreads(8);
+    DB::TCPServer tcp_server(tcp_factory, server_pool, tcp_socket, tcp_params);
+    tcp_server.start();
+
+    SCOPE_EXIT({
+        tcp_server.stop();
+        dispatcher->signalShutdown();
+        dispatcher->beginTCPConnectionDrain();
+        dispatcher->shutdownBeforeConnectionsFinish();
+        dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    });
+
+    auto recv_exact = [](Poco::Net::StreamSocket & sock, char * dst, size_t n) -> bool
+    {
+        size_t got = 0;
+        while (got < n)
+        {
+            const int r = sock.receiveBytes(dst + got, static_cast<int>(n - got));
+            if (r <= 0)
+                return false;
+            got += static_cast<size_t>(r);
+        }
+        return true;
+    };
+
+    auto send_handshake = [&](Poco::Net::StreamSocket & sock, int64_t sid, const std::string & passwd, bool readonly_hs)
+        -> std::tuple<int32_t, int32_t, int64_t, std::string>
+    {
+        DB::WriteBufferFromOwnString hs;
+        Coordination::write(static_cast<int32_t>(readonly_hs ? Coordination::CLIENT_HANDSHAKE_LENGTH_WITH_READONLY : Coordination::CLIENT_HANDSHAKE_LENGTH), hs);
+        Coordination::write(static_cast<int32_t>(0), hs);
+        Coordination::write(static_cast<int64_t>(0), hs);
+        Coordination::write(static_cast<int32_t>(10000), hs);
+        Coordination::write(sid, hs);
+        Coordination::write(passwd, hs);
+        if (readonly_hs)
+            Coordination::write(static_cast<int8_t>(1), hs);
+        const std::string hs_str = hs.str();
+        sock.sendBytes(hs_str.data(), static_cast<int>(hs_str.size()));
+
+        char len_buf[4];
+        if (!recv_exact(sock, len_buf, 4))
+            return {-1, 0, 0, ""};
+        DB::ReadBufferFromMemory len_rb(len_buf, 4);
+        int32_t resp_len = 0;
+        Coordination::read(resp_len, len_rb);
+        if (resp_len <= 0 || resp_len > 256)
+            return {-1, 0, 0, ""};
+        std::string body(static_cast<size_t>(resp_len), '\0');
+        if (!recv_exact(sock, body.data(), body.size()))
+            return {-1, 0, 0, ""};
+        DB::ReadBufferFromMemory rb(body.data(), body.size());
+        int32_t proto = 0;
+        int32_t timeout = 0;
+        int64_t out_sid = 0;
+        std::array<char, Coordination::PASSWORD_LENGTH> out_pw{};
+        Coordination::read(proto, rb);
+        Coordination::read(timeout, rb);
+        Coordination::read(out_sid, rb);
+        Coordination::read(out_pw, rb);
+        return {proto, timeout, out_sid, std::string(out_pw.data(), out_pw.size())};
+    };
+
+    /// 1. Raw TCP timeout clamping (`100ms -> min_session_timeout_ms=1000ms`), ephemeral create,
+    ///    explicit `OpNum::Close` cleanup, and `SessionExpired` (`timeout=0, sid=0`) on `previous_session_id != 0`!
+    {
+        Poco::Net::StreamSocket s1(Poco::Net::SocketAddress("127.0.0.1", tcp_port));
+        s1.setReceiveTimeout(Poco::Timespan(3, 0));
+        s1.setSendTimeout(Poco::Timespan(3, 0));
+        /// Request 100ms timeout (below min_session_timeout_ms=1000ms) -> server MUST clamp up to 1000ms!
+        DB::WriteBufferFromOwnString hs_clamp;
+        Coordination::write(static_cast<int32_t>(Coordination::CLIENT_HANDSHAKE_LENGTH), hs_clamp);
+        Coordination::write(static_cast<int32_t>(0), hs_clamp);
+        Coordination::write(static_cast<int64_t>(0), hs_clamp);
+        Coordination::write(static_cast<int32_t>(100), hs_clamp);
+        Coordination::write(static_cast<int64_t>(0), hs_clamp);
+        Coordination::write(std::string(16, '\0'), hs_clamp);
+        const std::string hs_clamp_str = hs_clamp.str();
+        s1.sendBytes(hs_clamp_str.data(), static_cast<int>(hs_clamp_str.size()));
+
+        char len_buf[4];
+        require(recv_exact(s1, len_buf, 4), "TCP clamp handshake length missing");
+        DB::ReadBufferFromMemory len_rb(len_buf, 4);
+        int32_t resp_len = 0;
+        Coordination::read(resp_len, len_rb);
+        std::string hbody(static_cast<size_t>(resp_len), '\0');
+        require(recv_exact(s1, hbody.data(), hbody.size()), "TCP clamp handshake body missing");
+        DB::ReadBufferFromMemory hrb(hbody.data(), hbody.size());
+        int32_t proto1 = 0;
+        int32_t to1 = 0;
+        int64_t sid1 = 0;
+        std::array<char, Coordination::PASSWORD_LENGTH> pw1_arr{};
+        Coordination::read(proto1, hrb);
+        Coordination::read(to1, hrb);
+        Coordination::read(sid1, hrb);
+        Coordination::read(pw1_arr, hrb);
+        const std::string pw1(pw1_arr.data(), pw1_arr.size());
+        require(proto1 == 0 && sid1 > 0 && to1 == 1000,
+            "TCP handshake timeout clamping mismatch (got to=" + std::to_string(to1) + ")");
+
+        /// Send Create ephemeral `/tcp_close_eph` on Socket 1.
+        auto creq = std::make_shared<Coordination::ZooKeeperCreateRequest>();
+        creq->xid = 1;
+        creq->path = "/tcp_close_eph";
+        creq->data = "alive";
+        creq->is_ephemeral = true;
+        creq->acls = {{Coordination::ACL::All, "world", "anyone"}};
+        DB::WriteBufferFromOwnString wb;
+        creq->write(wb, /*use_xid_64=*/false);
+        const std::string payload = wb.str();
+        s1.sendBytes(payload.data(), static_cast<int>(payload.size()));
+
+        char rlen_buf[4];
+        require(recv_exact(s1, rlen_buf, 4), "Create response length missing");
+        DB::ReadBufferFromMemory rlen_rb(rlen_buf, 4);
+        int32_t rlen = 0;
+        Coordination::read(rlen, rlen_rb);
+        std::string rbody(static_cast<size_t>(rlen), '\0');
+        require(recv_exact(s1, rbody.data(), rbody.size()), "Create response body missing");
+
+        auto zk_obs = zkutil::ZooKeeper::createFromImpl([dispatcher]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher, Poco::Timespan(10, 0));
+        });
+        require(zk_obs->get("/tcp_close_eph") == "alive", "Ephemeral node not visible over dispatcher");
+
+        /// Send explicit `OpNum::Close` on Socket 1 -> ephemeral MUST be deleted promptly!
+        auto close_req = std::make_shared<Coordination::ZooKeeperCloseRequest>();
+        close_req->xid = Coordination::CLOSE_XID;
+        DB::WriteBufferFromOwnString cwb;
+        close_req->write(cwb, /*use_xid_64=*/false);
+        const std::string cstr = cwb.str();
+        s1.sendBytes(cstr.data(), static_cast<int>(cstr.size()));
+        s1.close();
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4000);
+        while (zk_obs->exists("/tcp_close_eph") && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(!zk_obs->exists("/tcp_close_eph"), "Ephemeral node not deleted after explicit Close over TCP");
+
+        /// Attempting to continue an existing/previous session (`previous_session_id != 0`) MUST reply
+        /// `HandshakeResult::SessionExpired` (`timeout == 0 && session_id == 0`) rather than silently issuing a new session!
+        Poco::Net::StreamSocket s2(Poco::Net::SocketAddress("127.0.0.1", tcp_port));
+        s2.setReceiveTimeout(Poco::Timespan(3, 0));
+        s2.setSendTimeout(Poco::Timespan(3, 0));
+        auto [proto2, to2, sid2, pw2] = send_handshake(s2, sid1, pw1, false);
+        require(sid2 == 0 && to2 == 0,
+            "KeeperTCPHandler did not reply SessionExpired (timeout=0, sid=0) for previous_session_id != 0");
+        s2.close();
+    }
+
+    /// 2. Invalid / non-existent session_id MUST be rejected (`session_id == 0` or closed socket).
+    {
+        Poco::Net::StreamSocket sbad(Poco::Net::SocketAddress("127.0.0.1", tcp_port));
+        sbad.setReceiveTimeout(Poco::Timespan(2, 0));
+        sbad.setSendTimeout(Poco::Timespan(2, 0));
+        auto [proto_bad, to_bad, sid_bad, pw_bad] = send_handshake(sbad, 0x777777LL, std::string(16, '\0'), false);
+        require(sid_bad == 0, "KeeperTCPHandler accepted bogus non-existent session_id!");
+        sbad.close();
+    }
+
+    /// 3. Read-only 45-byte handshake (`CLIENT_HANDSHAKE_LENGTH_WITH_READONLY`).
+    {
+        Poco::Net::StreamSocket sro(Poco::Net::SocketAddress("127.0.0.1", tcp_port));
+        sro.setReceiveTimeout(Poco::Timespan(2, 0));
+        sro.setSendTimeout(Poco::Timespan(2, 0));
+        auto [proto_ro, to_ro, sid_ro, pw_ro] = send_handshake(sro, 0, std::string(16, '\0'), /*readonly_hs=*/true);
+        require(sid_ro > 0 && to_ro > 0, "TCP 45-byte readonly handshake failed");
+        sro.close();
+    }
+
+    /// 4. Cross-client async watch push over live TCP (`Session A` watches, `Session B` mutates!).
+    {
+        zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port));
+        args.connection_timeout_ms = 5000;
+        args.session_timeout_ms = 10000;
+        args.operation_timeout_ms = 5000;
+        auto zk_a = zkutil::ZooKeeper::create(args, nullptr, nullptr);
+        auto zk_b = zkutil::ZooKeeper::create(args, nullptr, nullptr);
+
+        zk_a->create("/cross_watch", "v0", zkutil::CreateMode::Persistent);
+        zk_a->create("/cross_dir", "", zkutil::CreateMode::Persistent);
+
+        auto data_ev = std::make_shared<Poco::Event>();
+        auto child_ev = std::make_shared<Poco::Event>();
+        require(zk_a->get("/cross_watch", nullptr, data_ev) == "v0", "Cross-client initial get failed");
+        require(zk_a->getChildren("/cross_dir", nullptr, child_ev).empty(), "Cross-client initial list failed");
+
+        zk_b->set("/cross_watch", "v1");
+        zk_b->create("/cross_dir/c1", "child1", zkutil::CreateMode::Persistent);
+
+        require(data_ev->tryWait(3000), "Cross-client TCP data watch push did not arrive on Session A");
+        require(child_ev->tryWait(3000), "Cross-client TCP child watch push did not arrive on Session A");
+    }
+
+    std::cout << "  [PASS] live: tcp_session_resumption_invalid_session_readonly_and_cross_client_watch\n";
+}
+
+/// 10. Live `ZooKeeper` Client Library Helpers (`ZooKeeperLock`, `ZooKeeperNodeCache`, `ZooKeeperCachingGetter`,
+/// `multi` atomic rollback, and `listWithOptions`) against a real `KeeperDispatcher`!
+inline void testLiveClientHelpersLockNodeCacheCachingGetterAndMulti(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_client_helpers";
+    std::filesystem::create_directories(base_dir / "logs");
+    std::filesystem::create_directories(base_dir / "snapshots");
+
+    Poco::Net::ServerSocket tcp_socket(Poco::Net::SocketAddress("127.0.0.1", 0));
+    const uint16_t tcp_port = tcp_socket.address().port();
+    const uint16_t raft_port = pickFreeLoopbackPort();
+    auto config = makeLiveKeeperConfig(base_dir, tcp_port, raft_port, /*use_new_dispatcher=*/true);
+    auto macros = std::make_shared<const DB::Macros>();
+
+    auto dispatcher = std::make_shared<DB::KeeperDispatcher>();
+    dispatcher->initialize(*config, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    waitUntilActiveLeader(*dispatcher, 8000);
+
+    Poco::ThreadPool server_pool(2, 16);
+    auto tcp_factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+        [config]() -> const Poco::Util::AbstractConfiguration & { return *config; },
+        dispatcher,
+        /*receive_timeout_seconds=*/5,
+        /*send_timeout_seconds=*/5,
+        /*secure=*/false));
+    Poco::Net::TCPServerParams::Ptr tcp_params = new Poco::Net::TCPServerParams();
+    tcp_params->setMaxThreads(8);
+    DB::TCPServer tcp_server(tcp_factory, server_pool, tcp_socket, tcp_params);
+    tcp_server.start();
+
+    SCOPE_EXIT({
+        tcp_server.stop();
+        dispatcher->signalShutdown();
+        dispatcher->beginTCPConnectionDrain();
+        dispatcher->shutdownBeforeConnectionsFinish();
+        dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    });
+
+    auto make_zk = [tcp_port]()
+    {
+        zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port));
+        args.connection_timeout_ms = 5000;
+        args.session_timeout_ms = 10000;
+        args.operation_timeout_ms = 5000;
+        return zkutil::ZooKeeper::create(args, nullptr, nullptr);
+    };
+
+    auto zk1 = make_zk();
+    auto zk2 = make_zk();
+
+    /// 1. `zkutil::ZooKeeperLock` mutual exclusion.
+    {
+        zk1->create("/locks", "", zkutil::CreateMode::Persistent);
+        auto lock1 = zkutil::createSimpleZooKeeperLock(zk1, "/locks", "res1", "holder1");
+        auto lock2 = zkutil::createSimpleZooKeeperLock(zk2, "/locks", "res1", "holder2");
+        require(lock1->tryLock(), "lock1 failed to acquire free ZooKeeperLock");
+        require(lock1->isLocked(/*check_node=*/true), "lock1 should report locked");
+        require(!lock2->tryLock(), "lock2 acquired contended ZooKeeperLock!");
+        lock1->unlock();
+        require(lock2->tryLock(), "lock2 failed to acquire unlocked ZooKeeperLock");
+        lock2->unlock();
+    }
+
+    /// 2. `zkutil::ZooKeeperNodeCache` live watch-driven invalidation (missing -> created -> updated -> deleted).
+    {
+        zkutil::ZooKeeperNodeCache cache([&]() { return zk1; });
+        auto ev = std::make_shared<Poco::Event>();
+        auto z0 = cache.get("/nc_node", ev);
+        require(!z0.exists, "NodeCache expected nonexistent initially");
+
+        zk2->create("/nc_node", "nc-v1", zkutil::CreateMode::Persistent);
+        require(ev->tryWait(3000), "NodeCache watch did not fire on create");
+        ev->reset();
+        auto z1 = cache.get("/nc_node", ev);
+        require(z1.exists && z1.contents == "nc-v1", "NodeCache did not observe created payload");
+
+        zk2->set("/nc_node", "nc-v2");
+        require(ev->tryWait(3000), "NodeCache watch did not fire on set");
+        ev->reset();
+        auto z2 = cache.get("/nc_node", ev);
+        require(z2.exists && z2.contents == "nc-v2", "NodeCache did not observe updated payload");
+
+        zk2->remove("/nc_node");
+        require(ev->tryWait(3000), "NodeCache watch did not fire on remove");
+        auto z3 = cache.get("/nc_node", ev);
+        require(!z3.exists, "NodeCache did not observe deletion");
+    }
+
+    /// 3. `zkutil::ZooKeeperCachingGetter` cache hit & `resetCache`.
+    {
+        int factory_calls = 0;
+        zkutil::ZooKeeperCachingGetter getter([&]()
+        {
+            ++factory_calls;
+            return make_zk();
+        });
+        auto [c1, s1] = getter.getZooKeeper();
+        require(s1 == zkutil::ZooKeeperCachingGetter::SessionStatus::New && factory_calls == 1,
+            "CachingGetter first call expected New");
+        auto [c2, s2] = getter.getZooKeeper();
+        require(s2 == zkutil::ZooKeeperCachingGetter::SessionStatus::Cached && c2 == c1 && factory_calls == 1,
+            "CachingGetter second call expected Cached");
+        getter.resetCache();
+        auto [c3, s3] = getter.getZooKeeper();
+        require(s3 == zkutil::ZooKeeperCachingGetter::SessionStatus::New && factory_calls == 2,
+            "CachingGetter after resetCache expected New");
+    }
+
+    /// 4. Live `ZooKeeper::multi` atomic rollback + `listWithOptions` over `KeeperOverDispatcher`.
+    {
+        Coordination::Requests bad_multi;
+        bad_multi.push_back(zkutil::makeCreateRequest("/live_rb_ok", "temp", zkutil::CreateMode::Persistent));
+        bad_multi.push_back(zkutil::makeCreateRequest("/live_rb_dup", "d1", zkutil::CreateMode::Persistent));
+        bad_multi.push_back(zkutil::makeCreateRequest("/live_rb_dup", "d2", zkutil::CreateMode::Persistent));
+        Coordination::Responses res;
+        require(zk1->tryMulti(bad_multi, res) == Coordination::Error::ZNODEEXISTS,
+            "Live multi expected ZNODEEXISTS rollback");
+        require(!zk1->exists("/live_rb_ok") && !zk1->exists("/live_rb_dup"),
+            "Live multi rollback leaked created nodes");
+
+        zk1->create("/live_lwo", "", zkutil::CreateMode::Persistent);
+        zk1->create("/live_lwo/p1", "pv1", zkutil::CreateMode::Persistent);
+        zk1->create("/live_lwo/p1/sub", "sv1", zkutil::CreateMode::Persistent);
+        zk1->create("/live_lwo/e1", "ev1", zkutil::CreateMode::Ephemeral);
+
+        auto ov = std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher, Poco::Timespan(10, 0));
+        Coordination::ListOptions opts;
+        opts.filter = Coordination::ListRequestType::EPHEMERAL_ONLY;
+        opts.with_stat = true;
+        opts.with_data = true;
+        auto done = std::make_shared<Poco::Event>();
+        Coordination::ListWithOptionsResponse got;
+        ov->listWithOptions("/live_lwo", opts, [&](const Coordination::ListWithOptionsResponse & r)
+        {
+            got = r;
+            done->set();
+        }, {});
+        require(done->tryWait(5000) && got.error == Coordination::Error::ZOK
+            && got.names.size() == 1 && got.names[0] == "e1" && got.data[0] == "ev1",
+            "Live KeeperOverDispatcher listWithOptions EPHEMERAL_ONLY failed");
+    }
+
+    std::cout << "  [PASS] live: client_helpers_lock_node_cache_caching_getter_and_multi\n";
+}
+
+/// 11. Real 3-node On-Disk LSMT Cluster (`use_lsmt_storage = true`, `storage_memory_only = false`)
+/// + live 4th-node `learner: true` dynamic join/catch-up/remove + `HOT_RELOAD` `updateConfiguration`!
+inline void testLive3NodeLSMTDiskLearnerJoinAndHotReload(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_3node_lsmt_disk_learner";
+    std::filesystem::create_directories(base_dir);
+
+    const std::array<uint16_t, 3> raft_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+    const std::array<uint16_t, 3> tcp_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+
+    auto make_lsmt_cfg = [&](int id, bool quorum_reads_val, uint64_t batch_size_val, uint64_t read_threads_val,
+                             uint16_t extra_learner_port = 0)
+    {
+        const auto ndir = base_dir / ("node_" + std::to_string(id));
+        std::filesystem::create_directories(ndir / "logs");
+        std::filesystem::create_directories(ndir / "snapshots");
+        std::filesystem::create_directories(ndir / "data");
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << (id <= 3 ? tcp_ports[id - 1] : pickFreeLoopbackPort()) << "</tcp_port>\n"
+            << "  <server_id>" << id << "</server_id>\n"
+            << "  <enable_reconfiguration>true</enable_reconfiguration>\n"
+            << "  <log_storage_path>" << (ndir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (ndir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <data_storage_path>" << (ndir / "data").string() << "</data_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+            << "    <startup_timeout>8000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <raft_logs_level>error</raft_logs_level>\n"
+            << "    <heart_beat_interval_ms>50</heart_beat_interval_ms>\n"
+            << "    <election_timeout_lower_bound_ms>150</election_timeout_lower_bound_ms>\n"
+            << "    <election_timeout_upper_bound_ms>300</election_timeout_upper_bound_ms>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "    <optimize_read_order>true</optimize_read_order>\n"
+            << "    <use_lsmt_storage>true</use_lsmt_storage>\n"
+            << "    <storage_memory_only>false</storage_memory_only>\n"
+            << "    <committed_memtable_size>4096</committed_memtable_size>\n"
+            << "    <block_cache_size>8192</block_cache_size>\n"
+            << "    <sorted_file_uncompressed_size>4096</sorted_file_uncompressed_size>\n"
+            << "    <quorum_reads>" << (quorum_reads_val ? "true" : "false") << "</quorum_reads>\n"
+            << "    <max_requests_batch_size>" << batch_size_val << "</max_requests_batch_size>\n"
+            << "    <parallel_read_threads>" << read_threads_val << "</parallel_read_threads>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n";
+        for (int sid = 1; sid <= 3; ++sid)
+            xml << "    <server><id>" << sid << "</id><hostname>127.0.0.1</hostname><port>" << raft_ports[sid - 1] << "</port></server>\n";
+        if (extra_learner_port > 0)
+            xml << "    <server><id>4</id><hostname>127.0.0.1</hostname><port>" << extra_learner_port << "</port><can_become_leader>false</can_become_leader><priority>0</priority><start_as_follower>true</start_as_follower></server>\n";
+        xml << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(iss));
+    };
+
+    auto macros = std::make_shared<const DB::Macros>();
+    std::array<std::shared_ptr<DB::KeeperDispatcher>, 3> nodes;
+    SCOPE_EXIT({
+        for (auto & n : nodes)
+        {
+            if (n)
+            {
+                n->signalShutdown();
+                n->beginTCPConnectionDrain();
+                n->shutdownBeforeConnectionsFinish();
+                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            }
+        }
+    });
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = make_lsmt_cfg(i + 1, false, 64, 2);
+        nodes[i] = std::make_shared<DB::KeeperDispatcher>();
+        nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    }
+
+    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (pred())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        throw std::runtime_error(msg);
+    };
+
+    int leader_idx = -1;
+    wait_until(10000, [&]()
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            if (nodes[i]->isServerActive() && nodes[i]->isLeader())
+            {
+                leader_idx = i;
+                return true;
+            }
+        }
+        return false;
+    }, "3-node LSMT-Disk cluster did not elect leader");
+
+    /// Write 35 nodes + a 6 KB huge value forcing LSMT memtable flushes & sorted-run merges on disk!
+    const std::string huge_val(6144, 'L');
+    {
+        auto zk = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        zk->create("/lsmt_huge", huge_val, zkutil::CreateMode::Persistent);
+        for (int i = 0; i < 35; ++i)
+            zk->create("/lsmt_k" + std::to_string(i), std::string(180, static_cast<char>('a' + (i % 26))), zkutil::CreateMode::Persistent);
+        require(zk->get("/lsmt_huge") == huge_val, "3-node LSMT-Disk huge readback mismatch");
+    }
+
+    /// Dynamically add a 4th LSMT-disk node as a non-voting `learner: true` via `rcfg` `add_members`!
+    {
+        const uint16_t raft_port4 = pickFreeLoopbackPort();
+        auto cfg4 = make_lsmt_cfg(4, false, 64, 2, raft_port4);
+        auto node4 = std::make_shared<DB::KeeperDispatcher>();
+        SCOPE_EXIT({
+            if (node4)
+            {
+                node4->signalShutdown();
+                node4->beginTCPConnectionDrain();
+                node4->shutdownBeforeConnectionsFinish();
+                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            }
+        });
+        node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
+               << R"(","learner":true,"priority":0}]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg add_members learner(4) failed: " + res_ss.str());
+        }
+
+        wait_until(8000, [&]() { return node4->isServerActive() && node4->isObserver(); },
+            "Dynamically added LSMT learner Node 4 did not become active observer");
+        {
+            const auto members = nodes[leader_idx]->getClusterMembersInfo();
+            bool found_observer = false;
+            for (const auto & m : members)
+                if (m.server_id == 4 && m.is_observer)
+                    found_observer = true;
+            require(found_observer, "Cluster members info did not report Node 4 as observer/learner");
+        }
+        {
+            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
+            {
+                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
+            });
+            require(zk4->get("/lsmt_huge") == huge_val, "LSMT learner Node 4 missing huge value");
+        }
+
+        /// Remove learner Node 4 cleanly via `rcfg` `remove_members`.
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"remove_members":[4]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg remove_members learner(4) failed: " + res_ss.str());
+        }
+        require(nodes[leader_idx]->getClusterMembersInfo().size() == 3, "Expected 3 members after removing learner 4");
+    }
+
+    /// Hot-reload `HOT_RELOAD` `CoordinationSettings` (`quorum_reads = true`, `max_requests_batch_size = 32`, `parallel_read_threads = 4`)!
+    {
+        auto hot_cfg = make_lsmt_cfg(leader_idx + 1, /*quorum_reads_val=*/true, /*batch_size_val=*/32, /*read_threads_val=*/4);
+        nodes[leader_idx]->updateConfiguration(*hot_cfg, macros);
+
+        auto zk = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        zk->create("/after_hot_reload", "quorum-ok", zkutil::CreateMode::Persistent);
+        require(zk->get("/after_hot_reload") == "quorum-ok", "Quorum read after hot reload failed");
+        require(zk->get("/lsmt_huge") == huge_val, "Huge quorum read after hot reload failed");
+    }
+
+    std::cout << "  [PASS] live: 3node_lsmt_disk_learner_join_and_hot_reload\n";
+}
+
+/// 12. Live TCP `chroot` (`root_path`) isolation + graceful `KeeperDispatcher` shutdown & restart durability
+/// (snapshot + post-snapshot changelog delta + sequential counter continuity)!
+inline void testLiveTCPChrootIsolationAndRestartPersistence(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_tcp_chroot_restart";
+    std::filesystem::create_directories(base_dir / "logs");
+    std::filesystem::create_directories(base_dir / "snapshots");
+    const uint16_t raft_port = pickFreeLoopbackPort();
+    auto macros = std::make_shared<const DB::Macros>();
+
+    /// Boot #1: exercise `chroot` isolation over live TCP, take a snapshot, then write post-snapshot deltas.
+    {
+        Poco::Net::ServerSocket tcp_socket(Poco::Net::SocketAddress("127.0.0.1", 0));
+        const uint16_t tcp_port = tcp_socket.address().port();
+        auto config = makeLiveKeeperConfig(base_dir, tcp_port, raft_port, /*use_new_dispatcher=*/true);
+
+        auto dispatcher = std::make_shared<DB::KeeperDispatcher>();
+        dispatcher->initialize(*config, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+        waitUntilActiveLeader(*dispatcher, 8000);
+
+        Poco::ThreadPool server_pool(2, 16);
+        auto tcp_factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+            [config]() -> const Poco::Util::AbstractConfiguration & { return *config; },
+            dispatcher,
+            /*receive_timeout_seconds=*/5,
+            /*send_timeout_seconds=*/5,
+            /*secure=*/false));
+        Poco::Net::TCPServerParams::Ptr tcp_params = new Poco::Net::TCPServerParams();
+        tcp_params->setMaxThreads(8);
+        DB::TCPServer tcp_server(tcp_factory, server_pool, tcp_socket, tcp_params);
+        tcp_server.start();
+        SCOPE_EXIT({
+            tcp_server.stop();
+            dispatcher->signalShutdown();
+            dispatcher->beginTCPConnectionDrain();
+            dispatcher->shutdownBeforeConnectionsFinish();
+            dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        });
+
+        zkutil::ZooKeeperArgs root_args("127.0.0.1:" + std::to_string(tcp_port));
+        root_args.connection_timeout_ms = 5000;
+        root_args.session_timeout_ms = 10000;
+        root_args.operation_timeout_ms = 5000;
+        auto zk_root = zkutil::ZooKeeper::create(root_args, nullptr, nullptr);
+        zk_root->create("/tenant_a", "troot", zkutil::CreateMode::Persistent);
+
+        /// Chrooted client sees `/tenant_a` as `/`!
+        zkutil::ZooKeeperArgs chroot_args = root_args;
+        chroot_args.chroot = "/tenant_a";
+        auto zk_chroot = zkutil::ZooKeeper::create(chroot_args, nullptr, nullptr);
+        zk_chroot->create("/k1", "v1", zkutil::CreateMode::Persistent);
+        require(zk_root->get("/tenant_a/k1") == "v1", "Chroot create did not map under /tenant_a");
+
+        auto watch_ev = std::make_shared<Poco::Event>();
+        require(zk_chroot->get("/k1", nullptr, watch_ev) == "v1", "Chroot get mismatch");
+        zk_root->set("/tenant_a/k1", "v2");
+        require(watch_ev->tryWait(3000), "Chroot watch did not fire when root updated /tenant_a/k1");
+        auto ch_children = zk_chroot->getChildren("/");
+        require(std::find(ch_children.begin(), ch_children.end(), "k1") != ch_children.end()
+            && std::find(ch_children.begin(), ch_children.end(), "clickhouse") != ch_children.end(),
+            "Chroot getChildren(/) missing expected chrooted children (k1 + clickhouse session dir)");
+
+        /// Create sequential node #0, trigger live snapshot, then write post-snapshot delta!
+        const std::string seq0 = zk_root->create("/tenant_a/seq", "s0", zkutil::CreateMode::PersistentSequential);
+        require(seq0.ends_with("0000000001") || seq0.ends_with("0000000000") || seq0.find("/tenant_a/seq") == 0,
+            "Unexpected sequential node name: " + seq0);
+        (void)dispatcher->createSnapshot();
+        zk_root->create("/post_snap_delta", "delta-alive", zkutil::CreateMode::Persistent);
+    }
+
+    /// Boot #2: fresh `KeeperDispatcher` on the exact same `logs` + `snapshots` directories MUST recover snapshot + delta!
+    {
+        const uint16_t tcp_port2 = pickFreeLoopbackPort();
+        auto config2 = makeLiveKeeperConfig(base_dir, tcp_port2, raft_port, /*use_new_dispatcher=*/true);
+        auto dispatcher2 = std::make_shared<DB::KeeperDispatcher>();
+        dispatcher2->initialize(*config2, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+        waitUntilActiveLeader(*dispatcher2, 8000);
+        SCOPE_EXIT({
+            dispatcher2->signalShutdown();
+            dispatcher2->beginTCPConnectionDrain();
+            dispatcher2->shutdownBeforeConnectionsFinish();
+            dispatcher2->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+        });
+
+        auto zk2 = zkutil::ZooKeeper::createFromImpl([dispatcher2]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(dispatcher2, Poco::Timespan(10, 0));
+        });
+        require(zk2->get("/tenant_a/k1") == "v2", "Restart lost pre-snapshot /tenant_a/k1");
+        require(zk2->get("/post_snap_delta") == "delta-alive", "Restart lost post-snapshot changelog delta");
+        const std::string seq_next = zk2->create("/tenant_a/seq", "s1", zkutil::CreateMode::PersistentSequential);
+        require(seq_next > "/tenant_a/seq0000000000", "Restart did not advance sequential counter: " + seq_next);
+    }
+
+    std::cout << "  [PASS] live: tcp_chroot_isolation_and_restart_persistence\n";
+}
+
+/// 13. Real 3-node cluster with forced chunked `InstallSnapshot` over live NuRaft ASIO TCP (`reserved_log_items = 0`,
+/// `snapshot_transfer_chunk_size = 512`) + live multi-host `zkutil::ZooKeeper` failover with `ZooKeeperRetriesControl`!
+inline void testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_3node_chunked_snap_failover";
+    std::filesystem::create_directories(base_dir);
+
+    const std::array<uint16_t, 3> raft_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+    std::array<Poco::Net::ServerSocket, 3> tcp_sockets;
+    std::array<uint16_t, 3> tcp_ports{};
+    for (int i = 0; i < 3; ++i)
+    {
+        tcp_sockets[i] = Poco::Net::ServerSocket(Poco::Net::SocketAddress("127.0.0.1", 0));
+        tcp_ports[i] = tcp_sockets[i].address().port();
+    }
+
+    auto make_cfg = [&](int id, uint16_t extra_port4 = 0)
+    {
+        const auto ndir = base_dir / ("node_" + std::to_string(id));
+        std::filesystem::create_directories(ndir / "logs");
+        std::filesystem::create_directories(ndir / "snapshots");
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << (id <= 3 ? tcp_ports[id - 1] : pickFreeLoopbackPort()) << "</tcp_port>\n"
+            << "  <server_id>" << id << "</server_id>\n"
+            << "  <enable_reconfiguration>true</enable_reconfiguration>\n"
+            << "  <log_storage_path>" << (ndir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (ndir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+            << "    <startup_timeout>8000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <raft_logs_level>error</raft_logs_level>\n"
+            << "    <heart_beat_interval_ms>50</heart_beat_interval_ms>\n"
+            << "    <election_timeout_lower_bound_ms>150</election_timeout_lower_bound_ms>\n"
+            << "    <election_timeout_upper_bound_ms>300</election_timeout_upper_bound_ms>\n"
+            << "    <snapshot_distance>10</snapshot_distance>\n"
+            << "    <reserved_log_items>0</reserved_log_items>\n"
+            << "    <stale_log_gap>5</stale_log_gap>\n"
+            << "    <fresh_log_gap>3</fresh_log_gap>\n"
+            << "    <snapshot_transfer_chunk_size>512</snapshot_transfer_chunk_size>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n";
+        for (int sid = 1; sid <= 3; ++sid)
+            xml << "    <server><id>" << sid << "</id><hostname>127.0.0.1</hostname><port>" << raft_ports[sid - 1] << "</port></server>\n";
+        if (extra_port4 > 0)
+            xml << "    <server><id>4</id><hostname>127.0.0.1</hostname><port>" << extra_port4 << "</port><start_as_follower>true</start_as_follower></server>\n";
+        xml << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(iss));
+    };
+
+    auto macros = std::make_shared<const DB::Macros>();
+    std::array<std::shared_ptr<DB::KeeperDispatcher>, 3> nodes;
+    std::array<std::unique_ptr<DB::TCPServer>, 3> tcp_servers;
+    Poco::ThreadPool server_pool(4, 24);
+
+    auto stop_node = [&](int i)
+    {
+        if (tcp_servers[i])
+        {
+            tcp_servers[i]->stop();
+            tcp_servers[i].reset();
+        }
+        if (nodes[i])
+        {
+            nodes[i]->signalShutdown();
+            nodes[i]->beginTCPConnectionDrain();
+            nodes[i]->shutdownBeforeConnectionsFinish();
+            nodes[i]->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            nodes[i].reset();
+        }
+    };
+    SCOPE_EXIT({
+        for (int i = 0; i < 3; ++i)
+            stop_node(i);
+    });
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = make_cfg(i + 1);
+        nodes[i] = std::make_shared<DB::KeeperDispatcher>();
+        nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+        auto factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+            [cfg]() -> const Poco::Util::AbstractConfiguration & { return *cfg; },
+            nodes[i],
+            /*receive_timeout_seconds=*/5,
+            /*send_timeout_seconds=*/5,
+            /*secure=*/false));
+        Poco::Net::TCPServerParams::Ptr params = new Poco::Net::TCPServerParams();
+        params->setMaxThreads(8);
+        tcp_servers[i] = std::make_unique<DB::TCPServer>(factory, server_pool, tcp_sockets[i], params);
+        tcp_servers[i]->start();
+    }
+
+    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (pred())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        throw std::runtime_error(msg);
+    };
+
+    auto find_leader = [&]() -> int
+    {
+        for (int i = 0; i < 3; ++i)
+            if (nodes[i] && nodes[i]->isServerActive() && nodes[i]->isLeader())
+                return i;
+        return -1;
+    };
+
+    int leader_idx = -1;
+    wait_until(10000, [&]()
+    {
+        leader_idx = find_leader();
+        return leader_idx >= 0;
+    }, "3-node chunked-snapshot cluster did not elect leader");
+
+    /// Write 25 keys + 4 KB payload -> forces automatic snapshot + log compaction (`reserved_log_items = 0`).
+    const std::string big_payload(4096, 'S');
+    const std::string multi_hosts = "127.0.0.1:" + std::to_string(tcp_ports[0])
+        + ",127.0.0.1:" + std::to_string(tcp_ports[1])
+        + ",127.0.0.1:" + std::to_string(tcp_ports[2]);
+    zkutil::ZooKeeperArgs client_args(multi_hosts);
+    client_args.connection_timeout_ms = 3000;
+    client_args.session_timeout_ms = 10000;
+    client_args.operation_timeout_ms = 5000;
+    auto zk = zkutil::ZooKeeper::create(client_args, nullptr, nullptr);
+    zk->create("/snap_big", big_payload, zkutil::CreateMode::Persistent);
+    for (int i = 0; i < 25; ++i)
+        zk->create("/snap_k" + std::to_string(i), "val-" + std::to_string(i), zkutil::CreateMode::Persistent);
+    /// Ensure leader has compacted logs past index 1 so Node 4 MUST install a chunked snapshot!
+    (void)nodes[leader_idx]->createSnapshot();
+    wait_until(5000, [&]()
+    {
+        return nodes[leader_idx]->getKeeperLogInfo().first_log_idx > 1;
+    }, "Leader did not compact logs before Node 4 chunked InstallSnapshot join");
+
+    /// Join fresh Node 4 -> MUST catch up via live multi-chunk `InstallSnapshot` (`snapshot_transfer_chunk_size = 512`)!
+    {
+        const uint16_t raft_port4 = pickFreeLoopbackPort();
+        auto cfg4 = make_cfg(4, raft_port4);
+        auto node4 = std::make_shared<DB::KeeperDispatcher>();
+        SCOPE_EXIT({
+            if (node4)
+            {
+                node4->signalShutdown();
+                node4->beginTCPConnectionDrain();
+                node4->shutdownBeforeConnectionsFinish();
+                node4->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            }
+        });
+        node4->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"add_members":[{"id":4,"endpoint":"127.0.0.1:)" << raft_port4
+               << R"(","learner":false,"priority":1}]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg add_members(4) for chunked snapshot failed: " + res_ss.str());
+        }
+        wait_until(10000, [&]() { return node4->isServerActive() && node4->isFollower(); },
+            "Node 4 did not complete live chunked InstallSnapshot");
+        {
+            auto zk4 = zkutil::ZooKeeper::createFromImpl([node4]()
+            {
+                return std::make_unique<Coordination::KeeperOverDispatcher>(node4, Poco::Timespan(10, 0));
+            });
+            require(zk4->get("/snap_big") == big_payload && zk4->get("/snap_k24") == "val-24",
+                "Node 4 missing snapshot-installed keys");
+        }
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3,4],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"remove_members":[4]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg remove_members(4) failed: " + res_ss.str());
+        }
+    }
+
+    /// Kill the leader's TCP listener + Dispatcher and verify multi-host `zkutil::ZooKeeper` + `ZooKeeperRetriesControl`
+    /// fails over seamlessly to one of the 2 surviving nodes!
+    stop_node(leader_idx);
+    wait_until(8000, [&]()
+    {
+        const int nl = find_leader();
+        return nl >= 0 && nl != leader_idx;
+    }, "Surviving 2/3 nodes failed to elect new leader for multi-host client failover");
+
+    DB::ZooKeeperRetriesInfo retry_info(/*max_retries_=*/10, /*initial_backoff_ms_=*/50, /*max_backoff_ms_=*/250, nullptr);
+    DB::ZooKeeperRetriesControl retry_ctrl("sim_multihost_failover", nullptr, retry_info);
+    std::string recovered_val;
+    retry_ctrl.retryLoop([&]()
+    {
+        if (zk->expired())
+            zk = zk->startNewSession();
+        recovered_val = zk->get("/snap_big");
+        zk->create("/after_multihost_failover", "failover-ok", zkutil::CreateMode::Persistent);
+    });
+    require(recovered_val == big_payload && zk->get("/after_multihost_failover") == "failover-ok",
+        "Multi-host ZooKeeper client failover failed");
+
+    std::cout << "  [PASS] live: 3node_chunked_snapshot_install_and_multihost_client_failover\n";
+}
+
+/// 14. Live client `path_acls` (`apply_to_children`), Availability Zone preference (`prefer_local_availability_zone`),
+/// dynamic `<raft_logs_level>` hot reload, and `<create_snapshot_on_exit>true</create_snapshot_on_exit>`!
+inline void testLivePathACLsSnapshotOnExitDynamicLogLevelAndAZPreference(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_path_acl_snap_exit_az";
+    std::filesystem::create_directories(base_dir / "logs");
+    std::filesystem::create_directories(base_dir / "snapshots");
+
+    Poco::Net::ServerSocket tcp_socket1(Poco::Net::SocketAddress("127.0.0.1", 0));
+    Poco::Net::ServerSocket tcp_socket2(Poco::Net::SocketAddress("127.0.0.1", 0));
+    const uint16_t tcp_port1 = tcp_socket1.address().port();
+    const uint16_t tcp_port2 = tcp_socket2.address().port();
+    const uint16_t raft_port = pickFreeLoopbackPort();
+    auto macros = std::make_shared<const DB::Macros>();
+
+    auto make_xml = [&](const std::string & raft_log_lvl)
+    {
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << tcp_port1 << "</tcp_port>\n"
+            << "  <server_id>1</server_id>\n"
+            << "  <create_snapshot_on_exit>true</create_snapshot_on_exit>\n"
+            << "  <log_storage_path>" << (base_dir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (base_dir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+            << "    <startup_timeout>5000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <raft_logs_level>" << raft_log_lvl << "</raft_logs_level>\n"
+            << "    <snapshot_distance>100000</snapshot_distance>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n"
+            << "    <server><id>1</id><hostname>127.0.0.1</hostname><port>" << raft_port << "</port></server>\n"
+            << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(iss));
+    };
+
+    auto cfg = make_xml("error");
+    auto dispatcher = std::make_shared<DB::KeeperDispatcher>();
+    dispatcher->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    waitUntilActiveLeader(*dispatcher, 8000);
+
+    {
+        Poco::ThreadPool server_pool(2, 16);
+        auto make_tcp_srv = [&](Poco::Net::ServerSocket & sock)
+        {
+            auto factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+                [cfg]() -> const Poco::Util::AbstractConfiguration & { return *cfg; },
+                dispatcher, 5, 5, false));
+            Poco::Net::TCPServerParams::Ptr params = new Poco::Net::TCPServerParams();
+            params->setMaxThreads(8);
+            auto srv = std::make_unique<DB::TCPServer>(factory, server_pool, sock, params);
+            srv->start();
+            return srv;
+        };
+        auto srv1 = make_tcp_srv(tcp_socket1);
+        auto srv2 = make_tcp_srv(tcp_socket2);
+        SCOPE_EXIT({
+            srv1->stop();
+            srv2->stop();
+        });
+
+        /// 1. Client-side `ZooKeeperArgs::path_acls` (`apply_to_children = true`).
+        {
+            zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port1));
+            args.connection_timeout_ms = 5000;
+            args.session_timeout_ms = 10000;
+            args.operation_timeout_ms = 5000;
+            args.path_acls["/secured"] = zkutil::ZooKeeperArgs::PathAclInfo{
+                .acl = Coordination::ACL{Coordination::ACL::Read, "world", "anyone"},
+                .apply_to_children = true,
+            };
+            auto zk = zkutil::ZooKeeper::create(args, nullptr, nullptr);
+            zk->create("/secured", "root", zkutil::CreateMode::Persistent);
+            zk->create("/secured/child", "data", zkutil::CreateMode::Persistent);
+
+            auto acls = zk->getACL("/secured/child");
+            bool has_read_only_acl = false;
+            for (const auto & a : acls)
+                if (a.permissions == Coordination::ACL::Read && a.scheme == "world" && a.id == "anyone")
+                    has_read_only_acl = true;
+            require(has_read_only_acl, "ZooKeeperArgs::path_acls did not attach child ACL to /secured/child");
+        }
+
+        /// 2. Availability Zone preference (`prefer_local_availability_zone = true`) selects `tcp_port2` (`az-local`)!
+        {
+            zkutil::ZooKeeperArgs az_args("127.0.0.1:" + std::to_string(tcp_port1) + ",127.0.0.1:" + std::to_string(tcp_port2));
+            az_args.connection_timeout_ms = 5000;
+            az_args.session_timeout_ms = 10000;
+            az_args.operation_timeout_ms = 5000;
+            az_args.availability_zones = {"az-remote", "az-local"};
+            az_args.client_availability_zone = "az-local";
+            az_args.prefer_local_availability_zone = true;
+            auto zk_az = zkutil::ZooKeeper::create(az_args, nullptr, nullptr);
+            const std::string connected = zk_az->getConnectedHostPort();
+            require(connected == "127.0.0.1:" + std::to_string(tcp_port2),
+                "AZ-aware client connected to wrong endpoint: " + connected);
+        }
+
+        /// 3. Dynamic `<raft_logs_level>` hot reload via `updateConfiguration` (`error -> warning -> error`)!
+        {
+            auto cfg_warn = make_xml("warning");
+            dispatcher->updateConfiguration(*cfg_warn, macros);
+            auto cfg_err = make_xml("error");
+            dispatcher->updateConfiguration(*cfg_err, macros);
+        }
+    }
+
+    /// 4. `<create_snapshot_on_exit>true</create_snapshot_on_exit>`: zero snapshots before exit, >= 1 after clean exit!
+    auto count_snapshots = [&]() -> size_t
+    {
+        size_t n = 0;
+        for (const auto & e : std::filesystem::directory_iterator(base_dir / "snapshots"))
+            if (e.path().filename().string().starts_with("snapshot_"))
+                ++n;
+        return n;
+    };
+    require(count_snapshots() == 0, "Unexpected snapshot before shutdown despite snapshot_distance=100000");
+
+    dispatcher->signalShutdown();
+    dispatcher->beginTCPConnectionDrain();
+    dispatcher->shutdownBeforeConnectionsFinish();
+    dispatcher->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+    require(count_snapshots() >= 1, "create_snapshot_on_exit=true did not write a snapshot during clean shutdown");
+
+    std::cout << "  [PASS] live: path_acls_snapshot_on_exit_dynamic_log_level_and_az_preference\n";
+}
+
+/// 15. Live 3-node cluster: rejoin a removed follower WITHOUT restarting it (`test_keeper_rejoin_removed_member_without_restart`)
+/// AND atomic single-command `OpNum::Reconfig` leader replacement (`test_keeper_reconfig_replace_leader_in_one_command`)!
+inline void testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_3node_rejoin_and_replace_leader";
+    std::filesystem::create_directories(base_dir);
+
+    const std::array<uint16_t, 4> raft_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+
+    auto make_cfg = [&](int id, bool include_node4 = false)
+    {
+        const auto ndir = base_dir / ("node_" + std::to_string(id));
+        std::filesystem::create_directories(ndir / "logs");
+        std::filesystem::create_directories(ndir / "snapshots");
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << pickFreeLoopbackPort() << "</tcp_port>\n"
+            << "  <server_id>" << id << "</server_id>\n"
+            << "  <enable_reconfiguration>true</enable_reconfiguration>\n"
+            << "  <log_storage_path>" << (ndir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (ndir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>5000</operation_timeout_ms>\n"
+            << "    <startup_timeout>8000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <sleep_before_leader_change_ms>200</sleep_before_leader_change_ms>\n"
+            << "    <raft_logs_level>error</raft_logs_level>\n"
+            << "    <heart_beat_interval_ms>50</heart_beat_interval_ms>\n"
+            << "    <election_timeout_lower_bound_ms>150</election_timeout_lower_bound_ms>\n"
+            << "    <election_timeout_upper_bound_ms>300</election_timeout_upper_bound_ms>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n";
+        for (int sid = 1; sid <= 3; ++sid)
+            xml << "    <server><id>" << sid << "</id><hostname>127.0.0.1</hostname><port>" << raft_ports[sid - 1] << "</port></server>\n";
+        if (include_node4)
+            xml << "    <server><id>4</id><hostname>127.0.0.1</hostname><port>" << raft_ports[3] << "</port><start_as_follower>true</start_as_follower></server>\n";
+        xml << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(iss));
+    };
+
+    auto macros = std::make_shared<const DB::Macros>();
+    std::array<std::shared_ptr<DB::KeeperDispatcher>, 4> nodes;
+    SCOPE_EXIT({
+        for (auto & n : nodes)
+        {
+            if (n)
+            {
+                n->signalShutdown();
+                n->beginTCPConnectionDrain();
+                n->shutdownBeforeConnectionsFinish();
+                n->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            }
+        }
+    });
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto cfg = make_cfg(i + 1);
+        nodes[i] = std::make_shared<DB::KeeperDispatcher>();
+        nodes[i]->initialize(*cfg, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    }
+
+    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (pred())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        throw std::runtime_error(msg);
+    };
+
+    auto find_leader = [&]() -> int
+    {
+        for (int i = 0; i < 4; ++i)
+            if (nodes[i] && nodes[i]->isServerActive() && nodes[i]->isLeader())
+                return i;
+        return -1;
+    };
+
+    int leader_idx = -1;
+    wait_until(10000, [&]()
+    {
+        leader_idx = find_leader();
+        return leader_idx >= 0;
+    }, "3-node rejoin cluster did not elect leader");
+    const int fol_idx = (leader_idx + 1) % 3;
+    const int fol_id = fol_idx + 1;
+
+    /// 1. Remove follower `fol_id`, write `/while_removed`, then re-add SAME still-running `nodes[fol_idx]` WITHOUT restart!
+    {
+        {
+            std::ostringstream js;
+            js << R"({"preconditions":{"members":[1,2,3],"leaders":[)" << (leader_idx + 1)
+               << R"(]},"actions":[{"remove_members":[)" << fol_id << R"(]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg remove follower failed: " + res_ss.str());
+        }
+        auto zk_l = zkutil::ZooKeeper::createFromImpl([d = nodes[leader_idx]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        zk_l->create("/while_removed", "written-while-out", zkutil::CreateMode::Persistent);
+
+        {
+            std::ostringstream js;
+            js << R"({"actions":[{"add_members":[{"id":)" << fol_id << R"(,"endpoint":"127.0.0.1:)" << raft_ports[fol_idx]
+               << R"(","learner":false,"priority":1}]}]})";
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(js.str()).extract<Poco::JSON::Object::Ptr>();
+            auto res = nodes[leader_idx]->reconfigureClusterFromReconfigureCommand(obj);
+            std::ostringstream res_ss;
+            Poco::JSON::Stringifier::stringify(res, res_ss);
+            require(!res.isNull() && res_ss.str().find("error") == std::string::npos,
+                "rcfg re-add follower without restart failed: " + res_ss.str());
+        }
+        wait_until(8000, [&]()
+        {
+            return nodes[fol_idx]->isServerActive() && nodes[fol_idx]->isFollower();
+        }, "Rejoined follower did not become active without restart");
+        auto zk_f = zkutil::ZooKeeper::createFromImpl([d = nodes[fol_idx]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        require(zk_f->get("/while_removed") == "written-while-out", "Rejoined follower missed /while_removed");
+    }
+
+    /// 2. Start Node 4 and atomically replace the current leader (`leader_id`) with Node 4 in ONE `OpNum::Reconfig` command!
+    {
+        auto cfg4 = make_cfg(4, /*include_node4=*/true);
+        nodes[3] = std::make_shared<DB::KeeperDispatcher>();
+        nodes[3]->initialize(*cfg4, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+
+        const int old_leader_idx = find_leader();
+        const int old_leader_id = old_leader_idx + 1;
+        const int other_idx = (old_leader_idx + 1) % 3;
+
+        auto ov_other = std::make_unique<Coordination::KeeperOverDispatcher>(nodes[other_idx], Poco::Timespan(15, 0));
+        auto done = std::make_shared<Poco::Event>();
+        Coordination::ReconfigResponse rres;
+        ov_other->reconfig(
+            "server.4=127.0.0.1:" + std::to_string(raft_ports[3]),
+            std::to_string(old_leader_id),
+            "",
+            -1,
+            [&](const Coordination::ReconfigResponse & r)
+            {
+                rres = r;
+                done->set();
+            });
+        require(done->tryWait(12000) && rres.error == Coordination::Error::ZOK,
+            "Atomic single-command leader replacement OpNum::Reconfig failed");
+        require(rres.value.find("server.4=") != std::string::npos
+            && rres.value.find("server." + std::to_string(old_leader_id) + "=") == std::string::npos,
+            "Atomic leader replacement config mismatch: " + rres.value);
+
+        wait_until(10000, [&]()
+        {
+            const int nl = find_leader();
+            return nl >= 0 && nl != old_leader_idx && nodes[3]->isServerActive();
+        }, "New 3-node cluster without old leader did not stabilize");
+
+        auto zk4 = zkutil::ZooKeeper::createFromImpl([d = nodes[3]]()
+        {
+            return std::make_unique<Coordination::KeeperOverDispatcher>(d, Poco::Timespan(10, 0));
+        });
+        require(zk4->get("/while_removed") == "written-while-out", "Replacement Node 4 missing prior state");
+        zk4->create("/after_atomic_replace", "replaced-ok", zkutil::CreateMode::Persistent);
+        require(zk4->get("/after_atomic_replace") == "replaced-ok", "Write after atomic leader replace failed");
+    }
+
+    std::cout << "  [PASS] live: 3node_rejoin_without_restart_and_atomic_leader_replace\n";
+}
+
+/// 16. Live 2-node cluster (`test_keeper_two_nodes_cluster`): quorum election, live TCP `sync`,
+/// quorum loss on 1-node shutdown, automatic quorum restoration on rejoin, AND `test_keeper_read_during_close`!
+inline void testLive2NodeClusterQuorumLossRecoveryAndReadDuringClose(const std::filesystem::path & root_dir)
+{
+    const auto base_dir = root_dir / "live_2node_cluster";
+    std::filesystem::create_directories(base_dir);
+
+    const std::array<uint16_t, 2> raft_ports = {
+        pickFreeLoopbackPort(),
+        pickFreeLoopbackPort(),
+    };
+    Poco::Net::ServerSocket tcp_socket1(Poco::Net::SocketAddress("127.0.0.1", 0));
+    const uint16_t tcp_port1 = tcp_socket1.address().port();
+
+    auto make_cfg = [&](int id)
+    {
+        const auto ndir = base_dir / ("node_" + std::to_string(id));
+        std::filesystem::create_directories(ndir / "logs");
+        std::filesystem::create_directories(ndir / "snapshots");
+        std::ostringstream xml;
+        xml << "<clickhouse><keeper_server>\n"
+            << "  <tcp_port>" << (id == 1 ? tcp_port1 : pickFreeLoopbackPort()) << "</tcp_port>\n"
+            << "  <server_id>" << id << "</server_id>\n"
+            << "  <four_letter_word_white_list>*</four_letter_word_white_list>\n"
+            << "  <log_storage_path>" << (ndir / "logs").string() << "</log_storage_path>\n"
+            << "  <snapshot_storage_path>" << (ndir / "snapshots").string() << "</snapshot_storage_path>\n"
+            << "  <coordination_settings>\n"
+            << "    <operation_timeout_ms>1500</operation_timeout_ms>\n"
+            << "    <startup_timeout>8000</startup_timeout>\n"
+            << "    <session_timeout_ms>10000</session_timeout_ms>\n"
+            << "    <raft_logs_level>error</raft_logs_level>\n"
+            << "    <heart_beat_interval_ms>50</heart_beat_interval_ms>\n"
+            << "    <election_timeout_lower_bound_ms>150</election_timeout_lower_bound_ms>\n"
+            << "    <election_timeout_upper_bound_ms>300</election_timeout_upper_bound_ms>\n"
+            << "    <use_new_dispatcher>true</use_new_dispatcher>\n"
+            << "  </coordination_settings>\n"
+            << "  <raft_configuration>\n"
+            << "    <server><id>1</id><hostname>127.0.0.1</hostname><port>" << raft_ports[0] << "</port></server>\n"
+            << "    <server><id>2</id><hostname>127.0.0.1</hostname><port>" << raft_ports[1] << "</port></server>\n"
+            << "  </raft_configuration>\n</keeper_server></clickhouse>\n";
+        std::istringstream iss(xml.str());
+        return Poco::AutoPtr<Poco::Util::XMLConfiguration>(new Poco::Util::XMLConfiguration(iss));
+    };
+
+    auto macros = std::make_shared<const DB::Macros>();
+    std::array<std::shared_ptr<DB::KeeperDispatcher>, 2> nodes;
+    auto cfg1 = make_cfg(1);
+    auto cfg2 = make_cfg(2);
+    nodes[0] = std::make_shared<DB::KeeperDispatcher>();
+    nodes[1] = std::make_shared<DB::KeeperDispatcher>();
+    nodes[0]->initialize(*cfg1, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    nodes[1]->initialize(*cfg2, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    DB::FourLetterCommandFactory::registerCommands(*nodes[0]);
+
+    Poco::ThreadPool server_pool(2, 16);
+    auto tcp_factory = Poco::SharedPtr<DB::TCPServerConnectionFactory>(new DB::KeeperTCPHandlerFactory(
+        [cfg1]() -> const Poco::Util::AbstractConfiguration & { return *cfg1; },
+        nodes[0], 5, 5, false));
+    Poco::Net::TCPServerParams::Ptr tcp_params = new Poco::Net::TCPServerParams();
+    tcp_params->setMaxThreads(8);
+    DB::TCPServer tcp_server(tcp_factory, server_pool, tcp_socket1, tcp_params);
+    tcp_server.start();
+
+    auto stop_node = [&](int i)
+    {
+        if (nodes[i])
+        {
+            nodes[i]->signalShutdown();
+            nodes[i]->beginTCPConnectionDrain();
+            nodes[i]->shutdownBeforeConnectionsFinish();
+            nodes[i]->shutdownAfterConnectionsFinish(/*closed_all_connections=*/true);
+            nodes[i].reset();
+        }
+    };
+    SCOPE_EXIT({
+        tcp_server.stop();
+        stop_node(0);
+        stop_node(1);
+    });
+
+    auto wait_until = [](int timeout_ms, auto && pred, const std::string & msg)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (pred())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        throw std::runtime_error(msg);
+    };
+
+    wait_until(8000, [&]()
+    {
+        return nodes[0]->isServerActive() && nodes[1]->isServerActive()
+            && (nodes[0]->isLeader() || nodes[1]->isLeader());
+    }, "2-node cluster did not reach active quorum");
+
+    /// 1. Live TCP write + `ZooKeeper::sync` on 2-node cluster + concurrent reads during client close (`test_keeper_read_during_close`)!
+    {
+        zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port1));
+        args.connection_timeout_ms = 5000;
+        args.session_timeout_ms = 10000;
+        args.operation_timeout_ms = 5000;
+        auto zk = zkutil::ZooKeeper::create(args, nullptr, nullptr);
+        zk->create("/two_node_key", "quorum-2of2", zkutil::CreateMode::Persistent);
+        require(zk->sync("/two_node_key") == "/two_node_key", "Live TCP ZooKeeper::sync failed");
+        require(zk->get("/two_node_key") == "quorum-2of2", "2-node cluster get mismatch");
+
+        /// Fire asynchronous reads right as the client closes its session (must never crash server!).
+        std::vector<std::future<Coordination::GetResponse>> inflight;
+        inflight.reserve(16);
+        for (int i = 0; i < 16; ++i)
+            inflight.push_back(zk->asyncTryGetNoThrow("/two_node_key"));
+        zk.reset();
+        for (auto & f : inflight)
+        {
+            try { (void)f.get(); }
+            catch (...) {}
+        }
+        require(sendRawTCPFourLetterWord(tcp_port1, "ruok") == "imok",
+            "Server unhealthy after read_during_close");
+    }
+
+    /// 2. Stop Node 2 -> 2-node cluster loses quorum (1/2 cannot commit writes), then restart Node 2 -> quorum restores!
+    stop_node(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+
+    nodes[1] = std::make_shared<DB::KeeperDispatcher>();
+    nodes[1]->initialize(*cfg2, /*standalone_keeper=*/true, /*start_async=*/true, macros);
+    wait_until(8000, [&]()
+    {
+        return nodes[0]->isServerActive() && nodes[1]->isServerActive()
+            && (nodes[0]->isLeader() || nodes[1]->isLeader());
+    }, "2-node cluster did not restore quorum after Node 2 restart");
+
+    {
+        zkutil::ZooKeeperArgs args("127.0.0.1:" + std::to_string(tcp_port1));
+        args.connection_timeout_ms = 5000;
+        args.session_timeout_ms = 10000;
+        args.operation_timeout_ms = 5000;
+        auto zk2 = zkutil::ZooKeeper::create(args, nullptr, nullptr);
+        zk2->create("/two_node_restored", "back-2of2", zkutil::CreateMode::Persistent);
+        require(zk2->get("/two_node_key") == "quorum-2of2" && zk2->get("/two_node_restored") == "back-2of2",
+            "2-node cluster post-recovery read/write failed");
+    }
+
+    std::cout << "  [PASS] live: 2node_quorum_loss_recovery_sync_and_read_during_close\n";
+}
+
+}
+
+inline const std::vector<std::string> & getKeeperLiveServerSuiteNames()
+{
+    static const std::vector<std::string> suites = {
+        "dispatcher_tcp_http_4lw",
+        "dispatcher_old_lifecycle",
+        "tcp_password_auth_and_tls",
+        "3node_forwarding_rcfg_failover_recovery",
+        "tcp_session_resumption_and_watch",
+        "client_helpers_lock_cache_multi",
+        "3node_lsmt_disk_learner_hot_reload",
+        "tcp_chroot_and_restart",
+        "3node_chunked_snap_and_failover",
+        "path_acls_snap_exit_log_az",
+        "3node_rejoin_and_atomic_leader_replace",
+        "2node_quorum_sync_read_during_close",
+#if USE_SSL
+        "3node_tls_raft_peers",
+#endif
+#if USE_AWS_S3
+        "s3_snapshot_uploader",
+#endif
+    };
+    return suites;
+}
+
+inline void runKeeperLiveServerTests(
+    const std::filesystem::path & state_dir,
+    const std::string & suite_filter = "",
+    uint16_t port_base = 0)
 {
     require(!state_dir.empty(), "--state-dir is required for --live-server-tests");
+    if (port_base != 0)
+        live_server_detail::g_live_port_cursor.store(port_base, std::memory_order_relaxed);
     if (std::filesystem::exists(state_dir))
         std::filesystem::remove_all(state_dir);
     std::filesystem::create_directories(state_dir);
@@ -1230,16 +3082,47 @@ inline void runKeeperLiveServerTests(const std::filesystem::path & state_dir)
     /// so virtual POSIX time must stay disabled here.
     g_virtual_time_enabled = false;
     DB::ServerUUID::setRandomForUnitTests();
+    {
+        std::istringstream empty_iss("<clickhouse/>");
+        Poco::AutoPtr<Poco::Util::XMLConfiguration> empty_cfg(new Poco::Util::XMLConfiguration(empty_iss));
+        DB::PlacementInfo::PlacementInfo::instance().initialize(*empty_cfg);
+    }
     std::cout << std::unitbuf;
 
-    live_server_detail::testLiveDispatcherTcpHttpAnd4LW(state_dir);
-    live_server_detail::testLiveDispatcherOldLifecycle(state_dir);
-    live_server_detail::testLiveTCPPasswordAuthAndTLS(state_dir);
-    live_server_detail::testLive3NodeClusterForwardingFailoverAndForceRecovery(state_dir);
+    bool matched = false;
+    auto maybe_run = [&](const std::string & name, auto && fn)
+    {
+        if (!suite_filter.empty() && suite_filter != name)
+            return;
+        matched = true;
+        fn(state_dir);
+    };
+
+    maybe_run("dispatcher_tcp_http_4lw", live_server_detail::testLiveDispatcherTcpHttpAnd4LW);
+    maybe_run("dispatcher_old_lifecycle", live_server_detail::testLiveDispatcherOldLifecycle);
+    maybe_run("tcp_password_auth_and_tls", live_server_detail::testLiveTCPPasswordAuthAndTLS);
+    maybe_run("3node_forwarding_rcfg_failover_recovery", live_server_detail::testLive3NodeClusterForwardingFailoverAndForceRecovery);
+    maybe_run("tcp_session_resumption_and_watch", live_server_detail::testLiveTCPSessionResumptionInvalidSessionAndCrossClientWatch);
+    maybe_run("client_helpers_lock_cache_multi", live_server_detail::testLiveClientHelpersLockNodeCacheCachingGetterAndMulti);
+    maybe_run("3node_lsmt_disk_learner_hot_reload", live_server_detail::testLive3NodeLSMTDiskLearnerJoinAndHotReload);
+    maybe_run("tcp_chroot_and_restart", live_server_detail::testLiveTCPChrootIsolationAndRestartPersistence);
+    maybe_run("3node_chunked_snap_and_failover", live_server_detail::testLive3NodeChunkedSnapshotInstallAndMultiHostClientFailover);
+    maybe_run("path_acls_snap_exit_log_az", live_server_detail::testLivePathACLsSnapshotOnExitDynamicLogLevelAndAZPreference);
+    maybe_run("3node_rejoin_and_atomic_leader_replace", live_server_detail::testLive3NodeRejoinWithoutRestartAndAtomicLeaderReplace);
+    maybe_run("2node_quorum_sync_read_during_close", live_server_detail::testLive2NodeClusterQuorumLossRecoveryAndReadDuringClose);
+#if USE_SSL
+    maybe_run("3node_tls_raft_peers", live_server_detail::testLive3NodeTLSRaftCluster);
+#endif
+#if USE_AWS_S3
+    maybe_run("s3_snapshot_uploader", live_server_detail::testLiveS3SnapshotUploader);
+#endif
+
+    if (!suite_filter.empty() && !matched)
+        throw std::runtime_error("Unknown --live-suite: " + suite_filter);
 
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);
     std::cout << "PASS keeper-sim-live-server-tests\n";
 }
 
-} // namespace keeper_sim
+}

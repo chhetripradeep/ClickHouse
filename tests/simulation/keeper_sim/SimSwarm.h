@@ -1,5 +1,6 @@
 #pragma once
 
+#include <SimLiveServerTests.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -278,6 +279,43 @@ public:
                 j.lazy_startup = true;
                 j.mixed_versions = true;
                 j.snapshot_on_exit = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 15. Auto-forwarding + NuRaft `client_req_stream` + hot `update_params` / `set_priority` / `request_leadership`
+            {
+                auto j = make_ci("ci-autofwd-clistream-3n", 115, 3, "chaos", "mixed", 13000);
+                j.auto_forward = true;
+                j.client_stream = true;
+                j.hot_reconfig = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 16. 5-node LSMT-Disk with real `DiskLocal` streaming snapshots (`writeSnapshotFile`/`fallocate`/`ftruncate`)
+            ///     + huge 2-10 KB LSMT values + `snapshot_on_exit`
+            {
+                auto j = make_ci("ci-localdisk-lsmt-5n", 116, 5, "chaos", "lsmt-disk", 13000);
+                j.local_disk_cache = true;
+                j.huge_lsmt_values = true;
+                j.snapshot_on_exit = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 17. 5-node LSMT-Disk with mixed snapshot versions (`V5`–`V9` Zstd/LZ4 across replicas) + same-path Multi churn + async replication
+            {
+                auto j = make_ci("ci-snapmix-churn-lsmt-5n", 117, 5, "snapshot-storm", "lsmt-disk", 13000);
+                j.snapshot_versions_mix = true;
+                j.same_path_multi_churn = true;
+                j.async_replication = true;
+                j.no_disk_faults = true;
+                jobs.push_back(std::move(j));
+            }
+            /// 18. 3-node priority torture (`set_priority` v2 leader & forwarded) + dynamic member rotation + leadership yields + async replication
+            {
+                auto j = make_ci("ci-priority-rotation-3n", 118, 3, "chaos", "mem", 13000);
+                j.priority_torture = true;
+                j.member_rotation = true;
+                j.async_replication = true;
                 j.no_disk_faults = true;
                 jobs.push_back(std::move(j));
             }
@@ -782,27 +820,150 @@ public:
             }
             std::cout << "[PASS] keeper-feature-tests (" << std::fixed << std::setprecision(2) << feat.elapsed_s << "s)\n" << std::flush;
 
-            /// 2c. Run `--live-server-tests` in an isolated child process covering real `KeeperDispatcher`
-            /// (`use_new_dispatcher` true & false), `KeeperRequestDispatcher`, `KeeperRequestDispatcherOld`,
-            /// `KeeperServer`, `KeeperReadThreadPool`, all 27 non-jemalloc 4LW commands + `rcfg`, `OpNum::Reconfig`,
-            /// `KeeperOverDispatcher`, `KeeperTCPHandler` (plain + LZ4 + XID64 + 4LW + `max_request_size`),
-            /// and HTTP handlers (`/ready`, `/dashboard/content`, `/api/v1/commands`, `/api/v1/storage`)!
-            const auto live_dir = work_dir / "state_live_server_tests";
-            auto live = runOneSubprocess(
-                self_exe,
-                {"--live-server-tests", "--state-dir", live_dir.string()},
-                JobSpec{"keeper-live-server-tests"},
-                work_dir);
-            const bool live_ok = (live.exit_code == 0 && live.stdout_text.find("PASS keeper-sim-live-server-tests") != std::string::npos);
-            extra_checks.push_back({"keeper-live-server-tests", live_ok, live.elapsed_s, live_ok ? "" : firstLine(live.stderr_text.empty() ? live.stdout_text : live.stderr_text)});
-            if (!live.stdout_text.empty())
-                std::cout << live.stdout_text << std::flush;
-            if (!live_ok)
+            /// 2c. Run all live server/multi-node/TCP/HTTP/TLS/LSMT suites in parallel isolated child processes
+            /// across `max_workers` for ~4x faster PR CI runtime and zero cross-test global state bleed!
             {
-                std::cerr << "[FAIL] keeper-live-server-tests: " << live.stderr_text << '\n';
-                return 1;
+                const auto live_wall_start = std::chrono::steady_clock::now();
+                const auto & live_suites = getKeeperLiveServerSuiteNames();
+                struct LiveTask
+                {
+                    std::string name;
+                    std::vector<std::string> args;
+                    std::filesystem::path state_dir;
+                };
+                std::vector<LiveTask> tasks;
+                tasks.reserve(live_suites.size());
+                for (size_t sidx = 0; sidx < live_suites.size(); ++sidx)
+                {
+                    const auto & sname = live_suites[sidx];
+                    const auto sdir = work_dir / ("state_live_" + sname);
+                    const uint16_t pbase = static_cast<uint16_t>(24000 + sidx * 64);
+                    tasks.push_back(LiveTask{
+                        sname,
+                        {"--live-server-tests", "--live-suite", sname, "--live-port-base", std::to_string(pbase), "--state-dir", sdir.string()},
+                        sdir,
+                    });
+                }
+
+                struct LiveChild
+                {
+                    pid_t pid = 0;
+                    size_t idx = 0;
+                    std::filesystem::path out_file;
+                    std::filesystem::path err_file;
+                    std::chrono::steady_clock::time_point started;
+                };
+                struct LiveRes
+                {
+                    bool ok = false;
+                    double elapsed_s = 0.0;
+                    std::string stdout_text;
+                    std::string stderr_text;
+                };
+                std::vector<LiveRes> live_results(tasks.size());
+                std::map<pid_t, LiveChild> active_live;
+                size_t next_live = 0;
+                const size_t live_workers = std::max<size_t>(1, max_workers);
+
+                auto read_all_file = [](const std::filesystem::path & p) -> std::string
+                {
+                    std::ifstream in(p);
+                    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                };
+
+                while (next_live < tasks.size() || !active_live.empty())
+                {
+                    while (next_live < tasks.size() && active_live.size() < live_workers)
+                    {
+                        const size_t idx = next_live++;
+                        const auto & t = tasks[idx];
+                        const auto out_file = work_dir / ("out_live_" + t.name + ".log");
+                        const auto err_file = work_dir / ("err_live_" + t.name + ".log");
+                        std::vector<std::string> argv_storage;
+                        argv_storage.push_back(self_exe);
+                        for (const auto & a : t.args)
+                            argv_storage.push_back(a);
+
+                        const pid_t pid = fork();
+                        if (pid < 0)
+                            throw std::runtime_error("SimSwarmRunner: fork() failed for live suite");
+                        if (pid == 0)
+                        {
+                            FILE * fo = fopen(out_file.c_str(), "w");
+                            FILE * fe = fopen(err_file.c_str(), "w");
+                            if (fo)
+                            {
+                                dup2(fileno(fo), STDOUT_FILENO);
+                                fclose(fo);
+                            }
+                            if (fe)
+                            {
+                                dup2(fileno(fe), STDERR_FILENO);
+                                fclose(fe);
+                            }
+                            std::vector<char *> c_argv;
+                            c_argv.reserve(argv_storage.size() + 1);
+                            for (auto & s : argv_storage)
+                                c_argv.push_back(s.data());
+                            c_argv.push_back(nullptr);
+                            execv(self_exe.c_str(), c_argv.data());
+                            _exit(127);
+                        }
+                        active_live[pid] = LiveChild{pid, idx, out_file, err_file, std::chrono::steady_clock::now()};
+                    }
+
+                    int status = 0;
+                    const pid_t done_pid = waitpid(-1, &status, 0);
+                    if (done_pid <= 0)
+                        break;
+                    auto it = active_live.find(done_pid);
+                    if (it == active_live.end())
+                        continue;
+                    const auto child = it->second;
+                    active_live.erase(it);
+
+                    LiveRes lr;
+                    lr.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - child.started).count();
+                    lr.stdout_text = read_all_file(child.out_file);
+                    lr.stderr_text = read_all_file(child.err_file);
+                    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    lr.ok = (exit_code == 0 && lr.stdout_text.find("PASS keeper-sim-live-server-tests") != std::string::npos);
+                    live_results[child.idx] = std::move(lr);
+                }
+
+                bool all_live_ok = true;
+                size_t live_passed = 0;
+                for (size_t i = 0; i < tasks.size(); ++i)
+                {
+                    const auto & lr = live_results[i];
+                    extra_checks.push_back({
+                        "live_" + tasks[i].name,
+                        lr.ok,
+                        lr.elapsed_s,
+                        lr.ok ? "" : firstLine(lr.stderr_text.empty() ? lr.stdout_text : lr.stderr_text),
+                    });
+                    if (lr.ok)
+                    {
+                        ++live_passed;
+                        std::istringstream iss(lr.stdout_text);
+                        std::string line;
+                        while (std::getline(iss, line))
+                            if (line.find("  [PASS] live:") != std::string::npos)
+                                std::cout << line << " (" << std::fixed << std::setprecision(2) << lr.elapsed_s << "s)\n";
+                    }
+                    else
+                    {
+                        all_live_ok = false;
+                        std::cerr << "[FAIL] live_" << tasks[i].name << " (" << std::fixed << std::setprecision(2) << lr.elapsed_s
+                                  << "s): " << (lr.stderr_text.empty() ? lr.stdout_text : lr.stderr_text) << '\n';
+                    }
+                }
+                const double live_wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - live_wall_start).count();
+                if (!all_live_ok)
+                    return 1;
+                std::cout << "[PASS] keeper-live-server-tests (" << live_passed << "/" << tasks.size()
+                          << " parallel suites, " << std::fixed << std::setprecision(2) << live_wall_s << "s wall)\n" << std::flush;
             }
-            std::cout << "[PASS] keeper-live-server-tests (" << std::fixed << std::setprecision(2) << live.elapsed_s << "s)\n" << std::flush;
         }
 
         /// 3. Run all campaign jobs in parallel across `max_workers` child processes.
@@ -911,6 +1072,22 @@ public:
                 "dynamic_membership_changed",
                 "backpressure_params_active",
                 "full_consensus_enabled",
+                "auto_forwarding_enabled",
+                "follower_auto_forwarded_write",
+                "client_req_stream_opened",
+                "client_req_stream_appended",
+                "hot_update_params",
+                "local_disk_log_active",
+                "local_disk_streaming_snapshot_active",
+                "huge_lsmt_value_written",
+                "async_replication_enabled",
+                "same_path_multi_commit_submitted",
+                "same_path_multi_rollback_submitted",
+                "reconfig_priority_submitted",
+                "update_srv_config_succeeded",
+                "member_rotation_add_voter",
+                "snapshot_version_v5",
+                "leadership_yielded",
                 "linearizability_register_verified",
             };
             for (const auto & req_key : required_ci_coverage)
@@ -1454,4 +1631,4 @@ private:
     }
 };
 
-} // namespace keeper_sim
+}

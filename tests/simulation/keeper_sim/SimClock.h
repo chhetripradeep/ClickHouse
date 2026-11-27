@@ -499,8 +499,11 @@ struct BuggifyConfig
             compress_logs = false;
             log_max_size = static_cast<uint64_t>(rng.rangeInt(512, 2048));
             log_overallocate_size = static_cast<uint64_t>(rng.rangeInt(256, 1024));
-            latest_logs_cache_size_threshold = static_cast<uint64_t>(rng.rangeInt(512, 2048));
-            latest_logs_cache_entry_count_threshold = static_cast<uint64_t>(rng.rangeInt(2, 8));
+            if (!disable_bounded_cache)
+            {
+                latest_logs_cache_size_threshold = static_cast<uint64_t>(rng.rangeInt(512, 2048));
+                latest_logs_cache_entry_count_threshold = static_cast<uint64_t>(rng.rangeInt(2, 8));
+            }
             max_flush_batch_size = 1;
             large_values = true;
         }
@@ -625,7 +628,7 @@ inline void seedProcessRng(uint64_t seed)
     thread_local_rng.seed(seed ^ 0x9E3779B97F4A7C15ULL);
 }
 
-} // namespace keeper_sim
+}
 
 extern "C" int realPthreadCreate(pthread_t *, const pthread_attr_t *, void * (*)(void *), void *) asm("__real_pthread_create");
 extern "C" int wrappedPthreadCreate(pthread_t *, const pthread_attr_t *, void * (*)(void *), void *) asm("__wrap_pthread_create");

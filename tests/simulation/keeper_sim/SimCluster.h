@@ -2068,4 +2068,4 @@ private:
     bool shut_down = false;
 };
 
-} // namespace keeper_sim
+}
